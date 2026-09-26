@@ -33,8 +33,9 @@
 //! and confirm both the URL and the schema against an actual execution
 //! report.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -44,16 +45,34 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::SymbolConfig;
 use crate::kraken_rest::KrakenRestClient;
-use crate::proto::pb::{Decimal as PbDecimal, OrderStatus, OrderUpdate};
+use crate::proto::pb::{Decimal as PbDecimal, OrderSide, OrderStatus, OrderUpdate};
+use crate::risk::RiskEngine;
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 const PRIVATE_WS_URL: &str = "wss://ws-auth.kraken.com/v2";
+/// How many recent exec_id/trade_id values to remember for de-duplication.
+/// Bounded so a long-lived connection can't grow this unboundedly; a
+/// redelivery arriving further back than this many executions ago would
+/// slip through, which is an acceptable trade-off for a guard against the
+/// common case (a reconnect or at-least-once redelivery replaying the last
+/// few events), not a full exactly-once guarantee.
+const DEDUP_WINDOW: usize = 512;
 
 /// Runs forever, reconnecting on any error — fetching a fresh token on
 /// every (re)connect rather than trying to track token expiry. A dropped
 /// connection here must never take down order submission or market data;
 /// it only means fills stop being observed until it reconnects.
-pub async fn run(symbols: Vec<SymbolConfig>, rest_client: KrakenRestClient, tx: broadcast::Sender<OrderUpdate>) {
+///
+/// `risk` is fed real fills (see `apply_fill` in risk.rs) as they're
+/// observed on this feed, so `RiskEngine`'s position tracking and the
+/// daily kill switch reflect what actually happened at the exchange
+/// instead of staying at zero forever.
+pub async fn run(
+    symbols: Vec<SymbolConfig>,
+    rest_client: KrakenRestClient,
+    tx: broadcast::Sender<OrderUpdate>,
+    risk: Arc<RiskEngine>,
+) {
     if symbols.is_empty() {
         tracing::warn!("no symbols configured, not starting private execution feed");
         return;
@@ -66,7 +85,7 @@ pub async fn run(symbols: Vec<SymbolConfig>, rest_client: KrakenRestClient, tx: 
 
     loop {
         tracing::info!(url = PRIVATE_WS_URL, "connecting to Kraken private execution feed");
-        match connect_and_stream(&rest_client, &native_to_normalized, &tx).await {
+        match connect_and_stream(&rest_client, &native_to_normalized, &tx, &risk).await {
             Ok(()) => tracing::warn!("private execution feed stream ended, reconnecting"),
             Err(e) => tracing::error!(error = %e, "private execution feed error, reconnecting"),
         }
@@ -78,6 +97,7 @@ async fn connect_and_stream(
     rest_client: &KrakenRestClient,
     native_to_normalized: &HashMap<String, String>,
     tx: &broadcast::Sender<OrderUpdate>,
+    risk: &Arc<RiskEngine>,
 ) -> anyhow::Result<()> {
     let token = rest_client
         .get_websockets_token()
@@ -100,6 +120,12 @@ async fn connect_and_stream(
     });
     write.send(Message::Text(subscribe_msg.to_string())).await?;
     tracing::info!("sent executions subscription");
+
+    // Bounded recently-seen exec_id/trade_id set, scoped to this connection
+    // (a fresh connection starts with a clean slate — an event redelivered
+    // across a reconnect is, at worst, applied once more, which is the
+    // same trade-off DEDUP_WINDOW itself makes).
+    let mut seen_exec_ids: VecDeque<String> = VecDeque::with_capacity(DEDUP_WINDOW);
 
     while let Some(msg) = read.next().await {
         let msg = msg?;
@@ -152,6 +178,20 @@ async fn connect_and_stream(
                     tracing::debug!(raw = %entry, "execution report missing required fields, skipping");
                 }
             }
+
+            if let Some(fill) = build_fill_event(entry, native_to_normalized) {
+                if let Some(exec_id) = &fill.exec_id {
+                    if seen_exec_ids.contains(exec_id) {
+                        tracing::debug!(exec_id, "duplicate execution report, skipping apply_fill");
+                        continue;
+                    }
+                    if seen_exec_ids.len() >= DEDUP_WINDOW {
+                        seen_exec_ids.pop_front();
+                    }
+                    seen_exec_ids.push_back(exec_id.clone());
+                }
+                risk.apply_fill(&fill.symbol, fill.side, fill.qty, fill.price).await;
+            }
         }
     }
 
@@ -202,6 +242,60 @@ fn build_order_update(entry: &serde_json::Value, native_to_normalized: &HashMap<
         // exchange_timestamp_ns.
         timestamp_ns: now_ns(),
     })
+}
+
+/// A single real execution (fill) event, extracted from an `executions`
+/// channel entry for feeding into `RiskEngine::apply_fill`. Distinct from
+/// `OrderUpdate` (which is Python/gRPC-facing and reports order status,
+/// not per-event deltas) — this uses `last_qty`/`last_price`, the size and
+/// price of *this specific* execution, rather than `cum_qty`/`avg_price`,
+/// which are cumulative and would require locally-persisted delta-tracking
+/// state to turn into a per-fill quantity (state that breaks across a
+/// reconnect — see this module's top-level docs).
+struct FillEvent {
+    symbol: String,
+    side: OrderSide,
+    qty: Decimal,
+    price: Decimal,
+    exec_id: Option<String>,
+}
+
+/// Extracts a `FillEvent` from an executions-channel entry, but only for an
+/// entry that actually represents a trade: `exec_type == "trade"` is
+/// Kraken's documented marker for "this event carries a real execution",
+/// as opposed to a pure status transition (new/canceled/amended/etc.) that
+/// carries no fill to apply. Returns None for anything else, or for a
+/// trade entry missing the fields needed to apply it.
+fn build_fill_event(entry: &serde_json::Value, native_to_normalized: &HashMap<String, String>) -> Option<FillEvent> {
+    if entry.get("exec_type").and_then(|v| v.as_str()) != Some("trade") {
+        return None;
+    }
+
+    let native_symbol = entry.get("symbol")?.as_str()?;
+    let symbol = native_to_normalized.get(native_symbol)?.clone();
+
+    let side = match entry.get("side").and_then(|v| v.as_str()) {
+        Some("buy") => OrderSide::Buy,
+        Some("sell") => OrderSide::Sell,
+        other => {
+            tracing::warn!(?other, "trade execution missing/unrecognized side, skipping apply_fill");
+            return None;
+        }
+    };
+
+    let qty = decimal_field(entry, "last_qty")?;
+    let price = decimal_field(entry, "last_price")?;
+    if qty <= Decimal::ZERO {
+        return None;
+    }
+
+    let exec_id = entry
+        .get("exec_id")
+        .or_else(|| entry.get("trade_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    Some(FillEvent { symbol, side, qty, price, exec_id })
 }
 
 /// Maps Kraken v2's `order_status` values onto our proto's OrderStatus.
@@ -326,6 +420,69 @@ mod tests {
         .unwrap();
         let update = build_order_update(&entry, &native_map()).expect("should still parse");
         assert_eq!(update.client_order_id, "");
+    }
+
+    #[test]
+    fn build_fill_event_extracts_a_trade_execution() {
+        let entry: serde_json::Value = serde_json::from_str(
+            r#"{
+                "order_id": "OK4GJX-KSTLS-7DZZO5",
+                "symbol": "BTC/USD",
+                "exec_type": "trade",
+                "side": "buy",
+                "last_qty": 0.004,
+                "last_price": 26599.9,
+                "exec_id": "EXEC-1"
+            }"#,
+        )
+        .unwrap();
+
+        let fill = build_fill_event(&entry, &native_map()).expect("should parse a trade");
+        assert_eq!(fill.symbol, "BTC-USD");
+        assert_eq!(fill.side, OrderSide::Buy);
+        assert_eq!(fill.qty, Decimal::from_str("0.004").unwrap());
+        assert_eq!(fill.price, Decimal::from_str("26599.9").unwrap());
+        assert_eq!(fill.exec_id.as_deref(), Some("EXEC-1"));
+    }
+
+    #[test]
+    fn build_fill_event_ignores_non_trade_exec_types() {
+        let entry: serde_json::Value = serde_json::from_str(
+            r#"{
+                "order_id": "OK4GJX-KSTLS-7DZZO5",
+                "symbol": "BTC/USD",
+                "exec_type": "new",
+                "order_status": "new"
+            }"#,
+        )
+        .unwrap();
+        assert!(build_fill_event(&entry, &native_map()).is_none());
+    }
+
+    #[test]
+    fn build_fill_event_falls_back_to_trade_id_when_exec_id_absent() {
+        let entry: serde_json::Value = serde_json::from_str(
+            r#"{
+                "symbol": "BTC/USD",
+                "exec_type": "trade",
+                "side": "sell",
+                "last_qty": 0.01,
+                "last_price": 30000,
+                "trade_id": "TRADE-9"
+            }"#,
+        )
+        .unwrap();
+        let fill = build_fill_event(&entry, &native_map()).expect("should parse");
+        assert_eq!(fill.exec_id.as_deref(), Some("TRADE-9"));
+    }
+
+    #[test]
+    fn build_fill_event_skips_a_trade_missing_last_qty() {
+        let entry: serde_json::Value = serde_json::from_str(
+            r#"{"symbol": "BTC/USD", "exec_type": "trade", "side": "buy", "last_price": 30000}"#,
+        )
+        .unwrap();
+        assert!(build_fill_event(&entry, &native_map()).is_none());
     }
 
     #[test]

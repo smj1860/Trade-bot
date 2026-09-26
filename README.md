@@ -312,3 +312,74 @@ Strategy layer section above) can now, in principle, receive real
 updates through this path — that hasn't been exercised together with a
 funded account either, for the same reason nothing else funded-account-only
 has been in this project.
+
+## Closing the risk-engine loop (rust-core/src/risk.rs)
+
+Before this, `RiskEngine`'s position tracking and daily kill switch existed
+but had nothing to act on — `positions` never moved off zero, and
+`kill_switch_max_daily_loss_usd` was read from config but never checked
+against anything. Real fills from the private execution feed above now
+flow directly into the risk engine, so both guardrails reflect what
+actually happened at the exchange.
+
+**How it's wired**: `kraken_private_ws.rs`'s message loop extracts a
+`FillEvent` from each `executions`-channel entry where Kraken's
+`exec_type == "trade"` — the field that specifically marks "this event
+carries a real execution," as opposed to a pure status transition (new,
+canceled, amended, etc.). Each `FillEvent` uses `last_qty`/`last_price`
+(the size and price of *that specific* execution) rather than diffing
+`cum_qty` across messages: a `cum_qty` delta needs locally-persisted state
+to interpret as a quantity, and that state would be lost across a
+WebSocket reconnect, silently double- or under-counting fills.
+`last_qty`/`last_price` are self-contained per-event values that need no
+such state. A bounded (512-entry) recently-seen `exec_id`/`trade_id` set,
+scoped to each connection, skips an event redelivered within that window
+— a guard against the common case, not a full exactly-once guarantee.
+
+Each `FillEvent` is applied via `RiskEngine::apply_fill(symbol, side, qty,
+price)`, which:
+- Tracks position on an **average-cost basis** per symbol
+  (`PositionState { qty, avg_entry_price }`): a fill in the same direction
+  extends the position and rolls the average entry price forward,
+  size-weighted; a fill in the opposite direction realizes PnL against
+  that average price for the closing quantity, and any quantity beyond a
+  full close flips the position onto a fresh average-entry basis at the
+  fill price.
+- Accumulates realized PnL for the current UTC day (`realized_pnl_usd`),
+  reset via a day-index rollover (`unix_seconds / 86_400`) computed with
+  only `std::time` — no `chrono` dependency needed for a UTC day
+  boundary.
+- Feeds a new `check_kill_switch` check, now the **first** check inside
+  `evaluate()` (before rate limiting): once realized loss for the day
+  reaches `kill_switch_max_daily_loss_usd`, every order is rejected until
+  the day rolls over. Like every other check in this module, an
+  unparseable config value fails closed (rejects everything) rather than
+  silently disabling the switch.
+
+The existing per-symbol and portfolio-wide position-limit checks in
+`evaluate()` now read live position data instead of a value that could
+only ever be zero.
+
+**Verified**: 9 new unit tests (`cargo test`, 31/31 passing project-wide)
+cover opening a position, weighted-average-price extension, realizing a
+gain, realizing a loss with a position flip, the kill switch tripping
+after the configured daily loss and staying silent on a gain, and
+`kraken_private_ws.rs`'s `build_fill_event` parsing (a `"trade"` exec
+type, non-trade types being ignored, the `exec_id`/`trade_id` fallback,
+and a trade missing required fields being skipped rather than panicking).
+A live smoke run against real Kraken market data (fake execution
+credentials) confirmed the whole process still starts, connects, and
+reconnects cleanly with this wiring in place — no observable behavior
+change from before except the added fill/kill-switch logging, since fake
+credentials never reach a real fill.
+
+**What's NOT verified, for the same reason as the section above**: no
+real fill has ever been applied through this path, since that requires a
+real account's `executions` channel to actually emit a `"trade"`-type
+event. The `exec_type`/`last_qty`/`last_price`/`side` field names come
+from Kraken's public v2 documentation, not an observed report — get a
+real fill on a funded account before trusting this for real risk
+management. The read accessors `RiskEngine::position` and
+`RiskEngine::realized_pnl_today` are public but not yet exposed anywhere
+(no gRPC endpoint or log line surfaces them to an operator) — a natural
+next step once this is worth watching live.

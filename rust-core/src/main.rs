@@ -125,7 +125,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let symbols = config.symbols_for_exchange(&exchange.name);
         let client = client.clone();
         let order_updates_tx = order_updates_tx.clone();
-        tokio::spawn(kraken_private_ws::run(symbols, client, order_updates_tx));
+        let risk_engine = risk_engine.clone();
+        tokio::spawn(kraken_private_ws::run(symbols, client, order_updates_tx, risk_engine));
     }
 
     let execution_clients = Arc::new(execution_clients);

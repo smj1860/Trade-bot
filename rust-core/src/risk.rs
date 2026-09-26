@@ -14,7 +14,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rust_decimal::Decimal;
 use tokio::sync::Mutex;
@@ -24,6 +24,7 @@ use crate::orderbook::SharedBooks;
 use crate::proto::pb::{OrderRequest, OrderSide};
 
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const SECONDS_PER_DAY: u64 = 86_400;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RiskVerdict {
@@ -31,16 +32,61 @@ pub enum RiskVerdict {
     Rejected(String),
 }
 
+/// Net position in a single symbol, tracked on an average-cost basis. A
+/// fill in the same direction as `qty` extends the position and rolls
+/// `avg_entry_price` forward as a size-weighted average; a fill in the
+/// opposite direction closes some or all of the position and realizes PnL
+/// against `avg_entry_price` for the overlapping quantity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PositionState {
+    qty: Decimal,
+    avg_entry_price: Decimal,
+}
+
+impl PositionState {
+    const ZERO: PositionState = PositionState {
+        qty: Decimal::ZERO,
+        avg_entry_price: Decimal::ZERO,
+    };
+}
+
+/// UTC day index (days since the Unix epoch) used to decide when the daily
+/// kill-switch counter should reset. Deliberately avoids a `chrono`
+/// dependency — integer division of Unix seconds by seconds-per-day is a
+/// correct UTC day boundary on its own.
+fn current_day_index() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() / SECONDS_PER_DAY)
+        .unwrap_or(0)
+}
+
+/// Sign of a `Decimal` as -1/0/1, via comparison rather than relying on a
+/// `Decimal::signum()` API this codebase hasn't otherwise exercised.
+fn sign_of(d: Decimal) -> i32 {
+    if d > Decimal::ZERO {
+        1
+    } else if d < Decimal::ZERO {
+        -1
+    } else {
+        0
+    }
+}
+
 pub struct RiskEngine {
     config: Arc<Config>,
     books: SharedBooks,
-    /// Net position per normalized symbol, in base-asset units. Positive =
-    /// long. Updated only on confirmed fills (not wired up yet — no
-    /// exchange execution client exists, so this stays at zero for every
-    /// symbol in this build; the position-limit checks below are real and
-    /// tested, they just have nothing but zero to start from).
-    positions: Mutex<HashMap<String, Decimal>>,
+    /// Net position per normalized symbol, average-cost basis. Updated only
+    /// on confirmed fills coming from `apply_fill` (driven by Kraken's
+    /// private execution feed — see kraken_private_ws.rs). Starts empty, so
+    /// every symbol reads as flat until a real fill has been applied.
+    positions: Mutex<HashMap<String, PositionState>>,
     recent_order_times: Mutex<VecDeque<Instant>>,
+    /// Realized PnL (USD) accumulated since the start of the current UTC
+    /// day, per the kill switch. Reset to zero whenever `kill_switch_day`
+    /// rolls over.
+    realized_pnl_usd: Mutex<Decimal>,
+    kill_switch_day: Mutex<u64>,
 }
 
 impl RiskEngine {
@@ -50,10 +96,154 @@ impl RiskEngine {
             books,
             positions: Mutex::new(HashMap::new()),
             recent_order_times: Mutex::new(VecDeque::new()),
+            realized_pnl_usd: Mutex::new(Decimal::ZERO),
+            kill_switch_day: Mutex::new(current_day_index()),
         }
     }
 
+    /// Applies a confirmed fill from the exchange to this symbol's tracked
+    /// position, realizing PnL against the existing average entry price for
+    /// any quantity that closes or flips the position. `qty` is always
+    /// positive (the size of this specific fill); `side` says which
+    /// direction it moved the position.
+    ///
+    /// Deliberately driven by Kraken's per-execution `last_qty`/`last_price`
+    /// fields (see kraken_private_ws.rs), not by diffing `cum_qty` across
+    /// messages — a `cum_qty` delta requires locally-persisted state to
+    /// interpret, and that state would be lost/reset across a WebSocket
+    /// reconnect, silently double- or under-counting fills. A per-event
+    /// delta needs no such state.
+    pub async fn apply_fill(&self, symbol: &str, side: OrderSide, qty: Decimal, price: Decimal) {
+        if qty <= Decimal::ZERO {
+            tracing::warn!(symbol, ?side, %qty, "apply_fill called with non-positive quantity, ignoring");
+            return;
+        }
+
+        self.maybe_roll_over_day().await;
+
+        let signed_qty = match side {
+            OrderSide::Sell => -qty,
+            _ => qty,
+        };
+
+        let mut realized_delta = Decimal::ZERO;
+        {
+            let mut positions = self.positions.lock().await;
+            let current = positions.get(symbol).copied().unwrap_or(PositionState::ZERO);
+
+            if current.qty.is_zero() || sign_of(current.qty) == sign_of(signed_qty) {
+                // Opening or extending a position in the same direction:
+                // roll the average entry price forward, size-weighted.
+                let new_qty = current.qty + signed_qty;
+                let new_avg = if new_qty.is_zero() {
+                    Decimal::ZERO
+                } else {
+                    ((current.qty.abs() * current.avg_entry_price) + (qty * price)) / new_qty.abs()
+                };
+                positions.insert(
+                    symbol.to_string(),
+                    PositionState {
+                        qty: new_qty,
+                        avg_entry_price: new_avg,
+                    },
+                );
+            } else {
+                // Opposite direction: this fill closes some or all of the
+                // existing position, realizing PnL on the closed quantity
+                // against the existing average entry price.
+                let closing_qty = qty.min(current.qty.abs());
+                let pnl_per_unit = if current.qty > Decimal::ZERO {
+                    price - current.avg_entry_price
+                } else {
+                    current.avg_entry_price - price
+                };
+                realized_delta = pnl_per_unit * closing_qty;
+
+                let leftover = qty - closing_qty;
+                let new_qty = current.qty + signed_qty;
+                if leftover > Decimal::ZERO {
+                    // The fill was larger than the existing position: it
+                    // fully closes it and flips to a fresh position on the
+                    // remaining quantity, with a new average-entry basis.
+                    positions.insert(
+                        symbol.to_string(),
+                        PositionState {
+                            qty: new_qty,
+                            avg_entry_price: price,
+                        },
+                    );
+                } else {
+                    // Partial or exact close: position shrinks (or hits
+                    // zero) but the average entry price for whatever
+                    // remains is unchanged.
+                    positions.insert(
+                        symbol.to_string(),
+                        PositionState {
+                            qty: new_qty,
+                            avg_entry_price: if new_qty.is_zero() { Decimal::ZERO } else { current.avg_entry_price },
+                        },
+                    );
+                }
+            }
+        }
+
+        if !realized_delta.is_zero() {
+            let mut realized = self.realized_pnl_usd.lock().await;
+            *realized += realized_delta;
+            tracing::info!(symbol, %realized_delta, total_today = %*realized, "realized PnL updated from fill");
+        }
+    }
+
+    /// Current net position for a symbol, in base-asset units. Zero for any
+    /// symbol with no fills applied yet.
+    pub async fn position(&self, symbol: &str) -> Decimal {
+        self.positions.lock().await.get(symbol).map(|p| p.qty).unwrap_or(Decimal::ZERO)
+    }
+
+    /// Realized PnL (USD) accumulated since the start of the current UTC
+    /// day.
+    pub async fn realized_pnl_today(&self) -> Decimal {
+        *self.realized_pnl_usd.lock().await
+    }
+
+    /// Resets the daily realized-PnL counter when the UTC day has rolled
+    /// over since it was last checked.
+    async fn maybe_roll_over_day(&self) {
+        let today = current_day_index();
+        let mut day = self.kill_switch_day.lock().await;
+        if *day != today {
+            *day = today;
+            let mut realized = self.realized_pnl_usd.lock().await;
+            tracing::info!(previous_total = %*realized, "kill switch day rolled over, resetting realized PnL");
+            *realized = Decimal::ZERO;
+        }
+    }
+
+    /// Fails closed on a bad config, consistent with the rest of this
+    /// module: an unparseable daily-loss limit rejects every order rather
+    /// than silently disabling the kill switch.
+    async fn check_kill_switch(&self) -> Option<String> {
+        self.maybe_roll_over_day().await;
+
+        let Ok(max_daily_loss) = Decimal::from_str(&self.config.risk.global.kill_switch_max_daily_loss_usd) else {
+            return Some("invalid config: kill_switch_max_daily_loss_usd".to_string());
+        };
+
+        let realized = *self.realized_pnl_usd.lock().await;
+        if realized <= -max_daily_loss {
+            return Some(format!(
+                "daily kill switch triggered: realized loss {realized} has reached/exceeded the \
+                 max daily loss of {max_daily_loss} — no further orders will be approved today"
+            ));
+        }
+        None
+    }
+
     pub async fn evaluate(&self, order: &OrderRequest) -> RiskVerdict {
+        if let Some(reason) = self.check_kill_switch().await {
+            return RiskVerdict::Rejected(reason);
+        }
+
         if let Some(reason) = self.check_rate_limit().await {
             return RiskVerdict::Rejected(reason);
         }
@@ -117,7 +307,7 @@ impl RiskEngine {
         let signed_qty = if side == OrderSide::Buy { qty } else { -qty };
         let current_position = {
             let positions = self.positions.lock().await;
-            positions.get(&order.symbol).copied().unwrap_or(Decimal::ZERO)
+            positions.get(&order.symbol).map(|p| p.qty).unwrap_or(Decimal::ZERO)
         };
         let projected_notional = ((current_position + signed_qty) * price).abs();
         if projected_notional > max_position_usd {
@@ -187,12 +377,12 @@ impl RiskEngine {
         let books = self.books.lock().await;
         let mut total = Decimal::ZERO;
         for (symbol, position) in positions.iter() {
-            if symbol == exclude_symbol || position.is_zero() {
+            if symbol == exclude_symbol || position.qty.is_zero() {
                 continue;
             }
             if let Some(book) = books.get(symbol) {
                 if let Some((price, _)) = book.best_bid() {
-                    total += (*position * price).abs();
+                    total += (position.qty * price).abs();
                 }
             }
         }
@@ -320,5 +510,83 @@ mod tests {
         assert_eq!(engine.evaluate(&order).await, RiskVerdict::Approved);
         // third order within the window exceeds the limit of 2/minute
         assert!(matches!(engine.evaluate(&order).await, RiskVerdict::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn apply_fill_opens_and_tracks_a_long_position() {
+        let engine = RiskEngine::new(Arc::new(test_config()), new_shared_books());
+        engine
+            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("30000").unwrap())
+            .await;
+        assert_eq!(engine.position("BTC-USD").await, Decimal::from_str("0.01").unwrap());
+        assert_eq!(engine.realized_pnl_today().await, Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn apply_fill_extends_a_position_with_a_weighted_average_entry_price() {
+        let engine = RiskEngine::new(Arc::new(test_config()), new_shared_books());
+        engine
+            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("30000").unwrap())
+            .await;
+        engine
+            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("32000").unwrap())
+            .await;
+        // 0.02 total, avg entry (30000 + 32000) / 2 = 31000
+        assert_eq!(engine.position("BTC-USD").await, Decimal::from_str("0.02").unwrap());
+
+        // Closing the full 0.02 @ 33000 realizes (33000 - 31000) * 0.02 = 40
+        engine
+            .apply_fill("BTC-USD", OrderSide::Sell, Decimal::from_str("0.02").unwrap(), Decimal::from_str("33000").unwrap())
+            .await;
+        assert_eq!(engine.position("BTC-USD").await, Decimal::ZERO);
+        assert_eq!(engine.realized_pnl_today().await, Decimal::from_str("40").unwrap());
+    }
+
+    #[tokio::test]
+    async fn apply_fill_realizes_a_loss_and_flips_the_position_on_overshoot() {
+        let engine = RiskEngine::new(Arc::new(test_config()), new_shared_books());
+        engine
+            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("30000").unwrap())
+            .await;
+
+        // Sell 0.02 @ 29000: closes the 0.01 long at a loss of (29000-30000)*0.01 = -10,
+        // then flips to a fresh 0.01 short at an entry price of 29000.
+        engine
+            .apply_fill("BTC-USD", OrderSide::Sell, Decimal::from_str("0.02").unwrap(), Decimal::from_str("29000").unwrap())
+            .await;
+        assert_eq!(engine.position("BTC-USD").await, Decimal::from_str("-0.01").unwrap());
+        assert_eq!(engine.realized_pnl_today().await, Decimal::from_str("-10").unwrap());
+    }
+
+    #[tokio::test]
+    async fn kill_switch_rejects_orders_after_daily_loss_limit_hit() {
+        let engine = RiskEngine::new(Arc::new(test_config()), new_shared_books());
+        // max daily loss in test_config is 500. Realize a 600 loss: go long
+        // 1.0 @ 30000, then close it at 29400 (loss of 600).
+        engine
+            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("1.0").unwrap(), Decimal::from_str("30000").unwrap())
+            .await;
+        engine
+            .apply_fill("BTC-USD", OrderSide::Sell, Decimal::from_str("1.0").unwrap(), Decimal::from_str("29400").unwrap())
+            .await;
+        assert_eq!(engine.realized_pnl_today().await, Decimal::from_str("-600").unwrap());
+
+        let order = buy_order("BTC-USD", "0.01", Some("30000"));
+        assert!(matches!(engine.evaluate(&order).await, RiskVerdict::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn kill_switch_does_not_trip_on_gains() {
+        let engine = RiskEngine::new(Arc::new(test_config()), new_shared_books());
+        engine
+            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("30000").unwrap())
+            .await;
+        engine
+            .apply_fill("BTC-USD", OrderSide::Sell, Decimal::from_str("0.01").unwrap(), Decimal::from_str("31000").unwrap())
+            .await;
+        assert_eq!(engine.realized_pnl_today().await, Decimal::from_str("10").unwrap());
+
+        let order = buy_order("BTC-USD", "0.01", Some("30000"));
+        assert_eq!(engine.evaluate(&order).await, RiskVerdict::Approved);
     }
 }
