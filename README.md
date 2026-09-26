@@ -525,3 +525,54 @@ private-endpoint-shaped in this project**: no real reconciliation has ever
 run against an account with actual open or recently-closed orders, since
 that requires a funded account. The `OpenOrders`/`QueryOrders` response
 shapes come from Kraken's public documentation, not an observed response.
+
+## Symbol universe expansion (config/config.example.toml, docs/training-universe.md)
+
+Expanded live/config coverage from BTC-USD/ETH-USD only to the full
+13-symbol candidate universe recorded in `docs/training-universe.md`
+(Macro Anchor Baseline, Specialized Macro, High-Beta L1 Momentum, DeFi &
+Structural Rotations, Cross-Ecosystem/Infrastructure) — all 13 now
+`enabled = true`.
+
+**Verified live, not assumed**, per this project's standing "trust but
+verify" rule: every symbol's WS v2 pair name was confirmed by actually
+opening a `wss://ws.kraken.com/v2` public `book`-channel subscription and
+observing a real snapshot (not just an ack) come back, rather than trusted
+from Kraken's own `AssetPairs.wsname` field or from documentation.
+`wsname` turned out to be actively misleading for this purpose — for BTC
+it reports `XBT/USD` while the real WS v2 name is `BTC/USD` (already
+known), and the same split was found for DOGE (`wsname` says `XDG/USD`,
+live WS v2 name is `DOGE/USD`). `rest_native_symbol`, `tick_size`, and
+`lot_size` for all 13 came from a live `/0/public/AssetPairs` REST query
+(`altname`, `pair_decimals`, `lot_decimals`).
+
+**Quote currency decided: USD for all 13** (previously an open question).
+Six of the thirteen symbols (NEAR, SUI, UNI, AAVE, PENDLE, TAO) have no
+Kraken USDT pair at all, so USD is the only currency that covers the whole
+universe; standardizing on it keeps every symbol's config uniform.
+
+**`[risk.global].max_total_position_usd` raised from 10000 to 20000.**
+The sum of all 13 symbols' individual `max_position_usd` caps is ~24,500,
+so leaving the global cap at 10000 would have made it the binding
+constraint almost immediately with only two or three symbols holding a
+position at once; 20000 stays a real, meaningfully-enforced ceiling
+(`risk.rs`'s `combined_exposure_excluding`) without being high enough to
+be decorative. Per-symbol risk limits for the 11 new symbols follow the
+same conservative sizing philosophy as the original BTC/ETH entries, each
+`max_order_size` sized against the live price observed during
+verification.
+
+**Verified**: `cargo build` clean; a live smoke run
+(`CONFIG_PATH=../config/config.example.toml`) confirmed the config parses
+correctly (`symbols=13` in the startup log) and the process sends a real
+WS v2 book subscription covering all 13 symbols
+(`BTC/USD, ETH/USD, XRP/USD, DOGE/USD, SOL/USD, AVAX/USD, NEAR/USD,
+SUI/USD, UNI/USD, AAVE/USD, PENDLE/USD, LINK/USD, TAO/USD`).
+
+**Safe by construction**: `[execution].dry_run` defaults to `true`, so
+enabling all 13 symbols for market-data ingestion and the risk engine
+carries no live-order risk regardless — no real order can be placed
+without an explicit `dry_run = false` flip.
+
+See `docs/training-universe.md` for the full per-symbol verification
+table and rationale.

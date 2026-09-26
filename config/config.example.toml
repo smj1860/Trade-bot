@@ -20,28 +20,40 @@ enabled = true
 # Symbols to trade. Each entry is fully self-contained: which exchange(s) it
 # trades on, its precision (tick/lot size), and its own risk limits. Adding a
 # new coin/pair is adding one [[symbols]] block.
-# -----------------------------------------------------------------------------
-
-# -----------------------------------------------------------------------------
-# Symbols to trade. Each entry is fully self-contained: which exchange(s) it
-# trades on, its precision (tick/lot size), and its own risk limits. Adding a
-# new coin/pair is adding one [[symbols]] block.
 #
 # NOTE on Kraken specifically: its WebSocket API v2 uses slash-delimited pairs
 # with the modern asset code, e.g. "BTC/USD" (not the legacy REST v0 codes
-# like "XXBTZUSD" or "XBT/USD"). tick_size/lot_size below are placeholders —
-# pull real values per-pair from Kraken's AssetPairs REST endpoint before
-# trading live, since they vary by pair and Kraken updates them.
+# like "XXBTZUSD" or "XBT/USD"). Every exchange_native_symbol, rest_native_symbol,
+# tick_size and lot_size below (all 13 symbols) was verified live on 2026-09-26:
+# WS v2 naming by actually opening a public `book` subscription for each pair
+# and confirming Kraken accepted it and streamed real order-book data (no
+# credentials needed for that — see docs/training-universe.md for the full
+# verification record); REST altname/tick/lot from a live
+# /0/public/AssetPairs query. Re-verify before trading live again if this file
+# has aged, since Kraken can change these.
+#
+# All 13 are quoted in USD (not USDT) — a deliberate decision, not a
+# placeholder: 6 of the 13 (NEAR, SUI, UNI, AAVE, PENDLE, TAO) have no Kraken
+# USDT pair at all, only USD, so USD is the only quote currency that covers
+# every symbol in this set without a per-symbol exception. See
+# docs/training-universe.md for the full comparison.
+#
+# Every symbol below is enabled for market-data ingestion and the risk
+# engine. This is still safe by default: [execution].dry_run = true (below)
+# means no real order can be placed on ANY of these regardless of this flag
+# — validate=true only, until dry_run is explicitly turned off per the
+# warning in that section.
 # -----------------------------------------------------------------------------
+
+# --- Macro Anchor Baseline ---------------------------------------------------
 
 [[symbols]]
 symbol = "BTC-USD"          # normalized internal representation
 exchange = "kraken"
-exchange_native_symbol = "BTC/USD"  # Kraken WS v2 pair format
-rest_native_symbol = "XBTUSD"       # Kraken REST AddOrder altname — UNVERIFIED,
-                                     # confirm against /0/public/AssetPairs
-tick_size = "0.1"           # placeholder — confirm via AssetPairs
-lot_size = "0.00000001"     # placeholder — confirm via AssetPairs
+exchange_native_symbol = "BTC/USD"  # Kraken WS v2 pair format — verified live
+rest_native_symbol = "XBTUSD"       # Kraken REST AddOrder altname — verified live
+tick_size = "0.1"           # verified live via AssetPairs
+lot_size = "0.00000001"     # verified live via AssetPairs
 enabled = true
 
   [symbols.risk]
@@ -52,11 +64,10 @@ enabled = true
 [[symbols]]
 symbol = "ETH-USD"
 exchange = "kraken"
-exchange_native_symbol = "ETH/USD"  # Kraken WS v2 pair format
-rest_native_symbol = "ETHUSD"       # Kraken REST AddOrder altname — UNVERIFIED,
-                                     # confirm against /0/public/AssetPairs
-tick_size = "0.01"          # placeholder — confirm via AssetPairs
-lot_size = "0.00000001"     # placeholder — confirm via AssetPairs
+exchange_native_symbol = "ETH/USD"  # Kraken WS v2 pair format — verified live
+rest_native_symbol = "ETHUSD"       # Kraken REST AddOrder altname — verified live
+tick_size = "0.01"          # verified live via AssetPairs
+lot_size = "0.00000001"     # verified live via AssetPairs
 enabled = true
 
   [symbols.risk]
@@ -64,14 +75,199 @@ enabled = true
   max_order_size = "1.0"
   max_order_notional_usd = "1500"
 
+# --- Specialized Macro -------------------------------------------------------
+# Decoupled news-driven flows (XRP) and extreme retail sentiment/pumps (DOGE).
+
+[[symbols]]
+symbol = "XRP-USD"
+exchange = "kraken"
+exchange_native_symbol = "XRP/USD"  # Kraken WS v2 pair format — verified live
+rest_native_symbol = "XRPUSD"       # Kraken REST AddOrder altname — verified live
+tick_size = "0.00001"       # verified live via AssetPairs
+lot_size = "0.00000001"     # verified live via AssetPairs
+enabled = true
+
+  [symbols.risk]
+  max_position_usd = "2000"
+  max_order_size = "500"        # ~$767 at the price observed during verification
+  max_order_notional_usd = "800"
+
+[[symbols]]
+symbol = "DOGE-USD"
+exchange = "kraken"
+# Same legacy/modern naming split as BTC: classic REST AssetPairs still
+# calls this pair "XDGUSD"/"XDG", but the live WS v2 subscription verified
+# on 2026-09-26 confirmed the modern "DOGE/USD" — same pattern as BTC's
+# "BTC/USD" vs its REST "XBT" naming.
+exchange_native_symbol = "DOGE/USD" # Kraken WS v2 pair format — verified live
+rest_native_symbol = "XDGUSD"       # Kraken REST AddOrder altname — verified live
+tick_size = "0.0000001"     # verified live via AssetPairs
+lot_size = "0.00000001"     # verified live via AssetPairs
+enabled = true
+
+  [symbols.risk]
+  max_position_usd = "2000"
+  max_order_size = "8000"       # ~$781 at the price observed during verification
+  max_order_notional_usd = "800"
+
+# --- High-Beta L1 Momentum ---------------------------------------------------
+# High-speed breakout continuation, volatility expansion, sharp pullback
+# entries — sized smaller per order than the macro pair above given the
+# higher volatility this category is chosen for.
+
+[[symbols]]
+symbol = "SOL-USD"
+exchange = "kraken"
+exchange_native_symbol = "SOL/USD"  # Kraken WS v2 pair format — verified live
+rest_native_symbol = "SOLUSD"       # Kraken REST AddOrder altname — verified live
+tick_size = "0.01"          # verified live via AssetPairs
+lot_size = "0.00000001"     # verified live via AssetPairs
+enabled = true
+
+  [symbols.risk]
+  max_position_usd = "1500"
+  max_order_size = "4"           # ~$486 at the price observed during verification
+  max_order_notional_usd = "500"
+
+[[symbols]]
+symbol = "AVAX-USD"
+exchange = "kraken"
+exchange_native_symbol = "AVAX/USD" # Kraken WS v2 pair format — verified live
+rest_native_symbol = "AVAXUSD"      # Kraken REST AddOrder altname — verified live
+tick_size = "0.001"         # verified live via AssetPairs
+lot_size = "0.00000001"     # verified live via AssetPairs
+enabled = true
+
+  [symbols.risk]
+  max_position_usd = "1500"
+  max_order_size = "45"          # ~$489 at the price observed during verification
+  max_order_notional_usd = "500"
+
+[[symbols]]
+symbol = "NEAR-USD"
+exchange = "kraken"
+exchange_native_symbol = "NEAR/USD" # Kraken WS v2 pair format — verified live
+rest_native_symbol = "NEARUSD"      # Kraken REST AddOrder altname — verified live
+tick_size = "0.0001"        # verified live via AssetPairs
+lot_size = "0.00000001"     # verified live via AssetPairs
+enabled = true
+
+  [symbols.risk]
+  max_position_usd = "1500"
+  max_order_size = "100"         # ~$486 at the price observed during verification
+  max_order_notional_usd = "500"
+
+[[symbols]]
+symbol = "SUI-USD"
+exchange = "kraken"
+exchange_native_symbol = "SUI/USD"  # Kraken WS v2 pair format — verified live
+rest_native_symbol = "SUIUSD"       # Kraken REST AddOrder altname — verified live
+tick_size = "0.0001"        # verified live via AssetPairs
+lot_size = "0.00001"        # verified live via AssetPairs
+enabled = true
+
+  [symbols.risk]
+  max_position_usd = "1500"
+  max_order_size = "400"         # ~$470 at the price observed during verification
+  max_order_notional_usd = "500"
+
+# --- DeFi & Structural Rotations ---------------------------------------------
+# Mean-reversion in range-bound markets (UNI/AAVE) vs. decoupled protocol
+# trends (PENDLE).
+
+[[symbols]]
+symbol = "UNI-USD"
+exchange = "kraken"
+exchange_native_symbol = "UNI/USD"  # Kraken WS v2 pair format — verified live
+rest_native_symbol = "UNIUSD"       # Kraken REST AddOrder altname — verified live
+tick_size = "0.0001"        # verified live via AssetPairs
+lot_size = "0.00000001"     # verified live via AssetPairs
+enabled = true
+
+  [symbols.risk]
+  max_position_usd = "1500"
+  max_order_size = "50"          # ~$480 at the price observed during verification
+  max_order_notional_usd = "500"
+
+[[symbols]]
+symbol = "AAVE-USD"
+exchange = "kraken"
+exchange_native_symbol = "AAVE/USD" # Kraken WS v2 pair format — verified live
+rest_native_symbol = "AAVEUSD"      # Kraken REST AddOrder altname — verified live
+tick_size = "0.01"          # verified live via AssetPairs
+lot_size = "0.00000001"     # verified live via AssetPairs
+enabled = true
+
+  [symbols.risk]
+  max_position_usd = "1500"
+  max_order_size = "3"           # ~$465 at the price observed during verification
+  max_order_notional_usd = "500"
+
+[[symbols]]
+symbol = "PENDLE-USD"
+exchange = "kraken"
+exchange_native_symbol = "PENDLE/USD" # Kraken WS v2 pair format — verified live
+rest_native_symbol = "PENDLEUSD"      # Kraken REST AddOrder altname — verified live
+tick_size = "0.001"         # verified live via AssetPairs
+lot_size = "0.00001"        # verified live via AssetPairs
+enabled = true
+
+  [symbols.risk]
+  max_position_usd = "1500"
+  max_order_size = "190"         # ~$491 at the price observed during verification
+  max_order_notional_usd = "500"
+
+# --- Cross-Ecosystem / Infrastructure -----------------------------------------
+# High-liquidity infrastructure trends, distinct correlation cycles vs. BTC.
+
+[[symbols]]
+symbol = "LINK-USD"
+exchange = "kraken"
+exchange_native_symbol = "LINK/USD" # Kraken WS v2 pair format — verified live
+rest_native_symbol = "LINKUSD"      # Kraken REST AddOrder altname — verified live
+tick_size = "0.00001"       # verified live via AssetPairs
+lot_size = "0.00000001"     # verified live via AssetPairs
+enabled = true
+
+  [symbols.risk]
+  max_position_usd = "1500"
+  max_order_size = "35"          # ~$501 at the price observed during verification
+  max_order_notional_usd = "500"
+
+[[symbols]]
+symbol = "TAO-USD"
+exchange = "kraken"
+exchange_native_symbol = "TAO/USD"  # Kraken WS v2 pair format — verified live
+rest_native_symbol = "TAOUSD"       # Kraken REST AddOrder altname — verified live
+tick_size = "0.0001"        # verified live via AssetPairs
+lot_size = "0.00001"        # verified live via AssetPairs
+enabled = true
+
+  [symbols.risk]
+  max_position_usd = "1500"
+  max_order_size = "1.5"         # ~$493 at the price observed during verification
+  max_order_notional_usd = "500"
+
 # -----------------------------------------------------------------------------
 # Global risk guardrails — enforced in Rust regardless of what any strategy
 # or model requests. These are the last line of defense before an order
 # reaches the exchange.
+#
+# max_total_position_usd was raised from 10000 to 20000 when this config
+# expanded from 2 to 13 symbols — with 11 more max_position_usd budgets of
+# 1500-2000 each added above, the old 10000 cap would have made it
+# impossible for more than a handful of symbols to hold a position
+# simultaneously even well within their own per-symbol limits. This is
+# still a real, enforced portfolio-wide cap (see risk.rs's
+# combined_exposure_excluding), not merely descriptive — with all 13 near
+# their individual max_position_usd at once, combined exposure would be
+# ~$24,500, still above 20000, so the global cap remains a meaningful
+# constraint that forces trade-offs across symbols rather than a number
+# large enough to never bind.
 # -----------------------------------------------------------------------------
 
 [risk.global]
-max_total_position_usd = "10000"      # across all symbols combined
+max_total_position_usd = "20000"      # across all symbols combined
 max_orders_per_minute = 20
 kill_switch_max_daily_loss_usd = "500" # halts all trading if breached
 
