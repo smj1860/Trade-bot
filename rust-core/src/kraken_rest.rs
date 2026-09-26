@@ -23,6 +23,7 @@
 //!    plumbing, not the cryptography's correctness against a live,
 //!    authenticated account.
 
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -132,6 +133,45 @@ pub enum KrakenRestError {
 
 const ADD_ORDER_PATH: &str = "/0/private/AddOrder";
 const GET_WEBSOCKETS_TOKEN_PATH: &str = "/0/private/GetWebSocketsToken";
+const OPEN_ORDERS_PATH: &str = "/0/private/OpenOrders";
+const QUERY_ORDERS_PATH: &str = "/0/private/QueryOrders";
+const BALANCE_PATH: &str = "/0/private/Balance";
+/// Kraken's own documented cap on how many transaction IDs a single
+/// QueryOrders call accepts.
+const QUERY_ORDERS_MAX_TXIDS: usize = 50;
+
+/// One order as Kraken's `OpenOrders`/`QueryOrders` endpoints describe it —
+/// the same shape serves both (`QueryOrders` just adds a few fields this
+/// project doesn't need, like `closetm`). Used by reconcile.rs to cross-
+/// check this process's locally persisted order state against what Kraken
+/// actually has.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KrakenOrderInfo {
+    /// Only present if this order was placed with a `cl_ord_id`, which is
+    /// every order this project itself places — but a reconciliation pass
+    /// can also see orders it never placed (see reconcile.rs), and those
+    /// won't have one.
+    #[serde(default)]
+    pub cl_ord_id: Option<String>,
+    /// "open" (OpenOrders only) / "closed" / "canceled" / "expired"
+    /// (QueryOrders can return any terminal or non-terminal status).
+    pub status: String,
+    pub descr: KrakenOrderDescr,
+    /// Total order volume, decimal-as-string like everywhere else in this
+    /// project.
+    #[serde(default)]
+    pub vol: String,
+    /// Volume executed so far, decimal-as-string.
+    #[serde(default)]
+    pub vol_exec: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KrakenOrderDescr {
+    pub pair: String,
+    #[serde(rename = "type")]
+    pub side: String,
+}
 
 /// A token for Kraken's private (authenticated) WebSocket v2 feed —
 /// separate entirely from the public market-data feed in kraken.rs, which
@@ -203,6 +243,70 @@ impl KrakenRestClient {
         parsed
             .result
             .ok_or_else(|| KrakenRestError::Parse("GetWebSocketsToken response had no error but also no result".to_string()))
+    }
+
+    /// Every order Kraken currently considers open on this account, keyed
+    /// by exchange order ID (txid). Used by reconcile.rs at startup to
+    /// find out which locally-"open" orders Kraken no longer agrees are
+    /// open.
+    pub async fn get_open_orders(&self) -> Result<HashMap<String, KrakenOrderInfo>, KrakenRestError> {
+        #[derive(Debug, Deserialize)]
+        struct OpenOrdersResult {
+            #[serde(default)]
+            open: HashMap<String, KrakenOrderInfo>,
+        }
+
+        let text = self.signed_post(OPEN_ORDERS_PATH, vec![]).await?;
+        let parsed: KrakenResponse<OpenOrdersResult> = serde_json::from_str(&text)
+            .map_err(|e| KrakenRestError::Parse(format!("{e} — raw body: {text}")))?;
+        if !parsed.error.is_empty() {
+            return Err(KrakenRestError::Parse(format!("Kraken rejected OpenOrders: {:?}", parsed.error)));
+        }
+        Ok(parsed.result.map(|r| r.open).unwrap_or_default())
+    }
+
+    /// Looks up specific orders by exchange order ID (txid), whether open
+    /// or closed — this is how reconcile.rs finds out what actually
+    /// happened to a locally-"open" order that Kraken's OpenOrders no
+    /// longer lists (filled, canceled, or expired). `txids` must not
+    /// exceed Kraken's documented cap of 50 per call; the caller is
+    /// responsible for chunking a longer list.
+    pub async fn query_orders(&self, txids: &[String]) -> Result<HashMap<String, KrakenOrderInfo>, KrakenRestError> {
+        if txids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if txids.len() > QUERY_ORDERS_MAX_TXIDS {
+            return Err(KrakenRestError::Parse(format!(
+                "query_orders called with {} txids, exceeding Kraken's cap of {QUERY_ORDERS_MAX_TXIDS} per call",
+                txids.len()
+            )));
+        }
+
+        let form = vec![("txid", txids.join(","))];
+        let text = self.signed_post(QUERY_ORDERS_PATH, form).await?;
+        let parsed: KrakenResponse<HashMap<String, KrakenOrderInfo>> = serde_json::from_str(&text)
+            .map_err(|e| KrakenRestError::Parse(format!("{e} — raw body: {text}")))?;
+        if !parsed.error.is_empty() {
+            return Err(KrakenRestError::Parse(format!("Kraken rejected QueryOrders: {:?}", parsed.error)));
+        }
+        Ok(parsed.result.unwrap_or_default())
+    }
+
+    /// Current wallet balances, keyed by Kraken's own asset code (e.g.
+    /// `"ZUSD"`, `"XXBT"`). Informational only — a spot wallet balance is
+    /// not the same thing as `RiskEngine`'s tracked position, which starts
+    /// at zero when this process first runs and only reflects fills seen
+    /// since then. Reconciling the two would require knowing the account's
+    /// pre-bot holdings, which this project has no way to learn; this is
+    /// logged at startup purely so an operator can eyeball it.
+    pub async fn get_account_balance(&self) -> Result<HashMap<String, String>, KrakenRestError> {
+        let text = self.signed_post(BALANCE_PATH, vec![]).await?;
+        let parsed: KrakenResponse<HashMap<String, String>> = serde_json::from_str(&text)
+            .map_err(|e| KrakenRestError::Parse(format!("{e} — raw body: {text}")))?;
+        if !parsed.error.is_empty() {
+            return Err(KrakenRestError::Parse(format!("Kraken rejected Balance: {:?}", parsed.error)));
+        }
+        Ok(parsed.result.unwrap_or_default())
     }
 
     /// Shared signed-POST plumbing: builds the nonce, form-encodes
@@ -313,5 +417,57 @@ mod tests {
     fn rejects_non_base64_secret() {
         let err = sign("not valid base64 ###", "/0/private/AddOrder", "1", "x=1").unwrap_err();
         assert!(err.contains("base64"));
+    }
+
+    // These test only JSON parsing against synthetic responses shaped like
+    // Kraken's documented OpenOrders/QueryOrders/Balance schemas — they do
+    // NOT confirm that shape against a real response, for the same reason
+    // stated at the top of this module.
+
+    #[test]
+    fn parses_a_synthetic_open_orders_response() {
+        let body = r#"{
+            "error": [],
+            "result": {
+                "open": {
+                    "OQCLML-BW3P3-BUCMWZ": {
+                        "cl_ord_id": "co-1",
+                        "status": "open",
+                        "descr": {"pair": "XBTUSD", "type": "buy"},
+                        "vol": "1.00000000",
+                        "vol_exec": "0.00000000"
+                    }
+                }
+            }
+        }"#;
+        let parsed: KrakenResponse<serde_json::Value> = serde_json::from_str(body).unwrap();
+        assert!(parsed.error.is_empty());
+        let open = &parsed.result.unwrap()["open"];
+        let order: KrakenOrderInfo = serde_json::from_value(open["OQCLML-BW3P3-BUCMWZ"].clone()).unwrap();
+        assert_eq!(order.cl_ord_id.as_deref(), Some("co-1"));
+        assert_eq!(order.status, "open");
+        assert_eq!(order.descr.pair, "XBTUSD");
+        assert_eq!(order.descr.side, "buy");
+    }
+
+    #[test]
+    fn parses_a_synthetic_query_orders_response_with_no_cl_ord_id() {
+        // QueryOrders can return an order this project never placed
+        // (reconcile.rs's "Kraken has an order we don't know about" case),
+        // which never had a cl_ord_id to echo back.
+        let order: KrakenOrderInfo = serde_json::from_str(
+            r#"{"status": "closed", "descr": {"pair": "XBTUSD", "type": "sell"}, "vol": "0.5", "vol_exec": "0.5"}"#,
+        )
+        .unwrap();
+        assert_eq!(order.cl_ord_id, None);
+        assert_eq!(order.status, "closed");
+    }
+
+    #[test]
+    fn parses_a_synthetic_balance_response() {
+        let parsed: KrakenResponse<HashMap<String, String>> =
+            serde_json::from_str(r#"{"error": [], "result": {"ZUSD": "1000.0000", "XXBT": "0.5000000000"}}"#).unwrap();
+        let balances = parsed.result.unwrap();
+        assert_eq!(balances.get("ZUSD").map(String::as_str), Some("1000.0000"));
     }
 }

@@ -465,3 +465,63 @@ tool. The theoretical race noted in `Store::record_fill`'s doc comment
 insert) is accepted as-is: there is only ever one private-feed task per
 exchange in this project, so it doesn't occur in practice today, but would
 need a transaction if that ever changes.
+
+## Startup reconciliation (rust-core/src/reconcile.rs)
+
+Closes the exact gap the persistence section above named: until now, a
+restart trusted whatever `orders`/`positions` said in SQLite with no check
+against what Kraken itself actually has. Now, once a store and a real
+execution client both exist for an exchange, `main.rs` runs a
+reconciliation pass before starting the gRPC server (bounded by a 15s
+timeout, so an unreachable Kraken can't hang startup — a failure here is
+logged loudly and startup proceeds anyway, the same "optional
+infrastructure" posture as the persistence store itself).
+
+**What it does**: pulls every locally-persisted order that isn't already
+in a terminal status, calls Kraken's `OpenOrders` to see what Kraken still
+considers open, and for anything no longer on that list, calls
+`QueryOrders` (chunked at Kraken's 50-txid-per-call limit) to find out
+what actually happened — closed with executed quantity (a fill), closed
+with none, or canceled/expired. The local `orders` row is updated to
+match. Separately, any order Kraken lists as open that has no local record
+at all is logged as a warning — never adopted, since this process has no
+way to know that order's `strategy_id` or original intent.
+
+**Deliberately does NOT touch positions or PnL.** `RiskEngine`'s position
+and realized-PnL state is only ever mutated by `apply_fill`, driven by the
+live executions feed — reconciliation reading a historical `vol_exec` from
+`QueryOrders` and applying it there too would risk double-counting a fill
+the live feed already applied before a restart, and there's no reliable
+way from Kraken's order-level data alone to tell "already counted" from
+"missed while the process was down." Instead, when a since-closed order
+shows real executed quantity with no matching row in the `fills` table,
+that's surfaced as a `tracing::error!` (`possible_missed_fills` in the
+summary log line) for a human to check by hand against Kraken's own trade
+history — a conservative choice: it tells you exactly where to look
+instead of silently guessing and risking the wrong number.
+
+**Also added, informational only**: `KrakenRestClient::get_account_balance`
+(`/0/private/Balance`) — not called by reconciliation itself, since a spot
+wallet balance isn't the same thing as `RiskEngine`'s tracked position
+(which starts at zero when the bot first runs and only reflects fills
+since then; reconciling the two would require knowing the account's
+pre-bot holdings, which isn't knowable from here). It's available for a
+future operator-visibility feature rather than wired to anything yet.
+
+**Verified**: 15 new unit tests (`cargo test`, 53/53 passing project-wide)
+— JSON parsing for `OpenOrders`/`QueryOrders`/`Balance` against synthetic
+Kraken-shaped responses, and the reconciliation module's pure decision
+logic (`diff_local_vs_kraken_open`, `resolve_closed_status`,
+`kraken_open_with_no_local_record`) tested independently of any network
+call, the same split `kraken_rest.rs` itself uses for its signing logic. A
+live smoke run with fake credentials confirmed the real end-to-end path:
+the signed `OpenOrders` request reaches Kraken's server and gets back a
+genuine `EAPI:Invalid key` rejection, which is logged as a failed
+reconciliation pass without stopping the process — gRPC server, market
+data, and the private execution feed all start normally regardless.
+
+**What's NOT verified, for the same reason as everything else
+private-endpoint-shaped in this project**: no real reconciliation has ever
+run against an account with actual open or recently-closed orders, since
+that requires a funded account. The `OpenOrders`/`QueryOrders` response
+shapes come from Kraken's public documentation, not an observed response.

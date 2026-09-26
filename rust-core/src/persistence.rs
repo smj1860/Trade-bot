@@ -266,6 +266,23 @@ impl Store {
         Ok(exists.is_some())
     }
 
+    /// True if at least one fill has ever been recorded for this
+    /// `client_order_id` — used by startup reconciliation to flag an order
+    /// Kraken shows as executed (`vol_exec > 0`) but that this process
+    /// never saw a fill for, which points at a fill missed while the
+    /// process was down rather than a healthy, already-tracked position.
+    pub fn has_fill_for_order(&self, client_order_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM fills WHERE client_order_id = ?1 LIMIT 1",
+                params![client_order_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(exists.is_some())
+    }
+
     /// Appends a fill row. If `exec_id` is `Some` and a concurrent writer
     /// won the race since the caller's own `fill_exists` check (there is
     /// only ever one private-feed task per exchange in this project, so
@@ -465,6 +482,28 @@ mod tests {
         let conn = store.conn.lock().unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM fills", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn has_fill_for_order_reflects_whether_any_fill_was_recorded() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(!store.has_fill_for_order("co-1").unwrap());
+
+        store
+            .record_fill(&FillRecord {
+                exec_id: Some("EXEC-1".to_string()),
+                client_order_id: Some("co-1".to_string()),
+                symbol: "BTC-USD".to_string(),
+                side: "BUY".to_string(),
+                qty: Decimal::from_str("0.01").unwrap(),
+                price: Decimal::from_str("30000").unwrap(),
+                realized_pnl_usd: Decimal::ZERO,
+                applied_at_ns: 1,
+            })
+            .unwrap();
+
+        assert!(store.has_fill_for_order("co-1").unwrap());
+        assert!(!store.has_fill_for_order("co-2").unwrap());
     }
 
     #[test]

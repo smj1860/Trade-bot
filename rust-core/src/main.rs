@@ -7,6 +7,7 @@ mod order;
 mod orderbook;
 mod persistence;
 mod proto;
+mod reconcile;
 mod risk;
 
 use std::collections::HashMap;
@@ -106,18 +107,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(store) = &store {
         if let Err(e) = risk_engine.attach_store(store.clone()).await {
             tracing::error!(error = %e, "failed to load persisted risk state, continuing with in-memory-only state");
-        } else {
-            match store.load_open_orders() {
-                Ok(open) if !open.is_empty() => {
-                    tracing::warn!(
-                        count = open.len(),
-                        "found open orders from before this restart — nothing reconciles these \
-                         against Kraken's own order state yet, treat them as informational only"
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => tracing::error!(error = %e, "failed to load open orders from persistence store"),
-            }
         }
     }
 
@@ -150,6 +139,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // Startup reconciliation: cross-check what's locally persisted as
+    // "open" against what Kraken itself says is open, before this process
+    // starts trusting that local picture again. Only possible when both a
+    // store and a real execution client exist; a slow/unreachable Kraken
+    // is bounded by a timeout so a network hiccup can't hang startup
+    // forever — reconciliation not completing this run is logged loudly,
+    // not fatal, same as every other optional-infrastructure failure here.
+    if let Some(store) = &store {
+        for exchange in &config.exchanges {
+            let Some(client) = execution_clients.get(&exchange.name) else { continue };
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                reconcile::reconcile_startup_state(store, client, &exchange.name),
+            )
+            .await
+            {
+                Ok(Ok(summary)) => {
+                    tracing::info!(
+                        exchange = %exchange.name,
+                        locally_open_checked = summary.locally_open_checked,
+                        confirmed_still_open = summary.confirmed_still_open,
+                        closed_since_last_seen = summary.closed_since_last_seen,
+                        possible_missed_fills = summary.possible_missed_fills,
+                        kraken_open_with_no_local_record = summary.kraken_open_with_no_local_record,
+                        "startup reconciliation complete"
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(
+                        exchange = %exchange.name,
+                        error = %e,
+                        "startup reconciliation failed — continuing with whatever local order state was persisted, unverified"
+                    );
+                }
+                Err(_) => {
+                    tracing::error!(
+                        exchange = %exchange.name,
+                        "startup reconciliation timed out after 15s — continuing with whatever local order state was persisted, unverified"
+                    );
+                }
+            }
+        }
+    }
+
     // Real fills/status changes come from Kraken's private (authenticated)
     // WebSocket feed — entirely separate from the public market-data feed
     // above. One task per exchange that actually has an execution client
