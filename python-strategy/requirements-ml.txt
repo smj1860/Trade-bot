@@ -1,0 +1,7 @@
+# Optional: only needed if strategy_config.toml sets strategy.model.kind to
+# "sklearn" or "torch". Not required for the default "rule_based" model, and
+# deliberately kept out of requirements.txt so the baseline strategy has a
+# light dependency footprint.
+scikit-learn
+joblib
+torch

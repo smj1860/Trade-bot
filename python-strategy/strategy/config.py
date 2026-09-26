@@ -1,0 +1,116 @@
+"""
+Loads strategy_config.toml (or whatever path STRATEGY_CONFIG_PATH points at)
+into strongly-typed dataclasses. Mirrors the spirit of the Rust side's
+config.rs: nothing about a specific asset or model is hardcoded, it's all
+data from this file.
+"""
+
+from __future__ import annotations
+
+import os
+import tomllib
+from dataclasses import dataclass, field
+from decimal import Decimal
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class ConnectionConfig:
+    rust_core_addr: str
+
+
+@dataclass(frozen=True)
+class FeatureConfig:
+    momentum_window: int
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    kind: str  # "rule_based" | "sklearn" | "torch"
+    imbalance_weight: float
+    momentum_weight: float
+    model_path: str | None = None
+    feature_order: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StrategyConfig:
+    name: str
+    symbols: tuple[str, ...]
+    exchange: str
+    signal_threshold: float
+    cooldown_seconds: float
+    order_quantity: dict[str, Decimal]
+    features: FeatureConfig
+    model: ModelConfig
+
+
+@dataclass(frozen=True)
+class PortfolioConfig:
+    max_position: dict[str, Decimal]
+
+
+@dataclass(frozen=True)
+class LoggingConfig:
+    log_path: str
+    level: str
+
+
+@dataclass(frozen=True)
+class ExecutionConfig:
+    dry_run_only: bool = True
+
+
+@dataclass(frozen=True)
+class Config:
+    connection: ConnectionConfig
+    strategy: StrategyConfig
+    portfolio: PortfolioConfig
+    logging: LoggingConfig
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+
+    @staticmethod
+    def load(path: str | Path | None = None) -> "Config":
+        if path is None:
+            path = os.environ.get("STRATEGY_CONFIG_PATH", "strategy_config.example.toml")
+        path = Path(path)
+        with path.open("rb") as f:
+            raw = tomllib.load(f)
+
+        strategy_raw = raw["strategy"]
+        model_raw = strategy_raw["model"]
+
+        config = Config(
+            connection=ConnectionConfig(**raw["connection"]),
+            strategy=StrategyConfig(
+                name=strategy_raw["name"],
+                symbols=tuple(strategy_raw["symbols"]),
+                exchange=strategy_raw["exchange"],
+                signal_threshold=float(strategy_raw["signal_threshold"]),
+                cooldown_seconds=float(strategy_raw["cooldown_seconds"]),
+                order_quantity={k: Decimal(v) for k, v in strategy_raw["order_quantity"].items()},
+                features=FeatureConfig(momentum_window=int(strategy_raw["features"]["momentum_window"])),
+                model=ModelConfig(
+                    kind=model_raw["kind"],
+                    imbalance_weight=float(model_raw.get("imbalance_weight", 0.5)),
+                    momentum_weight=float(model_raw.get("momentum_weight", 0.5)),
+                    model_path=model_raw.get("model_path"),
+                    feature_order=tuple(model_raw.get("feature_order", ())),
+                ),
+            ),
+            portfolio=PortfolioConfig(
+                max_position={k: Decimal(v) for k, v in raw["portfolio"]["max_position"].items()}
+            ),
+            logging=LoggingConfig(**raw["logging"]),
+            execution=ExecutionConfig(**raw.get("execution", {})),
+        )
+
+        # Fail fast on an internally inconsistent config rather than
+        # discovering it mid-run: every symbol the strategy trades needs a
+        # configured order size, or we'll hit a KeyError deep inside a live
+        # event loop instead of at startup.
+        missing_sizes = [s for s in config.strategy.symbols if s not in config.strategy.order_quantity]
+        if missing_sizes:
+            raise ValueError(f"strategy.symbols includes symbols with no order_quantity configured: {missing_sizes}")
+
+        return config

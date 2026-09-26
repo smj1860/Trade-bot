@@ -1,0 +1,71 @@
+# -----------------------------------------------------------------------------
+# Example strategy-layer configuration — copy to strategy_config.toml and edit.
+# This is separate from config/config.example.toml (which configures the Rust
+# core): this file only controls Process B's behavior.
+# -----------------------------------------------------------------------------
+
+[connection]
+rust_core_addr = "localhost:50051"
+
+[strategy]
+name = "imbalance_momentum"
+# Which normalized symbols this strategy instance trades. Must be a subset of
+# what the Rust core is configured to track.
+symbols = ["BTC-USD", "ETH-USD"]
+exchange = "kraken"
+
+# Signal must exceed this magnitude (signal is in [-1, 1]) before the policy
+# turns it into an order at all. Below this, the strategy is treated as
+# having no opinion.
+signal_threshold = 0.35
+
+# Minimum time between two orders on the same symbol, regardless of signal —
+# a basic guard against a noisy signal firing repeatedly on the same move.
+cooldown_seconds = 30
+
+# Fixed order size per symbol, in base-asset units. A real strategy would size
+# from volatility/conviction; fixed size keeps this first version simple and
+# auditable. Must be below the Rust risk engine's per-symbol max_order_size
+# in config/config.example.toml, or every order gets rejected there.
+[strategy.order_quantity]
+BTC-USD = "0.001"
+ETH-USD = "0.01"
+
+# Feature engine parameters (see strategy/features.py).
+[strategy.features]
+# Number of order book updates kept in the rolling window used to compute
+# momentum (mid-price now vs. mid-price `momentum_window` updates ago).
+momentum_window = 20
+
+# Relative weight given to order-book imbalance vs. momentum when the
+# rule-based model combines them into a single signal. Must sum to 1.0.
+[strategy.model]
+kind = "rule_based"  # "rule_based" | "sklearn" | "torch"
+imbalance_weight = 0.6
+momentum_weight = 0.4
+# Only used when kind = "sklearn" or "torch":
+# model_path = "models/my_model.joblib"
+# feature_order = ["mid_price", "spread", "imbalance", "momentum"]
+
+# Soft, client-side position limits. These are advisory — the Rust risk
+# engine's config/config.example.toml limits are the real, enforced ones.
+# This just stops the strategy from repeatedly trying to add to a position
+# it should already consider "big enough," to cut down on noisy rejected
+# orders rather than to guarantee safety.
+[portfolio]
+[portfolio.max_position]
+BTC-USD = "0.01"
+ETH-USD = "0.1"
+
+[logging]
+log_path = "logs/strategy.jsonl"
+level = "INFO"
+
+[execution]
+# Belt-and-suspenders on top of the Rust core's own dry_run flag: when true,
+# the strategy computes and logs what it WOULD submit but never calls
+# SubmitOrder at all. Nothing reaches the network. Flip to false only once
+# you've reviewed a paper-mode log and are comfortable with what it does —
+# and even then, the Rust core's own execution.dry_run still gates whether
+# Kraken actually places anything.
+dry_run_only = true

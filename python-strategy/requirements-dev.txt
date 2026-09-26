@@ -1,0 +1,4 @@
+# Only needed to run the test suite and the log-plotting script — not
+# required to run the strategy engine itself.
+pytest
+matplotlib

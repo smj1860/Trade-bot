@@ -17,7 +17,12 @@ python-strategy/strategy/pb/*.pyi
 
 # Never commit real credentials or a filled-in config
 config/config.toml
+python-strategy/strategy_config.toml
 .env
+
+# Run artifacts, not source
+python-strategy/logs/
+python-strategy/.pytest_cache/
 
 # OS/editor cruft
 .DS_Store
