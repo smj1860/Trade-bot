@@ -33,6 +33,18 @@ def upsert_candles(conn, exchange: str, symbol: str, interval_minutes: int, cand
     """Idempotent insert: re-running a backfill over an already-stored range is a no-op."""
     if not candles:
         return 0
+
+    # Kraken's OHLC paging can hand back the same candle (same ts) twice
+    # across consecutive pages when the "since" boundary lands exactly on
+    # an existing candle. Postgres's ON CONFLICT DO UPDATE can't touch the
+    # same row twice within one statement (CardinalityViolation), so
+    # de-duplicate within this batch by (symbol, interval, ts) first,
+    # keeping the last occurrence — real live-fetched duplicates of the
+    # same candle are identical anyway, so which one wins doesn't matter.
+    deduped: dict[int, "Candle"] = {}
+    for c in candles:
+        deduped[c.ts_unix] = c
+
     rows = [
         (
             exchange,
@@ -47,7 +59,7 @@ def upsert_candles(conn, exchange: str, symbol: str, interval_minutes: int, cand
             c.volume,
             c.trade_count,
         )
-        for c in candles
+        for c in deduped.values()
     ]
     with conn.cursor() as cur:
         psycopg2.extras.execute_values(
@@ -75,9 +87,15 @@ def upsert_candles(conn, exchange: str, symbol: str, interval_minutes: int, cand
 def upsert_trades(conn, exchange: str, symbol: str, trades) -> int:
     if not trades:
         return 0
+
+    # Same overlap issue as upsert_candles above: Kraken's trade paging can
+    # repeat a trade across consecutive pages when the "since" cursor
+    # lands on it — de-duplicate by trade_id within this batch first.
+    deduped = {t.trade_id: t for t in trades}
+
     rows = [
         (exchange, symbol, t.trade_id, t.ts_unix_ns, t.price, t.volume, t.side, t.order_type)
-        for t in trades
+        for t in deduped.values()
     ]
     with conn.cursor() as cur:
         psycopg2.extras.execute_values(

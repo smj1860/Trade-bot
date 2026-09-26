@@ -162,13 +162,37 @@ talks to Postgres directly. Confirmed with Stephen before proceeding
   real candles fetched from Kraken above) — 5 rows inserted, still 5 rows
   after a repeat upsert of the same data, confirming the `on conflict`
   path is idempotent rather than duplicating.
-- **Not yet exercised**: the actual `db.py`/`psycopg2` connection path
-  from `backfill_ohlc.py`/`backfill_trades.py` themselves. That requires
-  `SUPABASE_DB_URL` with the real database password, which isn't
-  retrievable via the Supabase API — only Stephen has it (Project
-  Settings → Database → Connection string) or can reset it from the
-  dashboard. Once that's set, running `backfill_ohlc.py` for one symbol is
-  the remaining end-to-end check.
+## First real production run (2026-09-26)
+
+Ran end-to-end for the first time via the GitHub Actions workflow, once
+`SUPABASE_DB_URL` was set. Two real issues surfaced and were fixed:
+
+1. **Direct connection unreachable from GitHub's runners.** Supabase's
+   direct `db.xxxxx.supabase.co:5432` connection is IPv6-only by default;
+   GitHub Actions runners are IPv4-only, so the first run failed with
+   `Network is unreachable`. Fixed by switching `SUPABASE_DB_URL` to
+   Supabase's **Session pooler** connection string instead (from the
+   "Connect to your project" dialog → Connection Method → Session pooler
+   — explicitly described there as the alternative to direct connection
+   for IPv4 networks). Free, no IPv4 add-on purchase needed.
+
+2. **`CardinalityViolation: ON CONFLICT DO UPDATE command cannot affect
+   row a second time`**, thrown by `db.upsert_candles`. Kraken's OHLC
+   paging can return the same candle (same `ts`) twice across consecutive
+   `since`-cursor pages when the boundary lands exactly on an existing
+   candle — Postgres's `ON CONFLICT DO UPDATE` can't touch the same row
+   twice within a single statement. Fixed by de-duplicating each batch by
+   `ts_unix` (keeping the last occurrence) before building the insert in
+   `db.upsert_candles`, and applied the same defensive de-duplication to
+   `db.upsert_trades` by `trade_id`.
+
+After both fixes, the scheduled workflow run needs to be re-verified —
+see the "Not yet exercised" item below for what's still outstanding.
+
+- **Not yet exercised**: a clean, fully successful end-to-end run of the
+  scheduled GitHub Actions workflow after the two fixes above (last
+  attempt failed before the fixes were deployed). That's the remaining
+  check.
 
 ## Scheduled ingestion (.github/workflows/historical-backfill.yml)
 
