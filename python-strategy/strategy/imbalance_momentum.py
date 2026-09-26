@@ -23,7 +23,14 @@ class ImbalanceMomentumStrategy(Strategy):
     def __init__(self, config: Config, strategy_id: str = "imbalance-momentum-v1") -> None:
         self.strategy_id = strategy_id
         self._tradeable_symbols = set(config.strategy.symbols)
-        self._features = FeatureEngine(momentum_window=config.strategy.features.momentum_window)
+        self._features = FeatureEngine(
+            momentum_window=config.strategy.features.momentum_window,
+            bar_interval_seconds=config.strategy.features.bar_interval_minutes * 60,
+            sma_window=config.strategy.features.sma_window,
+            rsi_window=config.strategy.features.rsi_window,
+            vol_window=config.strategy.features.vol_window,
+            bar_momentum_window=config.strategy.features.bar_momentum_window,
+        )
         self._model: ModelWrapper = build_model(
             config.strategy.model.kind,
             imbalance_weight=config.strategy.model.imbalance_weight,
@@ -46,12 +53,14 @@ class ImbalanceMomentumStrategy(Strategy):
         best_ask_price: Decimal,
         best_ask_qty: Decimal,
         current_position: Decimal,
+        *,
+        timestamp: Optional[float] = None,
     ) -> Optional[StrategyDecision]:
         if symbol not in self._tradeable_symbols:
             return None
 
         features = self._features.on_order_book_update(
-            symbol, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty
+            symbol, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, timestamp=timestamp
         )
         if features is None:
             return None

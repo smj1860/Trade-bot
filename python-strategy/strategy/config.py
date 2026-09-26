@@ -22,6 +22,18 @@ class ConnectionConfig:
 @dataclass(frozen=True)
 class FeatureConfig:
     momentum_window: int
+    # Bar-derived feature parameters (see strategy/bars.py and
+    # strategy/indicators.py). bar_interval_minutes should match whatever
+    # interval_minutes the historical training data was pulled at (see
+    # historical-data/'s ohlc_candles table and docs/model-training.md) —
+    # that's what keeps a trained model's features identical to what the
+    # live engine computes. Defaults below match the 60-minute candles
+    # historical-data/backfill_ohlc.py backfills by default.
+    bar_interval_minutes: int = 60
+    sma_window: int = 20
+    rsi_window: int = 14
+    vol_window: int = 20
+    bar_momentum_window: int = 10
 
 
 @dataclass(frozen=True)
@@ -89,7 +101,14 @@ class Config:
                 signal_threshold=float(strategy_raw["signal_threshold"]),
                 cooldown_seconds=float(strategy_raw["cooldown_seconds"]),
                 order_quantity={k: Decimal(v) for k, v in strategy_raw["order_quantity"].items()},
-                features=FeatureConfig(momentum_window=int(strategy_raw["features"]["momentum_window"])),
+                features=FeatureConfig(
+                    momentum_window=int(strategy_raw["features"]["momentum_window"]),
+                    bar_interval_minutes=int(strategy_raw["features"].get("bar_interval_minutes", 60)),
+                    sma_window=int(strategy_raw["features"].get("sma_window", 20)),
+                    rsi_window=int(strategy_raw["features"].get("rsi_window", 14)),
+                    vol_window=int(strategy_raw["features"].get("vol_window", 20)),
+                    bar_momentum_window=int(strategy_raw["features"].get("bar_momentum_window", 10)),
+                ),
                 model=ModelConfig(
                     kind=model_raw["kind"],
                     imbalance_weight=float(model_raw.get("imbalance_weight", 0.5)),

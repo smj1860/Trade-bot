@@ -41,10 +41,18 @@ class Strategy(ABC):
         best_ask_price: Decimal,
         best_ask_qty: Decimal,
         current_position: Decimal,
+        *,
+        timestamp: Optional[float] = None,
     ) -> Optional[StrategyDecision]:
         """Called once per order book update for a symbol this strategy
         trades. Returns None only when there isn't yet enough book state
         to compute features (e.g. a one-sided book right after connecting)
         — once features exist, always return a StrategyDecision, even
-        when intent is None, so the engine can log what was considered."""
+        when intent is None, so the engine can log what was considered.
+
+        `timestamp` is the event's unix-seconds time, used by bar-derived
+        features (see strategy/bars.py); optional and keyword-only so
+        existing callers that don't have a timestamp handy (tests, mainly)
+        keep working unchanged — the feature engine falls back to
+        wall-clock time when it's omitted."""
         raise NotImplementedError

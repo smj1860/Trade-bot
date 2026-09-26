@@ -87,6 +87,15 @@ class Engine:
         best_ask = update.asks[0]
         current_position = self.portfolio.position(symbol)
 
+        # exchange_timestamp_ns is the exchange's own event time for this
+        # update (see proto/trading.proto); bar-derived features (see
+        # strategy/bars.py) bucket on this rather than on when we happened
+        # to process the message, so bars line up the same way whether
+        # processing is instantaneous or briefly delayed. A zero value
+        # (unset) falls back to None, which makes the feature engine use
+        # wall-clock time instead.
+        timestamp = update.exchange_timestamp_ns / 1_000_000_000 if update.exchange_timestamp_ns else None
+
         decision = self.strategy.on_order_book_update(
             symbol,
             Decimal(best_bid.price.value),
@@ -94,6 +103,7 @@ class Engine:
             Decimal(best_ask.price.value),
             Decimal(best_ask.quantity.value),
             current_position,
+            timestamp=timestamp,
         )
         if decision is None:
             return
@@ -105,6 +115,10 @@ class Engine:
             spread=decision.features.spread,
             imbalance=round(decision.features.imbalance, 4),
             momentum=round(decision.features.momentum, 6),
+            sma_ratio=round(decision.features.sma_ratio, 6),
+            rsi=round(decision.features.rsi, 4),
+            realized_vol=round(decision.features.realized_vol, 6),
+            bar_momentum=round(decision.features.bar_momentum, 6),
             signal=round(decision.signal, 4),
             order_side=decision.intent.side if decision.intent else None,
             position=current_position,

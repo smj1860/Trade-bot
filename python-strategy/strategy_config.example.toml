@@ -37,6 +37,24 @@ ETH-USD = "0.01"
 # momentum (mid-price now vs. mid-price `momentum_window` updates ago).
 momentum_window = 20
 
+# Bar-derived features (see strategy/bars.py + strategy/indicators.py):
+# sma_ratio, rsi, realized_vol, bar_momentum. These are computed over
+# fixed-duration bars built from mid-price ticks, not raw ticks, which is
+# what lets them be trained on Kraken's historical OHLC candles (unlike
+# imbalance/momentum above, which need live order-book depth that
+# historical data doesn't have — see docs/model-training.md).
+#
+# bar_interval_minutes MUST match whatever interval_minutes the training
+# data was pulled at (historical-data/backfill_ohlc.py's default is 60),
+# or a trained model will be scored against bars of a different length
+# than it was trained on. Window sizes below are sized to what's actually
+# available in ~1 month of hourly history as of this writing.
+bar_interval_minutes = 60
+sma_window = 20
+rsi_window = 14
+vol_window = 20
+bar_momentum_window = 10
+
 # Relative weight given to order-book imbalance vs. momentum when the
 # rule-based model combines them into a single signal. Must sum to 1.0.
 [strategy.model]
@@ -45,7 +63,7 @@ imbalance_weight = 0.6
 momentum_weight = 0.4
 # Only used when kind = "sklearn" or "torch":
 # model_path = "models/my_model.joblib"
-# feature_order = ["mid_price", "spread", "imbalance", "momentum"]
+# feature_order = ["mid_price", "spread", "imbalance", "momentum", "sma_ratio", "rsi", "realized_vol", "bar_momentum"]
 
 # Soft, client-side position limits. These are advisory — the Rust risk
 # engine's config/config.example.toml limits are the real, enforced ones.

@@ -95,6 +95,10 @@ class SklearnModelWrapper(ModelWrapper):
             "spread": float(features.spread),
             "imbalance": features.imbalance,
             "momentum": features.momentum,
+            "sma_ratio": features.sma_ratio,
+            "rsi": features.rsi,
+            "realized_vol": features.realized_vol,
+            "bar_momentum": features.bar_momentum,
         }
         try:
             return [values[name] for name in self._feature_order]
@@ -140,6 +144,10 @@ class TorchModelWrapper(ModelWrapper):
             "spread": float(features.spread),
             "imbalance": features.imbalance,
             "momentum": features.momentum,
+            "sma_ratio": features.sma_ratio,
+            "rsi": features.rsi,
+            "realized_vol": features.realized_vol,
+            "bar_momentum": features.bar_momentum,
         }
         try:
             return [values[name] for name in self._feature_order]

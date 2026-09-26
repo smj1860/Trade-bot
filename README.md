@@ -651,7 +651,26 @@ key, so they can't conflict. Needs `pandas`
 (`historical-data/requirements-csv.txt`, kept separate from the core
 pipeline's dependencies).
 
-**Not yet done**: no feature-engineering or training-set-assembly layer on
-top of the raw candles/trades; no data-quality or gap-detection tooling;
+**Not yet done**: no data-quality or gap-detection tooling;
 `backfill_trades.py` isn't in the scheduled workflow yet, only the OHLC
-backfill is.
+backfill is. Feature engineering is now underway — see the next section.
+
+## Model training / OHLC-derived features (docs/model-training.md)
+
+The live tick-level features (`imbalance`, `spread`) need live order-book
+depth that historical OHLC candles never recorded, so they can't be
+trained on. To get a real model trained against actual Kraken history
+without waiting on live depth to accumulate, the live feature engine was
+extended with new **bar-derived** features — `sma_ratio`, `rsi`,
+`realized_vol`, `bar_momentum` — computed by the same pure functions
+(`python-strategy/strategy/indicators.py`) both live (fed by
+`python-strategy/strategy/bars.py`'s tick-to-bar aggregator) and, once the
+training script exists, from Supabase's historical `ohlc_candles`. One
+implementation, so a trained model sees the exact same feature computation
+in training and in production. Full design, the tradeoffs considered, what
+changed, and a known live/historical approximation (mid-price vs. traded
+close):  `docs/model-training.md`.
+
+**Not yet built**: the training script itself (query Supabase, compute
+features and a label, time-ordered train/test split, train + evaluate a
+baseline classifier, save via `joblib`).

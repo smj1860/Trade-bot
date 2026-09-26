@@ -6,13 +6,14 @@ from strategy.features import Features
 from strategy.models import RuleBasedModel, build_model
 
 
-def make_features(imbalance: float = 0.0, momentum: float = 0.0) -> Features:
+def make_features(imbalance: float = 0.0, momentum: float = 0.0, **bar_features) -> Features:
     return Features(
         symbol="BTC-USD",
         mid_price=Decimal(100),
         spread=Decimal("0.5"),
         imbalance=imbalance,
         momentum=momentum,
+        **bar_features,
     )
 
 
@@ -82,3 +83,22 @@ def test_sklearn_wrapper_against_a_toy_model(tmp_path):
     assert -1.0 <= signal <= 1.0
     # Trained so positive features -> class 1 -> should lean positive.
     assert signal > 0
+
+
+def test_sklearn_wrapper_feature_vector_includes_bar_derived_features():
+    """_feature_vector must expose the new bar-derived feature names too,
+    so a feature_order referencing them (once a real model is trained on
+    historical Kraken candles) doesn't hit the "unknown feature" KeyError
+    path."""
+    from strategy.models import SklearnModelWrapper
+
+    class _FakeModel:
+        def predict(self, vector):
+            return [0.0]
+
+    wrapper = SklearnModelWrapper.__new__(SklearnModelWrapper)
+    wrapper._model = _FakeModel()
+    wrapper._feature_order = ["sma_ratio", "rsi", "realized_vol", "bar_momentum"]
+
+    features = make_features(sma_ratio=0.1, rsi=0.2, realized_vol=0.3, bar_momentum=0.4)
+    assert wrapper._feature_vector(features) == [0.1, 0.2, 0.3, 0.4]

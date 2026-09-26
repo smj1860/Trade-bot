@@ -67,3 +67,46 @@ def test_symbols_tracked_independently():
     assert eth.symbol == "ETH-USD"
     assert btc.momentum == 0.0
     assert eth.momentum == 0.0
+
+
+def test_bar_derived_features_default_to_neutral_with_no_bar_history():
+    # No timestamps passed in yet (or too little history) -> all bar-derived
+    # features should come back at their neutral 0.0 default, matching
+    # strategy.indicators' own "not enough history" convention.
+    engine = FeatureEngine(momentum_window=5, bar_interval_seconds=60)
+    features = engine.on_order_book_update(
+        "BTC-USD", Decimal(100), Decimal(1), Decimal(102), Decimal(1), timestamp=0.0
+    )
+    assert features.sma_ratio == 0.0
+    assert features.rsi == 0.0
+    assert features.realized_vol == 0.0
+    assert features.bar_momentum == 0.0
+
+
+def test_bar_derived_features_populate_once_bars_complete():
+    engine = FeatureEngine(
+        momentum_window=5,
+        bar_interval_seconds=60,
+        sma_window=3,
+        rsi_window=2,
+        vol_window=2,
+        bar_momentum_window=2,
+    )
+    # Each call's mid-price is (bid+ask)/2 = 100, 101, ..., rising steadily.
+    # One tick per 60s bucket -> each call after the first completes a bar
+    # with the previous call's mid-price as its close.
+    for i in range(5):
+        features = engine.on_order_book_update(
+            "BTC-USD",
+            Decimal(100 + i),
+            Decimal(1),
+            Decimal(102 + i),
+            Decimal(1),
+            timestamp=float(i * 60),
+        )
+    # After 5 ticks there are 4 completed bars: closes 101, 102, 103, 104
+    # (mid-price of each of the first four ticks).
+    assert features is not None
+    assert features.bar_momentum > 0  # steadily rising closes
+    assert features.rsi == 1.0  # every step was a gain
+    assert features.sma_ratio > 0  # most recent close above the window's average
