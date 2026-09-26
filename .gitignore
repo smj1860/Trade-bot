@@ -1,0 +1,24 @@
+# Rust
+/rust-core/target/
+
+# Python
+python-strategy/.venv/
+python-strategy/__pycache__/
+python-strategy/strategy/__pycache__/
+python-strategy/strategy/pb/__pycache__/
+*.pyc
+
+# Generated gRPC code — regenerate with generate_proto.sh rather than
+# committing it, so proto changes can't silently drift from the checked-in
+# generated files.
+python-strategy/strategy/pb/*_pb2.py
+python-strategy/strategy/pb/*_pb2_grpc.py
+python-strategy/strategy/pb/*.pyi
+
+# Never commit real credentials or a filled-in config
+config/config.toml
+.env
+
+# OS/editor cruft
+.DS_Store
+*.swp

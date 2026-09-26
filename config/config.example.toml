@@ -1,0 +1,89 @@
+# -----------------------------------------------------------------------------
+# Example configuration — copy to config.toml and edit.
+# Every trading symbol is config-driven: adding a new asset means adding a
+# block here, never touching code.
+# -----------------------------------------------------------------------------
+
+[general]
+# Normalized symbol format used everywhere internally: BASE-QUOTE
+log_level = "info"
+
+[[exchanges]]
+name = "kraken"
+ws_url = "wss://ws.kraken.com/v2"
+rest_url = "https://api.kraken.com"
+# API keys pulled from environment variables, never stored here:
+#   KRAKEN_API_KEY / KRAKEN_API_SECRET
+enabled = true
+
+# -----------------------------------------------------------------------------
+# Symbols to trade. Each entry is fully self-contained: which exchange(s) it
+# trades on, its precision (tick/lot size), and its own risk limits. Adding a
+# new coin/pair is adding one [[symbols]] block.
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Symbols to trade. Each entry is fully self-contained: which exchange(s) it
+# trades on, its precision (tick/lot size), and its own risk limits. Adding a
+# new coin/pair is adding one [[symbols]] block.
+#
+# NOTE on Kraken specifically: its WebSocket API v2 uses slash-delimited pairs
+# with the modern asset code, e.g. "BTC/USD" (not the legacy REST v0 codes
+# like "XXBTZUSD" or "XBT/USD"). tick_size/lot_size below are placeholders —
+# pull real values per-pair from Kraken's AssetPairs REST endpoint before
+# trading live, since they vary by pair and Kraken updates them.
+# -----------------------------------------------------------------------------
+
+[[symbols]]
+symbol = "BTC-USD"          # normalized internal representation
+exchange = "kraken"
+exchange_native_symbol = "BTC/USD"  # Kraken WS v2 pair format
+rest_native_symbol = "XBTUSD"       # Kraken REST AddOrder altname — UNVERIFIED,
+                                     # confirm against /0/public/AssetPairs
+tick_size = "0.1"           # placeholder — confirm via AssetPairs
+lot_size = "0.00000001"     # placeholder — confirm via AssetPairs
+enabled = true
+
+  [symbols.risk]
+  max_position_usd = "5000"     # max net exposure in this symbol
+  max_order_size = "0.05"       # max single order size, in base units
+  max_order_notional_usd = "2000"
+
+[[symbols]]
+symbol = "ETH-USD"
+exchange = "kraken"
+exchange_native_symbol = "ETH/USD"  # Kraken WS v2 pair format
+rest_native_symbol = "ETHUSD"       # Kraken REST AddOrder altname — UNVERIFIED,
+                                     # confirm against /0/public/AssetPairs
+tick_size = "0.01"          # placeholder — confirm via AssetPairs
+lot_size = "0.00000001"     # placeholder — confirm via AssetPairs
+enabled = true
+
+  [symbols.risk]
+  max_position_usd = "3000"
+  max_order_size = "1.0"
+  max_order_notional_usd = "1500"
+
+# -----------------------------------------------------------------------------
+# Global risk guardrails — enforced in Rust regardless of what any strategy
+# or model requests. These are the last line of defense before an order
+# reaches the exchange.
+# -----------------------------------------------------------------------------
+
+[risk.global]
+max_total_position_usd = "10000"      # across all symbols combined
+max_orders_per_minute = 20
+kill_switch_max_daily_loss_usd = "500" # halts all trading if breached
+
+# -----------------------------------------------------------------------------
+# Execution safety switch. dry_run = true sends every order to Kraken's
+# AddOrder endpoint with validate=true — Kraken checks and rejects/accepts
+# the request but NEVER places it on the order book. This defaults to true
+# even if this whole [execution] section is deleted from a config file, so
+# a config that says nothing about execution can never be misread as
+# permission to trade real money. Flip to false only once rest_native_symbol
+# values above have been verified against Kraken's own AssetPairs endpoint
+# and you have tested against a funded account you are prepared to risk.
+# -----------------------------------------------------------------------------
+[execution]
+dry_run = true

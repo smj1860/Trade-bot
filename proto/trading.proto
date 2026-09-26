@@ -1,0 +1,125 @@
+syntax = "proto3";
+
+package trading.v1;
+
+// ---------------------------------------------------------------------------
+// Currency-agnostic core: every message is keyed by `symbol`, normalized as
+// BASE-QUOTE (e.g. "BTC-USD", "ETH-USDT"). Nothing in this schema assumes a
+// specific asset. Exchange-native symbol formats are translated to/from this
+// normalized form at the exchange-adapter boundary inside the Rust service,
+// never here.
+// ---------------------------------------------------------------------------
+
+// All prices/quantities are transmitted as decimal strings, not floats, to
+// avoid binary floating-point rounding error. Rust uses rust_decimal::Decimal,
+// Python uses decimal.Decimal, on either side of the wire.
+
+message Decimal {
+  string value = 1; // e.g. "42891.53200000"
+}
+
+// --- Market data: Rust -> Python -------------------------------------------
+
+message OrderBookLevel {
+  Decimal price = 1;
+  Decimal quantity = 2;
+}
+
+message OrderBookUpdate {
+  string symbol = 1;          // normalized, e.g. "BTC-USD"
+  string exchange = 2;        // e.g. "coinbase"
+  int64 exchange_timestamp_ns = 3;
+  int64 received_timestamp_ns = 4;
+  repeated OrderBookLevel bids = 5; // sorted best-to-worst
+  repeated OrderBookLevel asks = 6; // sorted best-to-worst
+  uint64 sequence = 7;        // per-symbol monotonic sequence number
+}
+
+message Metric {
+  string symbol = 1;
+  string name = 2;            // e.g. "spread", "mid_price", "imbalance"
+  Decimal value = 3;
+  int64 timestamp_ns = 4;
+}
+
+message MarketDataEvent {
+  oneof event {
+    OrderBookUpdate order_book_update = 1;
+    Metric metric = 2;
+  }
+}
+
+// --- Trading decisions: Python -> Rust --------------------------------------
+
+enum OrderSide {
+  ORDER_SIDE_UNSPECIFIED = 0;
+  ORDER_SIDE_BUY = 1;
+  ORDER_SIDE_SELL = 2;
+}
+
+enum OrderType {
+  ORDER_TYPE_UNSPECIFIED = 0;
+  ORDER_TYPE_LIMIT = 1;
+  ORDER_TYPE_MARKET = 2;
+}
+
+message OrderRequest {
+  string client_order_id = 1;  // UUID assigned by Python side
+  string symbol = 2;           // normalized
+  string exchange = 3;
+  OrderSide side = 4;
+  OrderType type = 5;
+  Decimal quantity = 6;
+  Decimal limit_price = 7;     // unset for market orders
+  string strategy_id = 8;      // which strategy/model generated this
+}
+
+// --- Order lifecycle: Rust -> Python ----------------------------------------
+
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  ORDER_STATUS_ACCEPTED = 1;
+  ORDER_STATUS_REJECTED = 2;   // e.g. failed a risk guardrail
+  ORDER_STATUS_PARTIALLY_FILLED = 3;
+  ORDER_STATUS_FILLED = 4;
+  ORDER_STATUS_CANCELED = 5;
+}
+
+message OrderUpdate {
+  string client_order_id = 1;
+  string exchange_order_id = 2;
+  string symbol = 3;
+  OrderStatus status = 4;
+  string reject_reason = 5;    // populated only when status == REJECTED
+  Decimal filled_quantity = 6;
+  Decimal remaining_quantity = 7;
+  Decimal avg_fill_price = 8;
+  int64 timestamp_ns = 9;
+}
+
+// --- Services ----------------------------------------------------------------
+
+service MarketDataService {
+  // Python subscribes to a stream of order book updates / metrics for a set
+  // of symbols. `symbols` empty means "all symbols this Rust instance is
+  // configured to track."
+  rpc SubscribeMarketData(SubscribeRequest) returns (stream MarketDataEvent);
+}
+
+message SubscribeRequest {
+  repeated string symbols = 1;
+}
+
+service OrderService {
+  // Python submits a decision; Rust runs risk checks and forwards to the
+  // exchange if it passes.
+  rpc SubmitOrder(OrderRequest) returns (OrderUpdate);
+
+  // Python subscribes to the full order lifecycle stream (acks, fills,
+  // rejections) across all strategies.
+  rpc StreamOrderUpdates(StreamOrderUpdatesRequest) returns (stream OrderUpdate);
+}
+
+message StreamOrderUpdatesRequest {
+  string strategy_id = 1; // empty = all strategies
+}
