@@ -9,6 +9,7 @@ config/
   config.example.toml    per-symbol, currency-agnostic configuration
 rust-core/                Process A: WebSocket ingest, order book, risk, execution
 python-strategy/           Process B: strategy, ML, portfolio management
+historical-data/           Offline batch pipeline: Kraken OHLC/Trades -> Supabase, for model training
 ```
 
 ## Design decisions locked in
@@ -576,3 +577,63 @@ without an explicit `dry_run = false` flip.
 
 See `docs/training-universe.md` for the full per-symbol verification
 table and rationale.
+
+## Historical data pipeline (historical-data/)
+
+An offline, Python batch pipeline that pulls historical OHLC candles and
+raw trades from Kraken's public REST API (`/0/public/OHLC`,
+`/0/public/Trades` — no credentials needed) into a Postgres database, for
+eventually training the ML models the strategy layer already has stubs
+for (`SklearnModelWrapper`/`TorchModelWrapper`). Full design writeup and
+the reasoning behind each choice: `docs/historical-data-pipeline.md`.
+
+**Deliberately separate from `rust-core`'s SQLite store**: that database
+holds *operational* state (positions, fills, orders) written by the live
+process; this pipeline writes *analytical* data for training, on its own
+schedule, to its own database — mixing the two would tie an offline batch
+job's access patterns to the live trading process's storage.
+
+**Storage**: Postgres via Supabase (a project Stephen already had —
+`Rootstock-vercel`). That project turned out to already hold an unrelated
+homesteading-app schema; the three new tables
+(`ohlc_candles`, `trades`, `ohlc_backfill_state`) are namespaced by name
+only, with no FK or dependency on anything already there, and have Row
+Level Security enabled with no policies so the anon/public API key has no
+access to them — this pipeline only ever connects via a direct Postgres
+connection. Schema: `historical-data/migrations/0001_historical_ohlc_trades.sql`.
+
+**Symbol universe**: reads the same 13 `[[symbols]]` entries from
+`config/config.example.toml` (`symbol` + `rest_native_symbol`) rather than
+duplicating that mapping — one source of truth for "what Kraken calls
+each pair."
+
+**A real limitation, not glossed over**: Kraken's OHLC endpoint only
+retains a bounded window of history per candle resolution — 1-minute
+candles cover roughly a day, while daily (1440-minute) candles go back
+years. `backfill_ohlc.py` defaults to backfilling the 60 (hourly) and 1440
+(daily) intervals as deep as Kraken exposes; finer resolutions only
+accumulate real depth by re-running the script over time. `backfill_trades.py`
+similarly defaults to a bounded lookback window rather than an unbounded
+full-history pull, since that's a very large amount of data at Kraken's
+public rate limit. See `docs/historical-data-pipeline.md` for the full
+reasoning.
+
+**Credentials**: the Postgres connection string is read only from the
+`SUPABASE_DB_URL` environment variable, never a config file — same
+pattern as `KRAKEN_API_KEY`/`KRAKEN_API_SECRET`.
+
+**Verified**: `kraken_client.py`'s OHLC and Trades fetchers were run live
+against Kraken's real REST API (721 daily candles for BTC-USD going back
+to Oct 2024, and a real page of 1000 trades, both parsed correctly). The
+Postgres schema, upsert conflict handling (re-inserting the same candle
+updates it rather than duplicating), and `ohlc_backfill_state` tracking
+were smoke-tested directly against the live Supabase database with real
+fetched candles — 5 rows in, 5 rows after a repeat upsert, confirming
+idempotency. The `db.py`/`psycopg2` connection path itself hasn't been
+exercised end-to-end yet — that needs `SUPABASE_DB_URL` with the real
+database password, which only Stephen has (or can reset from the Supabase
+dashboard).
+
+**Not yet done**: no scheduled/recurring ingestion job yet (backfills run
+by hand); no feature-engineering or training-set-assembly layer on top of
+the raw candles/trades; no data-quality or gap-detection tooling.

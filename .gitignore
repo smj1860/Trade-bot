@@ -6,6 +6,7 @@ python-strategy/.venv/
 python-strategy/__pycache__/
 python-strategy/strategy/__pycache__/
 python-strategy/strategy/pb/__pycache__/
+historical-data/__pycache__/
 *.pyc
 
 # Generated gRPC code — regenerate with generate_proto.sh rather than
