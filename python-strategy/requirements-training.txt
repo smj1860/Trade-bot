@@ -1,0 +1,6 @@
+# Only needed to run scripts/train_model.py — kept separate from
+# requirements.txt (the live engine's dependencies) since training is an
+# offline, one-off/occasional job, not something the 24/7 strategy process
+# needs. Also install requirements-ml.txt (scikit-learn, joblib) alongside
+# this — train_model.py needs both.
+psycopg2-binary

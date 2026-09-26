@@ -25,6 +25,11 @@ python-strategy/strategy_config.toml
 python-strategy/logs/
 python-strategy/.pytest_cache/
 
+# Trained model files (scripts/train_model.py's output) — regenerable from
+# historical-data's Supabase tables, not source, and can get large; never
+# committed. See docs/model-training.md for how to (re)produce one.
+python-strategy/models/
+
 # SQLite persistence store (positions/fills/orders) — a run artifact, and
 # potentially sensitive (real order history), never something to commit.
 rust-core/data/

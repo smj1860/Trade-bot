@@ -109,12 +109,67 @@ feed into the strategy layer (Rust core would need to forward trades, not
 just book updates) — worth doing later if it turns out to matter, not done
 now because there's no live evidence yet that it does.
 
-## Not yet built
+## The training script (`python-strategy/scripts/train_model.py`)
 
-- The actual training script: query `ohlc_candles` for a chosen symbol at
-  60-minute resolution, compute `sma_ratio`/`rsi`/`realized_vol`/
-  `bar_momentum` via `strategy.indicators` over rolling windows, define a
-  label (e.g. next-bar-direction), do a time-ordered (non-shuffled)
-  train/test split, train a simple sklearn classifier, evaluate against a
-  naive baseline, save via `joblib`.
-- Documenting the resulting `feature_order` once a model actually exists.
+Queries `ohlc_candles` for one symbol/interval, computes the four
+bar-derived features over rolling windows using the exact same functions
+`strategy/features.py` calls live, labels each row with next-bar direction
+(a deliberately naive baseline label — see the script's own docstring for
+why), does a time-ordered train/test split (never shuffled, to avoid
+lookahead leakage), trains a baseline `sklearn` classifier
+(`LogisticRegression` by default, or `GradientBoostingClassifier` via
+`--kind gboost`), evaluates it against two naive baselines (majority-class
+and "the last move persists"), and saves the model via `joblib`.
+
+```
+export SUPABASE_DB_URL=postgresql://...   # Session pooler string, see historical-data-pipeline.md
+python3 scripts/train_model.py --symbol BTC-USD
+```
+
+Needs `requirements-training.txt` (`psycopg2-binary`) alongside
+`requirements-ml.txt` (`scikit-learn`, `joblib`).
+
+### First real run, against actual Supabase data (2026-09-26)
+
+Ran against BTC-USD's real 723 hourly candles (the full history backfilled
+so far, spanning late Aug through Sept 2026):
+
+| | value |
+|---|---|
+| dataset rows (after warmup) | 702 |
+| train / test split | 561 / 141 (time-ordered, last 20%) |
+| positive-label rate | 51.3% (close to coin-flip) |
+| **model accuracy** | **0.489** |
+| majority-class baseline | 0.532 |
+| persistence baseline | 0.482 |
+
+**The model did not beat the majority-class baseline.** This is an honest
+negative result, not a bug: one month of hourly BTC-USD candles for one
+symbol is a small, noisy dataset, next-bar direction is a genuinely hard
+target (BTC-USD hourly moves are close to a random walk at this
+resolution), and `LogisticRegression` with 4 simple technical features is
+a deliberately minimal starting point. This does **not** mean the
+feature-parity engineering was wasted — it means the honest next step is
+more/better data and a more considered label, not treating this model as
+tradeable. **This trained model is not committed to the repo** (`.gitignore`
+now excludes `python-strategy/models/`) precisely because it isn't a
+validated result — regenerate it from real Supabase data with the command
+above rather than trusting a stale binary.
+
+### Not yet done / natural next steps
+
+- More history: 723 hourly candles is thin for training; either let the
+  scheduled backfill keep accumulating, or pull Kraken's own deeper
+  historical CSV dumps via `import_csv.py` (see
+  `docs/historical-data-pipeline.md`'s "Bulk CSV import" section).
+- Try daily (1440-minute) candles too — more history per candle, a
+  possibly less noisy target, at the cost of far fewer completed bars per
+  unit time.
+- A better label than raw next-bar direction (e.g. a magnitude threshold,
+  or a multi-bar-ahead horizon) — next-bar direction is the simplest
+  possible thing to try first, not the right final target.
+- Multi-symbol training (pool all 13 symbols' candles into one dataset)
+  rather than one model per symbol from ~700 rows each.
+- Once a model actually beats its baselines convincingly, wire
+  `feature_order` into `strategy_config.toml` and switch
+  `strategy.model.kind` to `"sklearn"` — not before.
