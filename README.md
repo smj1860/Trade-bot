@@ -383,3 +383,85 @@ management. The read accessors `RiskEngine::position` and
 `RiskEngine::realized_pnl_today` are public but not yet exposed anywhere
 (no gRPC endpoint or log line surfaces them to an operator) — a natural
 next step once this is worth watching live.
+
+## Persistence (rust-core/src/persistence.rs)
+
+Before this, every piece of state introduced in the section above —
+positions, the kill switch's daily realized-PnL counter, and the whole
+order/fill history — lived only in memory. Restarting the process (a
+deploy, a crash, a manual bounce) silently reset all of it: positions back
+to flat, the kill switch's counter back to zero, no record of what had
+happened. That gap is now closed with a local SQLite database.
+
+**Why SQLite, and why `rusqlite` over an async driver**: this project
+already treats decimals-as-strings as a hard rule (config, gRPC), so the
+same discipline applies here — every numeric column is `TEXT`, never
+`REAL`, so nothing touches floating point on the way to or from disk.
+`rusqlite` (with SQLite compiled in via the `bundled` feature, no system
+library dependency) was chosen over an async SQL driver because every
+operation here is a single small, fast read or write (one row, at most a
+handful per fill or order) — not a volume that needs async I/O, and a
+plain `std::sync::Mutex<Connection>` guarded by methods that never hold
+the lock across an `.await` is simpler to reason about than threading an
+async pool through the codebase for this.
+
+**Schema** (four tables, migrations are just idempotent `CREATE TABLE IF
+NOT EXISTS`, no version to track for something this small):
+- `positions` — one row per symbol, upserted by `RiskEngine::apply_fill`.
+- `kill_switch_state` — a single row holding the current UTC day index and
+  that day's realized PnL, upserted on every fill and on every day
+  rollover.
+- `orders` — one row per `client_order_id`, upserted at submission
+  (`order.rs`) and updated in place as status changes arrive on the
+  private feed (`kraken_private_ws.rs`).
+- `fills` — an append-only audit trail of every applied fill, with a
+  `UNIQUE` constraint on `exec_id` that makes it the durable half of fill
+  de-duplication (see below).
+
+**How it's wired**: `main.rs` opens the store at startup (path from the
+new `[persistence]` config section, defaulting to
+`./data/trading-core.sqlite3`, parent directories created automatically)
+and calls `RiskEngine::attach_store`, which hydrates `positions` and (if
+it's from *today*, UTC) the kill-switch counter from disk before the
+engine does anything else — a counter from a previous day is deliberately
+**not** restored, since carrying yesterday's loss into today would either
+trip the switch for no reason or mask today's actual losses under a
+leftover cushion. The same `Store` is shared (as `Option<Arc<Store>>`)
+with `OrderServiceImpl` (order submission outcomes) and
+`kraken_private_ws::run` (order status updates from the private feed and,
+via `RiskEngine::apply_fill`, every applied fill). A store that fails to
+open at startup is logged loudly but does **not** stop the process — it
+degrades to the pre-persistence behavior (in-memory-only, resets on
+restart) rather than refusing to trade over what is, for now, optional
+infrastructure.
+
+**Fill de-duplication is now two layers deep**: `kraken_private_ws.rs`'s
+in-memory 512-entry window (from the section above) catches a redelivery
+within the same connection cheaply; `RiskEngine::apply_fill` now also
+checks the `fills` table's `exec_id` before touching any position state,
+which catches a redelivery across a reconnect *or a full process
+restart* — something the in-memory window structurally cannot, since it's
+wiped out along with everything else on restart.
+
+**Verified**: 6 new unit tests in `persistence.rs` (round-tripping
+positions, kill-switch state, order records and status transitions, and
+both dedup paths for fills) plus 3 new integration-style tests in
+`risk.rs` (a position surviving a fresh `RiskEngine` attached to the same
+store, `apply_fill` rejecting a redelivered `exec_id` via the store, and a
+previous-day kill-switch counter being correctly ignored on attach) —
+50/50 tests passing project-wide. A live smoke run confirmed the database
+file, WAL journal, and full schema are created automatically on a cold
+start against `config.example.toml`'s new `[persistence]` section, with
+no change in the process's other observable behavior.
+
+**What's NOT done**: nothing reconciles `orders`/`positions` against
+Kraken's own order/position state after a restart — a startup log line
+now warns if there are open orders left over from before a restart, but
+that's visibility, not reconciliation. There's no retention policy on the
+append-only `fills` table (it grows forever) and no admin/CLI tool to
+query the database — for now, `sqlite3 data/trading-core.sqlite3` is the
+tool. The theoretical race noted in `Store::record_fill`'s doc comment
+(two writers racing on the same `exec_id` between a dedup check and the
+insert) is accepted as-is: there is only ever one private-feed task per
+exchange in this project, so it doesn't occur in practice today, but would
+need a transaction if that ever changes.

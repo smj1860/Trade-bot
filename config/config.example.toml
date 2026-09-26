@@ -87,3 +87,16 @@ kill_switch_max_daily_loss_usd = "500" # halts all trading if breached
 # -----------------------------------------------------------------------------
 [execution]
 dry_run = true
+
+# -----------------------------------------------------------------------------
+# Where positions, the kill switch's daily realized-PnL counter, and
+# order/fill history are persisted (SQLite) so they survive a restart.
+# Defaults to ./data/trading-core.sqlite3 (relative to wherever the process
+# is run from) even if this whole [persistence] section is deleted — unlike
+# [execution], there's no "safe direction" to default toward here, the
+# default just needs to always be present. Parent directories are created
+# automatically if they don't exist. This file is never committed (see
+# .gitignore) — it can contain real order/fill history.
+# -----------------------------------------------------------------------------
+[persistence]
+database_path = "./data/trading-core.sqlite3"

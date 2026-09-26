@@ -45,6 +45,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::SymbolConfig;
 use crate::kraken_rest::KrakenRestClient;
+use crate::persistence::{order_status_label, Store};
 use crate::proto::pb::{Decimal as PbDecimal, OrderSide, OrderStatus, OrderUpdate};
 use crate::risk::RiskEngine;
 
@@ -72,6 +73,7 @@ pub async fn run(
     rest_client: KrakenRestClient,
     tx: broadcast::Sender<OrderUpdate>,
     risk: Arc<RiskEngine>,
+    store: Option<Arc<Store>>,
 ) {
     if symbols.is_empty() {
         tracing::warn!("no symbols configured, not starting private execution feed");
@@ -85,7 +87,7 @@ pub async fn run(
 
     loop {
         tracing::info!(url = PRIVATE_WS_URL, "connecting to Kraken private execution feed");
-        match connect_and_stream(&rest_client, &native_to_normalized, &tx, &risk).await {
+        match connect_and_stream(&rest_client, &native_to_normalized, &tx, &risk, &store).await {
             Ok(()) => tracing::warn!("private execution feed stream ended, reconnecting"),
             Err(e) => tracing::error!(error = %e, "private execution feed error, reconnecting"),
         }
@@ -98,6 +100,7 @@ async fn connect_and_stream(
     native_to_normalized: &HashMap<String, String>,
     tx: &broadcast::Sender<OrderUpdate>,
     risk: &Arc<RiskEngine>,
+    store: &Option<Arc<Store>>,
 ) -> anyhow::Result<()> {
     let token = rest_client
         .get_websockets_token()
@@ -171,6 +174,22 @@ async fn connect_and_stream(
         for entry in entries {
             match build_order_update(entry, native_to_normalized) {
                 Some(update) => {
+                    if let Some(store) = store {
+                        let status = OrderStatus::try_from(update.status).unwrap_or(OrderStatus::Unspecified);
+                        if let Err(e) = store.update_order_status(
+                            &update.client_order_id,
+                            &update.exchange_order_id,
+                            order_status_label(status),
+                            &update.reject_reason,
+                            update.timestamp_ns,
+                        ) {
+                            tracing::error!(
+                                client_order_id = %update.client_order_id,
+                                error = %e,
+                                "failed to persist order status update"
+                            );
+                        }
+                    }
                     // No subscriber yet is not an error.
                     let _ = tx.send(update);
                 }
@@ -190,7 +209,15 @@ async fn connect_and_stream(
                     }
                     seen_exec_ids.push_back(exec_id.clone());
                 }
-                risk.apply_fill(&fill.symbol, fill.side, fill.qty, fill.price).await;
+                risk.apply_fill(
+                    &fill.symbol,
+                    fill.side,
+                    fill.qty,
+                    fill.price,
+                    fill.exec_id.as_deref(),
+                    fill.client_order_id.as_deref(),
+                )
+                .await;
             }
         }
     }
@@ -258,6 +285,7 @@ struct FillEvent {
     qty: Decimal,
     price: Decimal,
     exec_id: Option<String>,
+    client_order_id: Option<String>,
 }
 
 /// Extracts a `FillEvent` from an executions-channel entry, but only for an
@@ -295,7 +323,9 @@ fn build_fill_event(entry: &serde_json::Value, native_to_normalized: &HashMap<St
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    Some(FillEvent { symbol, side, qty, price, exec_id })
+    let client_order_id = entry.get("cl_ord_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    Some(FillEvent { symbol, side, qty, price, exec_id, client_order_id })
 }
 
 /// Maps Kraken v2's `order_status` values onto our proto's OrderStatus.

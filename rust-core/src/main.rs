@@ -5,6 +5,7 @@ mod kraken_rest;
 mod market_data;
 mod order;
 mod orderbook;
+mod persistence;
 mod proto;
 mod risk;
 
@@ -19,6 +20,7 @@ use kraken_rest::{KrakenCredentials, KrakenRestClient};
 use market_data::MarketDataServiceImpl;
 use order::OrderServiceImpl;
 use orderbook::new_shared_books;
+use persistence::Store;
 use proto::pb::market_data_service_server::MarketDataServiceServer;
 use proto::pb::order_service_server::OrderServiceServer;
 use risk::RiskEngine;
@@ -79,6 +81,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let risk_engine = Arc::new(RiskEngine::new(config.clone(), books));
 
+    // Positions, the kill switch's daily PnL counter, and order/fill
+    // history all live in SQLite so they survive a restart — see
+    // persistence.rs. A database that fails to open is logged loudly but
+    // doesn't stop the process: it degrades to the old in-memory-only
+    // behavior (every symbol starts flat, the kill switch starts at zero)
+    // rather than refusing to trade over what is, for now, an optional
+    // piece of infrastructure.
+    let store: Option<Arc<Store>> = match Store::open(&config.persistence.database_path) {
+        Ok(store) => {
+            tracing::info!(path = %config.persistence.database_path, "persistence store opened");
+            Some(Arc::new(store))
+        }
+        Err(e) => {
+            tracing::error!(
+                path = %config.persistence.database_path,
+                error = %e,
+                "failed to open persistence store — running with in-memory-only state, \
+                 positions and the kill switch will NOT survive a restart"
+            );
+            None
+        }
+    };
+    if let Some(store) = &store {
+        if let Err(e) = risk_engine.attach_store(store.clone()).await {
+            tracing::error!(error = %e, "failed to load persisted risk state, continuing with in-memory-only state");
+        } else {
+            match store.load_open_orders() {
+                Ok(open) if !open.is_empty() => {
+                    tracing::warn!(
+                        count = open.len(),
+                        "found open orders from before this restart — nothing reconciles these \
+                         against Kraken's own order state yet, treat them as informational only"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!(error = %e, "failed to load open orders from persistence store"),
+            }
+        }
+    }
+
     // An execution client is only built for an exchange when credentials
     // are actually present. No credentials -> no entry in the map, and a
     // risk-approved order for that exchange comes back as an honest
@@ -126,7 +168,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let client = client.clone();
         let order_updates_tx = order_updates_tx.clone();
         let risk_engine = risk_engine.clone();
-        tokio::spawn(kraken_private_ws::run(symbols, client, order_updates_tx, risk_engine));
+        let store = store.clone();
+        tokio::spawn(kraken_private_ws::run(symbols, client, order_updates_tx, risk_engine, store));
     }
 
     let execution_clients = Arc::new(execution_clients);
@@ -142,6 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             execution_clients,
             order_updates_tx,
             strategy_registry,
+            store,
         )))
         .serve(addr)
         .await?;

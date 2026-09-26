@@ -24,6 +24,13 @@ python-strategy/strategy_config.toml
 python-strategy/logs/
 python-strategy/.pytest_cache/
 
+# SQLite persistence store (positions/fills/orders) — a run artifact, and
+# potentially sensitive (real order history), never something to commit.
+rust-core/data/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
 # OS/editor cruft
 .DS_Store
 *.swp

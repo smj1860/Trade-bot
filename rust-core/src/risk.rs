@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::orderbook::SharedBooks;
+use crate::persistence::{FillRecord, Store};
 use crate::proto::pb::{OrderRequest, OrderSide};
 
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
@@ -73,6 +74,13 @@ fn sign_of(d: Decimal) -> i32 {
     }
 }
 
+fn now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
 pub struct RiskEngine {
     config: Arc<Config>,
     books: SharedBooks,
@@ -87,6 +95,12 @@ pub struct RiskEngine {
     /// rolls over.
     realized_pnl_usd: Mutex<Decimal>,
     kill_switch_day: Mutex<u64>,
+    /// Set via `attach_store` once a `Store` is available. `None` means
+    /// running with in-memory-only state (every unit test in this module,
+    /// and a real deployment only if the database failed to open at
+    /// startup) — `apply_fill` still works correctly, it just has nothing
+    /// to survive a restart with.
+    store: Mutex<Option<Arc<Store>>>,
 }
 
 impl RiskEngine {
@@ -98,14 +112,57 @@ impl RiskEngine {
             recent_order_times: Mutex::new(VecDeque::new()),
             realized_pnl_usd: Mutex::new(Decimal::ZERO),
             kill_switch_day: Mutex::new(current_day_index()),
+            store: Mutex::new(None),
         }
+    }
+
+    /// Hydrates in-memory state from `store` (positions and the kill
+    /// switch's daily counter, if any was saved) and keeps `store` for
+    /// `apply_fill` to write through to from here on. Called once at
+    /// startup, after `RiskEngine::new` — kept separate from `new` itself
+    /// so every existing unit test can keep constructing a plain
+    /// in-memory engine without touching a database.
+    ///
+    /// A kill-switch counter persisted from a previous UTC day is treated
+    /// as stale and NOT loaded — restoring yesterday's loss as today's
+    /// would either trip the switch for no reason or (if it was a gain)
+    /// mask today's actual losses under a leftover cushion. Positions are
+    /// loaded regardless of age, since a position doesn't expire at
+    /// midnight the way a daily loss counter does.
+    pub async fn attach_store(&self, store: Arc<Store>) -> anyhow::Result<()> {
+        let persisted_positions = store.load_positions()?;
+        {
+            let mut positions = self.positions.lock().await;
+            for p in persisted_positions {
+                positions.insert(p.symbol, PositionState { qty: p.qty, avg_entry_price: p.avg_entry_price });
+            }
+        }
+
+        let today = current_day_index();
+        if let Some(state) = store.load_kill_switch_state()? {
+            if state.day_index == today {
+                *self.kill_switch_day.lock().await = state.day_index;
+                *self.realized_pnl_usd.lock().await = state.realized_pnl_usd;
+                tracing::info!(realized_today = %state.realized_pnl_usd, "restored today's kill-switch counter from disk");
+            } else {
+                tracing::info!(
+                    persisted_day = state.day_index,
+                    today,
+                    "persisted kill-switch counter is from a previous day, starting today at zero"
+                );
+            }
+        }
+
+        *self.store.lock().await = Some(store);
+        Ok(())
     }
 
     /// Applies a confirmed fill from the exchange to this symbol's tracked
     /// position, realizing PnL against the existing average entry price for
     /// any quantity that closes or flips the position. `qty` is always
     /// positive (the size of this specific fill); `side` says which
-    /// direction it moved the position.
+    /// direction it moved the position. Returns `false` without changing
+    /// any state if this fill was already applied (see `exec_id` below).
     ///
     /// Deliberately driven by Kraken's per-execution `last_qty`/`last_price`
     /// fields (see kraken_private_ws.rs), not by diffing `cum_qty` across
@@ -113,10 +170,45 @@ impl RiskEngine {
     /// interpret, and that state would be lost/reset across a WebSocket
     /// reconnect, silently double- or under-counting fills. A per-event
     /// delta needs no such state.
-    pub async fn apply_fill(&self, symbol: &str, side: OrderSide, qty: Decimal, price: Decimal) {
+    ///
+    /// `exec_id` (Kraken's `exec_id`/`trade_id`, when present) is checked
+    /// against the fills already recorded in `store` before anything else
+    /// happens — this is the durable half of fill de-duplication;
+    /// kraken_private_ws.rs's in-memory window catches a redelivery within
+    /// the same connection cheaply, this catches one across a reconnect or
+    /// a full process restart, which the in-memory window cannot.
+    /// `client_order_id` is carried through only for the fills audit
+    /// trail; it plays no role in the position/PnL math.
+    pub async fn apply_fill(
+        &self,
+        symbol: &str,
+        side: OrderSide,
+        qty: Decimal,
+        price: Decimal,
+        exec_id: Option<&str>,
+        client_order_id: Option<&str>,
+    ) -> bool {
         if qty <= Decimal::ZERO {
             tracing::warn!(symbol, ?side, %qty, "apply_fill called with non-positive quantity, ignoring");
-            return;
+            return false;
+        }
+
+        let store = self.store.lock().await.clone();
+
+        if let Some(exec_id) = exec_id {
+            match &store {
+                Some(store) => match store.fill_exists(exec_id) {
+                    Ok(true) => {
+                        tracing::debug!(exec_id, "fill already recorded, skipping apply_fill");
+                        return false;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!(exec_id, error = %e, "failed to check fill dedup store, applying anyway");
+                    }
+                },
+                None => {}
+            }
         }
 
         self.maybe_roll_over_day().await;
@@ -127,11 +219,12 @@ impl RiskEngine {
         };
 
         let mut realized_delta = Decimal::ZERO;
+        let new_state;
         {
             let mut positions = self.positions.lock().await;
             let current = positions.get(symbol).copied().unwrap_or(PositionState::ZERO);
 
-            if current.qty.is_zero() || sign_of(current.qty) == sign_of(signed_qty) {
+            new_state = if current.qty.is_zero() || sign_of(current.qty) == sign_of(signed_qty) {
                 // Opening or extending a position in the same direction:
                 // roll the average entry price forward, size-weighted.
                 let new_qty = current.qty + signed_qty;
@@ -140,13 +233,7 @@ impl RiskEngine {
                 } else {
                     ((current.qty.abs() * current.avg_entry_price) + (qty * price)) / new_qty.abs()
                 };
-                positions.insert(
-                    symbol.to_string(),
-                    PositionState {
-                        qty: new_qty,
-                        avg_entry_price: new_avg,
-                    },
-                );
+                PositionState { qty: new_qty, avg_entry_price: new_avg }
             } else {
                 // Opposite direction: this fill closes some or all of the
                 // existing position, realizing PnL on the closed quantity
@@ -165,33 +252,55 @@ impl RiskEngine {
                     // The fill was larger than the existing position: it
                     // fully closes it and flips to a fresh position on the
                     // remaining quantity, with a new average-entry basis.
-                    positions.insert(
-                        symbol.to_string(),
-                        PositionState {
-                            qty: new_qty,
-                            avg_entry_price: price,
-                        },
-                    );
+                    PositionState { qty: new_qty, avg_entry_price: price }
                 } else {
                     // Partial or exact close: position shrinks (or hits
                     // zero) but the average entry price for whatever
                     // remains is unchanged.
-                    positions.insert(
-                        symbol.to_string(),
-                        PositionState {
-                            qty: new_qty,
-                            avg_entry_price: if new_qty.is_zero() { Decimal::ZERO } else { current.avg_entry_price },
-                        },
-                    );
+                    PositionState {
+                        qty: new_qty,
+                        avg_entry_price: if new_qty.is_zero() { Decimal::ZERO } else { current.avg_entry_price },
+                    }
                 }
-            }
+            };
+            positions.insert(symbol.to_string(), new_state);
         }
 
+        let mut realized_after = None;
         if !realized_delta.is_zero() {
             let mut realized = self.realized_pnl_usd.lock().await;
             *realized += realized_delta;
+            realized_after = Some(*realized);
             tracing::info!(symbol, %realized_delta, total_today = %*realized, "realized PnL updated from fill");
         }
+
+        if let Some(store) = &store {
+            let now = now_ns();
+            if let Err(e) = store.upsert_position(symbol, new_state.qty, new_state.avg_entry_price, now) {
+                tracing::error!(symbol, error = %e, "failed to persist updated position");
+            }
+            if let Some(realized_after) = realized_after {
+                let day = *self.kill_switch_day.lock().await;
+                if let Err(e) = store.save_kill_switch_state(day, realized_after) {
+                    tracing::error!(error = %e, "failed to persist kill-switch state");
+                }
+            }
+            let fill = FillRecord {
+                exec_id: exec_id.map(|s| s.to_string()),
+                client_order_id: client_order_id.map(|s| s.to_string()),
+                symbol: symbol.to_string(),
+                side: format!("{side:?}").to_uppercase(),
+                qty,
+                price,
+                realized_pnl_usd: realized_delta,
+                applied_at_ns: now,
+            };
+            if let Err(e) = store.record_fill(&fill) {
+                tracing::error!(symbol, error = %e, "failed to record fill in persistence store");
+            }
+        }
+
+        true
     }
 
     /// Current net position for a symbol, in base-asset units. Zero for any
@@ -207,7 +316,8 @@ impl RiskEngine {
     }
 
     /// Resets the daily realized-PnL counter when the UTC day has rolled
-    /// over since it was last checked.
+    /// over since it was last checked, persisting the reset immediately so
+    /// a restart moments later doesn't resurrect yesterday's total.
     async fn maybe_roll_over_day(&self) {
         let today = current_day_index();
         let mut day = self.kill_switch_day.lock().await;
@@ -216,6 +326,12 @@ impl RiskEngine {
             let mut realized = self.realized_pnl_usd.lock().await;
             tracing::info!(previous_total = %*realized, "kill switch day rolled over, resetting realized PnL");
             *realized = Decimal::ZERO;
+
+            if let Some(store) = self.store.lock().await.as_ref() {
+                if let Err(e) = store.save_kill_switch_state(today, Decimal::ZERO) {
+                    tracing::error!(error = %e, "failed to persist kill-switch day rollover");
+                }
+            }
         }
     }
 
@@ -428,6 +544,7 @@ mod tests {
                 },
             },
             execution: crate::config::ExecutionConfig { dry_run: true },
+            persistence: crate::config::PersistenceConfig { database_path: ":memory:".to_string() },
         }
     }
 
@@ -516,7 +633,7 @@ mod tests {
     async fn apply_fill_opens_and_tracks_a_long_position() {
         let engine = RiskEngine::new(Arc::new(test_config()), new_shared_books());
         engine
-            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("30000").unwrap())
+            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("30000").unwrap(), None, None)
             .await;
         assert_eq!(engine.position("BTC-USD").await, Decimal::from_str("0.01").unwrap());
         assert_eq!(engine.realized_pnl_today().await, Decimal::ZERO);
@@ -526,17 +643,17 @@ mod tests {
     async fn apply_fill_extends_a_position_with_a_weighted_average_entry_price() {
         let engine = RiskEngine::new(Arc::new(test_config()), new_shared_books());
         engine
-            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("30000").unwrap())
+            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("30000").unwrap(), None, None)
             .await;
         engine
-            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("32000").unwrap())
+            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("32000").unwrap(), None, None)
             .await;
         // 0.02 total, avg entry (30000 + 32000) / 2 = 31000
         assert_eq!(engine.position("BTC-USD").await, Decimal::from_str("0.02").unwrap());
 
         // Closing the full 0.02 @ 33000 realizes (33000 - 31000) * 0.02 = 40
         engine
-            .apply_fill("BTC-USD", OrderSide::Sell, Decimal::from_str("0.02").unwrap(), Decimal::from_str("33000").unwrap())
+            .apply_fill("BTC-USD", OrderSide::Sell, Decimal::from_str("0.02").unwrap(), Decimal::from_str("33000").unwrap(), None, None)
             .await;
         assert_eq!(engine.position("BTC-USD").await, Decimal::ZERO);
         assert_eq!(engine.realized_pnl_today().await, Decimal::from_str("40").unwrap());
@@ -546,13 +663,13 @@ mod tests {
     async fn apply_fill_realizes_a_loss_and_flips_the_position_on_overshoot() {
         let engine = RiskEngine::new(Arc::new(test_config()), new_shared_books());
         engine
-            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("30000").unwrap())
+            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("30000").unwrap(), None, None)
             .await;
 
         // Sell 0.02 @ 29000: closes the 0.01 long at a loss of (29000-30000)*0.01 = -10,
         // then flips to a fresh 0.01 short at an entry price of 29000.
         engine
-            .apply_fill("BTC-USD", OrderSide::Sell, Decimal::from_str("0.02").unwrap(), Decimal::from_str("29000").unwrap())
+            .apply_fill("BTC-USD", OrderSide::Sell, Decimal::from_str("0.02").unwrap(), Decimal::from_str("29000").unwrap(), None, None)
             .await;
         assert_eq!(engine.position("BTC-USD").await, Decimal::from_str("-0.01").unwrap());
         assert_eq!(engine.realized_pnl_today().await, Decimal::from_str("-10").unwrap());
@@ -564,10 +681,10 @@ mod tests {
         // max daily loss in test_config is 500. Realize a 600 loss: go long
         // 1.0 @ 30000, then close it at 29400 (loss of 600).
         engine
-            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("1.0").unwrap(), Decimal::from_str("30000").unwrap())
+            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("1.0").unwrap(), Decimal::from_str("30000").unwrap(), None, None)
             .await;
         engine
-            .apply_fill("BTC-USD", OrderSide::Sell, Decimal::from_str("1.0").unwrap(), Decimal::from_str("29400").unwrap())
+            .apply_fill("BTC-USD", OrderSide::Sell, Decimal::from_str("1.0").unwrap(), Decimal::from_str("29400").unwrap(), None, None)
             .await;
         assert_eq!(engine.realized_pnl_today().await, Decimal::from_str("-600").unwrap());
 
@@ -579,14 +696,79 @@ mod tests {
     async fn kill_switch_does_not_trip_on_gains() {
         let engine = RiskEngine::new(Arc::new(test_config()), new_shared_books());
         engine
-            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("30000").unwrap())
+            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("30000").unwrap(), None, None)
             .await;
         engine
-            .apply_fill("BTC-USD", OrderSide::Sell, Decimal::from_str("0.01").unwrap(), Decimal::from_str("31000").unwrap())
+            .apply_fill("BTC-USD", OrderSide::Sell, Decimal::from_str("0.01").unwrap(), Decimal::from_str("31000").unwrap(), None, None)
             .await;
         assert_eq!(engine.realized_pnl_today().await, Decimal::from_str("10").unwrap());
 
         let order = buy_order("BTC-USD", "0.01", Some("30000"));
         assert_eq!(engine.evaluate(&order).await, RiskVerdict::Approved);
+    }
+
+    #[tokio::test]
+    async fn apply_fill_persists_position_and_survives_a_fresh_engine() {
+        let store = Arc::new(crate::persistence::Store::open_in_memory().unwrap());
+        let engine = RiskEngine::new(Arc::new(test_config()), new_shared_books());
+        engine.attach_store(store.clone()).await.unwrap();
+
+        engine
+            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("30000").unwrap(), None, None)
+            .await;
+        assert_eq!(engine.position("BTC-USD").await, Decimal::from_str("0.01").unwrap());
+
+        // A brand new engine attached to the same store picks up the
+        // persisted position without ever seeing the fill directly.
+        let restarted = RiskEngine::new(Arc::new(test_config()), new_shared_books());
+        restarted.attach_store(store).await.unwrap();
+        assert_eq!(restarted.position("BTC-USD").await, Decimal::from_str("0.01").unwrap());
+    }
+
+    #[tokio::test]
+    async fn apply_fill_deduplicates_by_exec_id_via_the_store() {
+        let store = Arc::new(crate::persistence::Store::open_in_memory().unwrap());
+        let engine = RiskEngine::new(Arc::new(test_config()), new_shared_books());
+        engine.attach_store(store).await.unwrap();
+
+        let applied = engine
+            .apply_fill(
+                "BTC-USD",
+                OrderSide::Buy,
+                Decimal::from_str("0.01").unwrap(),
+                Decimal::from_str("30000").unwrap(),
+                Some("EXEC-1"),
+                Some("co-1"),
+            )
+            .await;
+        assert!(applied);
+        assert_eq!(engine.position("BTC-USD").await, Decimal::from_str("0.01").unwrap());
+
+        // Same exec_id redelivered (e.g. after a reconnect) must not be
+        // applied a second time.
+        let applied_again = engine
+            .apply_fill(
+                "BTC-USD",
+                OrderSide::Buy,
+                Decimal::from_str("0.01").unwrap(),
+                Decimal::from_str("30000").unwrap(),
+                Some("EXEC-1"),
+                Some("co-1"),
+            )
+            .await;
+        assert!(!applied_again);
+        assert_eq!(engine.position("BTC-USD").await, Decimal::from_str("0.01").unwrap());
+    }
+
+    #[tokio::test]
+    async fn attach_store_ignores_a_kill_switch_counter_from_a_previous_day() {
+        let store = crate::persistence::Store::open_in_memory().unwrap();
+        // A day index that's certainly not today.
+        store.save_kill_switch_state(1, Decimal::from_str("-999").unwrap()).unwrap();
+
+        let engine = RiskEngine::new(Arc::new(test_config()), new_shared_books());
+        engine.attach_store(Arc::new(store)).await.unwrap();
+
+        assert_eq!(engine.realized_pnl_today().await, Decimal::ZERO);
     }
 }

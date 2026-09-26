@@ -10,6 +10,7 @@ use tonic::{Request, Response, Status};
 
 use crate::config::Config;
 use crate::kraken_rest::{AddOrderOutcome, AddOrderRequest, KrakenRestClient, OrderSide as KrakenSide};
+use crate::persistence::{order_status_label, OrderRecord, Store};
 use crate::proto::pb::{
     order_service_server::OrderService, OrderRequest, OrderSide, OrderStatus, OrderType, OrderUpdate,
     StreamOrderUpdatesRequest,
@@ -41,6 +42,10 @@ pub struct OrderServiceImpl {
     execution_clients: Arc<HashMap<String, KrakenRestClient>>,
     order_updates: broadcast::Sender<OrderUpdate>,
     strategy_registry: StrategyRegistry,
+    /// `None` means running without persistence (the database failed to
+    /// open at startup) — order submissions still work, they just leave no
+    /// record behind that survives a restart.
+    store: Option<Arc<Store>>,
 }
 
 impl OrderServiceImpl {
@@ -50,6 +55,7 @@ impl OrderServiceImpl {
         execution_clients: Arc<HashMap<String, KrakenRestClient>>,
         order_updates: broadcast::Sender<OrderUpdate>,
         strategy_registry: StrategyRegistry,
+        store: Option<Arc<Store>>,
     ) -> Self {
         Self {
             risk,
@@ -57,6 +63,86 @@ impl OrderServiceImpl {
             execution_clients,
             order_updates,
             strategy_registry,
+            store,
+        }
+    }
+
+    /// Persists the full lifecycle record for an order this process
+    /// actually reached a verdict on — a risk rejection, a Kraken
+    /// acceptance, or a Kraken rejection all produce an `OrderUpdate` and
+    /// are all worth keeping. A no-op when persistence isn't configured.
+    fn persist_order_record(&self, order: &OrderRequest, update: &OrderUpdate) {
+        let Some(store) = &self.store else { return };
+
+        let side = match OrderSide::try_from(order.side) {
+            Ok(OrderSide::Buy) => "BUY",
+            Ok(OrderSide::Sell) => "SELL",
+            _ => "UNSPECIFIED",
+        };
+        let order_type = match OrderType::try_from(order.r#type) {
+            Ok(OrderType::Limit) => "LIMIT",
+            Ok(OrderType::Market) => "MARKET",
+            _ => "UNSPECIFIED",
+        };
+        let status = OrderStatus::try_from(update.status).unwrap_or(OrderStatus::Unspecified);
+
+        let record = OrderRecord {
+            client_order_id: order.client_order_id.clone(),
+            exchange_order_id: update.exchange_order_id.clone(),
+            symbol: order.symbol.clone(),
+            exchange: order.exchange.clone(),
+            side: side.to_string(),
+            order_type: order_type.to_string(),
+            quantity: order.quantity.as_ref().map(|q| q.value.clone()).unwrap_or_default(),
+            limit_price: order.limit_price.as_ref().map(|p| p.value.clone()),
+            strategy_id: order.strategy_id.clone(),
+            status: order_status_label(status).to_string(),
+            reject_reason: update.reject_reason.clone(),
+            created_at_ns: update.timestamp_ns,
+            updated_at_ns: update.timestamp_ns,
+        };
+        if let Err(e) = store.upsert_order(&record) {
+            tracing::error!(client_order_id = %order.client_order_id, error = %e, "failed to persist order record");
+        }
+    }
+
+    /// A plumbing failure (no execution client configured, an unmapped
+    /// symbol, a network error) never produces an `OrderUpdate`, but it's
+    /// still worth a row: an order that was risk-approved and then simply
+    /// never reached the exchange is different from one that was never
+    /// attempted at all.
+    fn persist_order_error(&self, order: &OrderRequest, status: &Status) {
+        let Some(store) = &self.store else { return };
+
+        let side = match OrderSide::try_from(order.side) {
+            Ok(OrderSide::Buy) => "BUY",
+            Ok(OrderSide::Sell) => "SELL",
+            _ => "UNSPECIFIED",
+        };
+        let order_type = match OrderType::try_from(order.r#type) {
+            Ok(OrderType::Limit) => "LIMIT",
+            Ok(OrderType::Market) => "MARKET",
+            _ => "UNSPECIFIED",
+        };
+        let now = now_ns();
+
+        let record = OrderRecord {
+            client_order_id: order.client_order_id.clone(),
+            exchange_order_id: String::new(),
+            symbol: order.symbol.clone(),
+            exchange: order.exchange.clone(),
+            side: side.to_string(),
+            order_type: order_type.to_string(),
+            quantity: order.quantity.as_ref().map(|q| q.value.clone()).unwrap_or_default(),
+            limit_price: order.limit_price.as_ref().map(|p| p.value.clone()),
+            strategy_id: order.strategy_id.clone(),
+            status: order_status_label(OrderStatus::Rejected).to_string(),
+            reject_reason: format!("plumbing failure: {}", status.message()),
+            created_at_ns: now,
+            updated_at_ns: now,
+        };
+        if let Err(e) = store.upsert_order(&record) {
+            tracing::error!(client_order_id = %order.client_order_id, error = %e, "failed to persist order record for plumbing failure");
         }
     }
 
@@ -220,19 +306,30 @@ impl OrderService for OrderServiceImpl {
                     reason = %reason,
                     "order rejected by risk engine"
                 );
-                Ok(Response::new(OrderUpdate {
-                    client_order_id: order.client_order_id,
+                let update = OrderUpdate {
+                    client_order_id: order.client_order_id.clone(),
                     exchange_order_id: String::new(),
-                    symbol: order.symbol,
+                    symbol: order.symbol.clone(),
                     status: OrderStatus::Rejected as i32,
                     reject_reason: reason,
                     filled_quantity: None,
                     remaining_quantity: None,
                     avg_fill_price: None,
                     timestamp_ns: now_ns(),
-                }))
+                };
+                self.persist_order_record(&order, &update);
+                Ok(Response::new(update))
             }
-            RiskVerdict::Approved => self.execute(&order).await.map(Response::new),
+            RiskVerdict::Approved => match self.execute(&order).await {
+                Ok(update) => {
+                    self.persist_order_record(&order, &update);
+                    Ok(Response::new(update))
+                }
+                Err(status) => {
+                    self.persist_order_error(&order, &status);
+                    Err(status)
+                }
+            },
         }
     }
 

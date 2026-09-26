@@ -24,6 +24,7 @@ sha2 = "0.10"
 base64 = "0.22"
 serde_urlencoded = "0.7"
 thiserror = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [build-dependencies]
 tonic-build = "0.12"

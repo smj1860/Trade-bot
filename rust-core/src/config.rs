@@ -77,6 +77,27 @@ impl Default for ExecutionConfig {
     }
 }
 
+fn default_database_path() -> String {
+    "./data/trading-core.sqlite3".to_string()
+}
+
+/// Where positions, the kill-switch's daily PnL counter, and order/fill
+/// history are persisted so they survive a restart. Defaults to a local
+/// SQLite file even if the `[persistence]` section is missing entirely —
+/// unlike `[execution]`, there's no unsafe direction to default toward
+/// here, so the default just needs to always be present and writable.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PersistenceConfig {
+    #[serde(default = "default_database_path")]
+    pub database_path: String,
+}
+
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        Self { database_path: default_database_path() }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub general: GeneralConfig,
@@ -85,6 +106,8 @@ pub struct Config {
     pub risk: RiskSection,
     #[serde(default)]
     pub execution: ExecutionConfig,
+    #[serde(default)]
+    pub persistence: PersistenceConfig,
 }
 
 impl Config {
