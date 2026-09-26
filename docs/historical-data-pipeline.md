@@ -170,17 +170,66 @@ talks to Postgres directly. Confirmed with Stephen before proceeding
   dashboard. Once that's set, running `backfill_ohlc.py` for one symbol is
   the remaining end-to-end check.
 
+## Scheduled ingestion (.github/workflows/historical-backfill.yml)
+
+`backfill_ohlc.py` now also runs automatically, hourly, via GitHub
+Actions — on GitHub's own servers, not Stephen's laptop or any server he
+has to rent or maintain. Requires one repository secret,
+`SUPABASE_DB_URL` (Settings -> Secrets and variables -> Actions -> New
+repository secret in the GitHub UI — never committed to the repo itself).
+Re-running the backfill hourly is safe and cheap: it upserts by
+`(exchange, symbol, interval, ts)`, so re-fetching an already-stored
+candle just updates it in place. The workflow also supports
+`workflow_dispatch`, so Stephen can trigger a run by hand from the GitHub
+Actions tab with no terminal at all.
+
+## Bulk CSV import (historical-data/import_csv.py)
+
+For loading a large, already-downloaded historical dataset all at once —
+e.g. Kraken's own downloadable per-pair OHLCVT dumps, which cover much
+deeper history than the public REST API's retention window allows
+`backfill_ohlc.py` to reach (see the retention caveat above) — rather than
+waiting for that depth to accumulate one REST call at a time.
+
+Supports two input shapes:
+- `--format kraken-dump`: Kraken's own no-header CSV dumps
+  (`timestamp,open,high,low,close,volume,trades`).
+- `--format generic`: any CSV with a header row, matching common column
+  name variants case-insensitively (`timestamp`/`time`/`date`/`datetime`,
+  `open`/`high`/`low`/`close`, `volume`/`vol`, optional `vwap`,
+  optional `trades`/`trade_count`/`count`). The timestamp column can be
+  unix seconds or a parseable date/time string.
+
+This is meant to run **alongside** the scheduled job, not instead of it —
+a CSV import gets deep history in one shot; the hourly job keeps it
+current afterward. Both write to the same table with the same upsert key,
+so an overlapping CSV import is safe to re-run.
+
+Needs `pandas`, kept in a separate `requirements-csv.txt` so the core
+REST pipeline doesn't need it (same "opt-in extra dependency" pattern as
+`python-strategy/requirements-ml.txt`).
+
+**Verified**: parsing logic tested against synthetic CSVs in both
+formats — confirmed correct `Candle` construction for the `kraken-dump`
+format, and column auto-detection plus timestamp parsing for the
+`generic` format. Caught and fixed a real bug during that testing: the
+first timestamp-parsing implementation assumed pandas always represents
+parsed dates as nanosecond-resolution `datetime64`, which isn't
+guaranteed (this pandas version parses to microsecond resolution) — it
+was silently producing timestamps 1000x too small. Fixed by converting
+through numpy's `datetime64[s]` cast, which does the unit conversion
+explicitly rather than assuming a resolution. Not yet tested against a
+real multi-megabyte Kraken dump file end-to-end (only synthetic
+few-row CSVs so far).
+
 ## Not yet done
 
-- `backfill_ohlc.py` / `backfill_trades.py` run on demand, by hand — no
-  scheduled/recurring ingestion job exists yet. Once there's a first full
-  backfill in place, the natural next step is a scheduled task (this
-  project's existing scheduling tooling, or a simple cron) that runs the
-  backfill incrementally (e.g. daily) so 1-minute-resolution history
-  actually accumulates over time per the limitation above.
 - No feature-engineering or training-set-assembly layer yet — this
   pipeline only gets raw OHLC/trades into Postgres. Turning that into
   labeled training examples for `SklearnModelWrapper`/`TorchModelWrapper`
   is separate, future work.
 - No data-quality/gap-detection tooling yet (e.g. alerting if a symbol's
-  backfill state falls behind).
+  backfill state falls behind, or if the scheduled GitHub Actions run
+  starts failing).
+- `backfill_trades.py` (raw trade-level data) isn't in the scheduled
+  workflow yet — only OHLC candles run on a schedule so far.

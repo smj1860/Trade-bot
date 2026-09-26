@@ -1,0 +1,5 @@
+# Only needed to run import_csv.py — kept out of requirements.txt so the
+# core REST-based pipeline (backfill_ohlc.py / backfill_trades.py) doesn't
+# need pandas at all. Same "opt-in extra dependency" pattern
+# python-strategy uses for requirements-ml.txt.
+pandas

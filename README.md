@@ -634,6 +634,24 @@ exercised end-to-end yet — that needs `SUPABASE_DB_URL` with the real
 database password, which only Stephen has (or can reset from the Supabase
 dashboard).
 
-**Not yet done**: no scheduled/recurring ingestion job yet (backfills run
-by hand); no feature-engineering or training-set-assembly layer on top of
-the raw candles/trades; no data-quality or gap-detection tooling.
+**Scheduled ingestion**: `.github/workflows/historical-backfill.yml` runs
+`backfill_ohlc.py` hourly on GitHub's own servers — no laptop, server, or
+domain of Stephen's own required. Reads the Postgres connection string
+from a GitHub Actions repository secret (`SUPABASE_DB_URL`), never from
+the repo itself. Also supports manual triggering from the GitHub Actions
+tab (`workflow_dispatch`).
+
+**Bulk CSV import**: `historical-data/import_csv.py` loads an
+already-downloaded historical dataset (e.g. Kraken's own downloadable
+per-pair OHLCVT dumps, which cover much deeper history than the live REST
+API's retention window) all at once, rather than waiting for depth to
+accumulate via the hourly job alone. Runs alongside the scheduled
+backfill, not instead of it — both upsert into the same table by the same
+key, so they can't conflict. Needs `pandas`
+(`historical-data/requirements-csv.txt`, kept separate from the core
+pipeline's dependencies).
+
+**Not yet done**: no feature-engineering or training-set-assembly layer on
+top of the raw candles/trades; no data-quality or gap-detection tooling;
+`backfill_trades.py` isn't in the scheduled workflow yet, only the OHLC
+backfill is.

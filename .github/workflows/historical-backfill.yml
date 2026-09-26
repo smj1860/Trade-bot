@@ -1,0 +1,44 @@
+name: Historical data backfill
+
+# Runs historical-data/backfill_ohlc.py on GitHub's own servers, on a
+# schedule — no laptop, server, or domain of Stephen's own needed. See
+# docs/historical-data-pipeline.md for the pipeline this feeds and why it
+# runs on a schedule at all (fine-resolution candles only accumulate real
+# depth by being fetched repeatedly over time; see that doc's "retention"
+# note). Re-running this is safe: backfill_ohlc.py upserts by
+# (exchange, symbol, interval, ts), so re-fetching an already-stored
+# candle just updates it in place rather than duplicating it.
+#
+# Requires a repository secret named SUPABASE_DB_URL (the real Postgres
+# connection string, with password) — set once in GitHub's UI under
+# Settings -> Secrets and variables -> Actions -> New repository secret.
+# Never put that value in this file or anywhere else in the repo.
+
+on:
+  schedule:
+    # Every hour, on the hour, UTC. Cheap to run more often than the data
+    # actually changes — daily candles just get re-upserted with the same
+    # values most of the time — but this is what keeps hourly candles
+    # reasonably current without any manual step.
+    - cron: "0 * * * *"
+  # Lets Stephen trigger a run by hand from the GitHub Actions tab
+  # ("Run workflow" button) without touching a laptop or terminal at all.
+  workflow_dispatch: {}
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r historical-data/requirements.txt
+
+      - name: Run OHLC backfill (all symbols, hourly + daily intervals)
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: python historical-data/backfill_ohlc.py
