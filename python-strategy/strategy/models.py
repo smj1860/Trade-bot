@@ -103,6 +103,9 @@ class SklearnModelWrapper(ModelWrapper):
             "bollinger_percent_b": features.bollinger_percent_b,
             "bollinger_bandwidth": features.bollinger_bandwidth,
             "awesome_oscillator": features.awesome_oscillator,
+            "macd_histogram": features.macd_histogram,
+            "cci": features.cci,
+            "williams_percent_r": features.williams_percent_r,
         }
         try:
             return [values[name] for name in self._feature_order]
@@ -156,6 +159,9 @@ class TorchModelWrapper(ModelWrapper):
             "bollinger_percent_b": features.bollinger_percent_b,
             "bollinger_bandwidth": features.bollinger_bandwidth,
             "awesome_oscillator": features.awesome_oscillator,
+            "macd_histogram": features.macd_histogram,
+            "cci": features.cci,
+            "williams_percent_r": features.williams_percent_r,
         }
         try:
             return [values[name] for name in self._feature_order]

@@ -12,13 +12,14 @@ Two families of feature live here side by side:
   historical OHLC candle data (imbalance needs live bid/ask sizes), so
   they're live-only — there's no historical training signal for them.
 - Bar-level (sma_ratio, ema_ratio, rsi, realized_vol, bar_momentum,
-  bollinger_percent_b, bollinger_bandwidth, awesome_oscillator): computed
-  by strategy.indicators over a rolling history of completed bars built
-  by strategy.bars.BarAggregator from mid-price ticks. These are the ones
-  a model can actually be trained on, because the exact same indicator
-  functions run identically over Kraken's historical OHLC candle closes
-  (see historical-data/'s training script) — see docs/model-training.md
-  for why this split exists.
+  bollinger_percent_b, bollinger_bandwidth, awesome_oscillator,
+  macd_histogram, cci, williams_percent_r): computed by strategy.indicators
+  over a rolling history of completed bars built by
+  strategy.bars.BarAggregator from mid-price ticks. These are the ones a
+  model can actually be trained on, because the exact same indicator
+  functions run identically over Kraken's historical OHLC candle
+  closes/highs/lows (see historical-data/'s training script) — see
+  docs/model-training.md for why this split exists.
 """
 
 from __future__ import annotations
@@ -33,10 +34,13 @@ from strategy.indicators import (
     bar_momentum,
     bollinger_bandwidth,
     bollinger_percent_b,
+    cci,
     ema_ratio,
+    macd_histogram,
     realized_vol,
     rsi,
     sma_ratio,
+    williams_percent_r,
 )
 
 
@@ -59,6 +63,9 @@ class Features:
     bollinger_percent_b: float = 0.0
     bollinger_bandwidth: float = 0.0
     awesome_oscillator: float = 0.0
+    macd_histogram: float = 0.0
+    cci: float = 0.0
+    williams_percent_r: float = 0.0
 
 
 class _SymbolState:
@@ -91,6 +98,11 @@ class FeatureEngine:
         bollinger_num_std: float = 2.0,
         ao_fast_window: int = 5,
         ao_slow_window: int = 34,
+        macd_fast_window: int = 12,
+        macd_slow_window: int = 26,
+        macd_signal_window: int = 9,
+        cci_window: int = 20,
+        williams_r_window: int = 14,
     ) -> None:
         self._momentum_window = momentum_window
         self._state: dict[str, _SymbolState] = {}
@@ -104,9 +116,18 @@ class FeatureEngine:
         self._bollinger_num_std = bollinger_num_std
         self._ao_fast_window = ao_fast_window
         self._ao_slow_window = ao_slow_window
-        # rsi/realized_vol need one extra close to produce N price changes
-        # from a window of N+1 closes — size the bar history for the
-        # largest window any close-based indicator actually needs.
+        self._macd_fast_window = macd_fast_window
+        self._macd_slow_window = macd_slow_window
+        self._macd_signal_window = macd_signal_window
+        self._cci_window = cci_window
+        self._williams_r_window = williams_r_window
+        # Every bar-derived indicator's required window, all folded into a
+        # single max() — the underlying _SymbolBars deques (closes,
+        # midpoints, highs, lows) all share one maxlen anyway, so there's
+        # no benefit to sizing them separately. rsi/realized_vol need one
+        # extra close to produce N price changes from a window of N+1
+        # closes; MACD needs its slow EMA seeded plus enough MACD-series
+        # history to seed the signal EMA on top of that.
         max_bars = (
             max(
                 sma_window,
@@ -115,15 +136,14 @@ class FeatureEngine:
                 vol_window + 1,
                 bar_momentum_window,
                 bollinger_window,
+                ao_slow_window,
+                macd_slow_window + macd_signal_window,
+                cci_window,
+                williams_r_window,
             )
             + 1
         )
-        # The Awesome Oscillator runs over a separate (midpoint) series
-        # with its own, usually much longer, window — size that history
-        # independently rather than forcing every other indicator's
-        # window to grow to match AO's classic 34-bar slow window.
-        max_ao_bars = ao_slow_window + 1
-        self._bars = BarAggregator(bar_interval_seconds=bar_interval_seconds, max_bars=max(max_bars, max_ao_bars))
+        self._bars = BarAggregator(bar_interval_seconds=bar_interval_seconds, max_bars=max_bars)
 
     def on_order_book_update(
         self,
@@ -188,4 +208,27 @@ class FeatureEngine:
                 self._ao_fast_window,
                 self._ao_slow_window,
             ),
+            macd_histogram=macd_histogram(
+                self._bars.window(symbol, self._macd_slow_window + self._macd_signal_window),
+                self._macd_fast_window,
+                self._macd_slow_window,
+                self._macd_signal_window,
+            ),
+            cci=cci(self._typical_price_window(symbol, self._cci_window)),
+            williams_percent_r=williams_percent_r(
+                self._bars.window(symbol, self._williams_r_window),
+                self._bars.high_window(symbol, self._williams_r_window),
+                self._bars.low_window(symbol, self._williams_r_window),
+            ),
         )
+
+    def _typical_price_window(self, symbol: str, size: int) -> list[float]:
+        """(high + low + close) / 3 per bar, over the most recent `size`
+        completed bars — the "typical price" series CCI is traditionally
+        computed on. Built here rather than in bars.py since it's a
+        derived combination of three already-tracked histories, not a
+        history BarAggregator needs to track itself."""
+        closes = self._bars.window(symbol, size)
+        highs = self._bars.high_window(symbol, size)
+        lows = self._bars.low_window(symbol, size)
+        return [(h + l + c) / 3.0 for h, l, c in zip(highs, lows, closes)]

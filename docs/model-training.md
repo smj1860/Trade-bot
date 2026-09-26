@@ -192,16 +192,74 @@ hourly candles with all 8 features: 0.522 model accuracy vs. 0.529
 majority-class / 0.486 persistence baseline — still not a clear win, same
 honest conclusion as the first round (see below).
 
+## Third round: MACD, CCI, Williams %R (2026-09-26)
+
+Added three more bar-derived indicators to `strategy/indicators.py`, same
+pure-function/no-state pattern as the first two rounds:
+
+- **`_ema_series` (new private helper) / `macd_histogram`** — `ema()`
+  treats a window's own length as its EMA period, which doesn't work for
+  MACD: MACD's fast/slow EMAs need *fixed* periods (classically 12/26)
+  regardless of how large a window of closes is fed in, and its signal
+  line is an EMA of the resulting MACD series, not of raw closes. So
+  `_ema_series(values, period)` computes a full iterative EMA series (one
+  value per input) at a fixed period, and `macd_histogram` builds the
+  fast/slow EMA series, takes their difference as the MACD line, EMAs
+  *that* to get the signal line, and returns `(macd - signal)` at the most
+  recent point, normalized by the current close for cross-symbol
+  comparability.
+- **`cci`** — Commodity Channel Index: how far the most recent typical
+  price ((high+low+close)/3) sits from its SMA, relative to the window's
+  mean absolute deviation, rescaled by /100 (traditional +-100
+  overbought/oversold threshold) to match this project's [-1, 1]
+  composability convention.
+- **`williams_percent_r`** — where the most recent close sits within the
+  window's high-low range, rescaled from the traditional [-100, 0] to
+  roughly [-1, 1] (the same rescale idiom as RSI).
+
+CCI and Williams %R both need real per-bar high/low history, not just
+their average (which `midpoints` already provided for the Awesome
+Oscillator) — `strategy/bars.py`'s `BarAggregator` was extended with
+`highs`/`lows` deques (populated from the already-tracked
+`current_high`/`current_low` at bar completion) and matching
+`highs()`/`lows()`/`high_window()`/`low_window()` accessors, mirroring the
+existing `closes()`/`window()` pattern. `FeatureEngine` folded all its
+window-sizing logic (previously a two-tier `max_bars`/`max_ao_bars` split)
+into one `max()` across every indicator's required window, since the
+underlying bar histories all share one `maxlen` anyway.
+
+`Features`, `models.py`'s wrappers, `config.py` +
+`strategy_config.example.toml`, `engine.py`'s signal logging, and
+`scripts/train_model.py` (including `load_ohlc`, which now returns
+highs/lows alongside closes/midpoints) were all extended the same way as
+prior rounds. 25 new tests (110 total, all passing).
+
+Ran the extended training script against BTC-USD's real 723 hourly
+candles with all 11 features:
+
+| | value |
+|---|---|
+| dataset rows (after warmup) | 688 |
+| train / test split | 550 / 138 (time-ordered, last 20%) |
+| positive-label rate | 51.5% |
+| **model accuracy** | **0.529** |
+| majority-class baseline | 0.529 |
+| persistence baseline | 0.486 |
+
+**The model exactly tied the majority-class baseline** — still not a
+clear win. Adding more indicators hasn't moved the needle on this
+dataset/label combination; three rounds in a row point the same
+direction (see "Not yet done / natural next steps" below): the limiting
+factor looks like it's the data/label, not the feature set. This is the
+signal to try pooling more symbols and/or a better label next, rather
+than continuing to add indicators one at a time.
+
 ### Indicators considered but not (yet) added
 
 A few other well-known technical indicators, and why they're not here:
 
-- **MACD** (moving average convergence/divergence) — a natural next
-  addition; essentially a difference of two EMAs plus a signal-line EMA of
-  that difference. Not added yet only because nothing has asked for it —
-  same `indicators.py` pattern would fit it directly.
 - **Stochastic Oscillator** — needs high/low per bar (now available via
-  `bars.py`'s midpoint tracking, or real candle high/low historically),
+  `bars.py`'s high/low tracking, or real candle high/low historically),
   same shape as Awesome Oscillator. Not yet added.
 - **ATR (Average True Range)** — a volatility measure like
   `bollinger_bandwidth`/`realized_vol`, but computed from true range
@@ -210,9 +268,6 @@ A few other well-known technical indicators, and why they're not here:
 - **ADX (Average Directional Index)** — a trend-strength indicator built
   on top of directional movement + ATR; meaningfully more involved to
   implement correctly than anything here so far. Not added.
-- **CCI (Commodity Channel Index)**, **Williams %R** — both similar in
-  spirit to Bollinger %b/RSI (price relative to a recent range); would be
-  quick additions in the same pattern if wanted.
 - **OBV (On-Balance Volume)**, **VWAP** — both need real traded volume
   attributed to price direction. Kraken's OHLC candles *do* carry a volume
   column (unused so far), but the live engine has no live volume signal at

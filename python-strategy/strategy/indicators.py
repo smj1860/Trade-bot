@@ -173,6 +173,98 @@ def bollinger_bandwidth(closes: Sequence[float], num_std: float = 2.0) -> float:
     return (2.0 * num_std * std) / middle
 
 
+def _ema_series(values: Sequence[float], period: int) -> list[float]:
+    """A full iterative EMA series (one value per input, not just the
+    final value), using a *fixed* `period` argument — unlike ema(), which
+    treats the whole window's length as the period. MACD needs this:
+    its fast/slow EMAs use fixed periods (classically 12/26) regardless of
+    how large a window of closes happens to be fed in, and the signal line
+    is itself an EMA of the resulting MACD series, not of raw closes.
+    Seeded with the first value, same convention as ema(). Returns an
+    empty list if `values` is empty or `period` isn't positive."""
+    if not values or period <= 0:
+        return []
+    alpha = 2.0 / (period + 1)
+    series = [values[0]]
+    for v in values[1:]:
+        series.append(alpha * v + (1.0 - alpha) * series[-1])
+    return series
+
+
+def macd_histogram(
+    closes: Sequence[float],
+    fast_period: int = 12,
+    slow_period: int = 26,
+    signal_period: int = 9,
+) -> float:
+    """MACD histogram: (fast EMA - slow EMA) - signal-line EMA of that
+    difference, i.e. how far the MACD line currently sits from its own
+    signal line. Normalized by dividing by the most recent close (rather
+    than left as a raw price-unit difference) so it's comparable across
+    symbols at very different price levels, the same reasoning as
+    bar_momentum's/sma_ratio's normalization. Classic default periods
+    (12, 26, 9) per Gerald Appel's original definition. Needs at least
+    `slow_period` closes to seed both EMAs, plus `signal_period` MACD
+    values to seed the signal line; returns 0.0 otherwise, or if the most
+    recent close is 0."""
+    if len(closes) < slow_period or slow_period <= 0 or fast_period <= 0 or signal_period <= 0:
+        return 0.0
+    if closes[-1] == 0:
+        return 0.0
+    fast_series = _ema_series(closes, fast_period)
+    slow_series = _ema_series(closes, slow_period)
+    macd_series = [f - s for f, s in zip(fast_series, slow_series)]
+    if len(macd_series) < signal_period:
+        return 0.0
+    signal_series = _ema_series(macd_series, signal_period)
+    return (macd_series[-1] - signal_series[-1]) / closes[-1]
+
+
+def cci(typical_prices: Sequence[float]) -> float:
+    """Commodity Channel Index: how far the most recent typical price
+    ((high + low + close) / 3 per bar — caller supplies this, since it
+    needs high/low history, not just closes) sits from its SMA, relative
+    to the mean absolute deviation of the window. Traditionally scaled so
+    +-100 marks overbought/oversold; rescaled here by dividing by 100 to
+    roughly match this project's [-1, 1] composability convention (the
+    same idiom as rsi's/bollinger_percent_b's rescale), deliberately left
+    unclipped beyond +-1 so a genuine extreme reading is still visible.
+    Classic window is 20 typical prices. Needs at least 2 values to form
+    a non-trivial average; returns 0.0 otherwise, or if the window is
+    perfectly flat (mean absolute deviation of 0)."""
+    if len(typical_prices) < 2:
+        return 0.0
+    average = sma(typical_prices)
+    mean_abs_deviation = sum(abs(p - average) for p in typical_prices) / len(typical_prices)
+    if mean_abs_deviation == 0:
+        return 0.0
+    raw = (typical_prices[-1] - average) / (0.015 * mean_abs_deviation)
+    return raw / 100.0
+
+
+def williams_percent_r(closes: Sequence[float], highs: Sequence[float], lows: Sequence[float]) -> float:
+    """Classic Williams %R: where the most recent close sits within the
+    window's high-low range, traditionally reported in [-100, 0] (0 = at
+    the window's high, -100 = at the window's low). Rescaled here to
+    roughly [-1, 1] (+1 = at the high, -1 = at the low, 0 = mid-range),
+    the same rescale idiom as rsi's [-1, 1] mapping, so it composes with
+    this project's other signals. `closes`, `highs`, and `lows` must be
+    the same window (classic window is 14 bars), aligned bar-for-bar.
+    Needs at least 1 bar of history and a non-flat range (highest high !=
+    lowest low); returns 0.0 (neutral) otherwise, or on empty/mismatched
+    input."""
+    if not closes or not highs or not lows:
+        return 0.0
+    if len(closes) != len(highs) or len(closes) != len(lows):
+        return 0.0
+    highest_high = max(highs)
+    lowest_low = min(lows)
+    if highest_high == lowest_low:
+        return 0.0
+    raw = (highest_high - closes[-1]) / (highest_high - lowest_low) * -100.0
+    return (raw + 50.0) / 50.0
+
+
 def awesome_oscillator(midpoints: Sequence[float], fast_window: int = 5, slow_window: int = 34) -> float:
     """Bill Williams' Awesome Oscillator: SMA(fast_window) of bar
     midpoints ((high + low) / 2, see strategy/bars.py) minus

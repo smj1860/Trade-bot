@@ -35,6 +35,11 @@ class ImbalanceMomentumStrategy(Strategy):
             bollinger_num_std=config.strategy.features.bollinger_num_std,
             ao_fast_window=config.strategy.features.ao_fast_window,
             ao_slow_window=config.strategy.features.ao_slow_window,
+            macd_fast_window=config.strategy.features.macd_fast_window,
+            macd_slow_window=config.strategy.features.macd_slow_window,
+            macd_signal_window=config.strategy.features.macd_signal_window,
+            cci_window=config.strategy.features.cci_window,
+            williams_r_window=config.strategy.features.williams_r_window,
         )
         self._model: ModelWrapper = build_model(
             config.strategy.model.kind,

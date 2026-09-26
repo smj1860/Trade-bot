@@ -126,3 +126,42 @@ def test_max_bars_evicts_oldest_midpoints_too():
     for i in range(5):
         agg.on_tick("BTC-USD", timestamp=float(i * 60), price=float(100 + i))
     assert len(agg.midpoints("BTC-USD")) == 2
+
+
+def test_no_history_highs_and_lows_are_empty():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=10)
+    assert agg.highs("BTC-USD") == []
+    assert agg.lows("BTC-USD") == []
+    assert agg.high_window("BTC-USD", 5) == []
+    assert agg.low_window("BTC-USD", 5) == []
+
+
+def test_highs_and_lows_track_bucket_extremes():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=10)
+    # bucket [0, 60): ticks 100, 105, 98 -> high=105, low=98
+    agg.on_tick("BTC-USD", timestamp=0.0, price=100.0)
+    agg.on_tick("BTC-USD", timestamp=20.0, price=105.0)
+    agg.on_tick("BTC-USD", timestamp=40.0, price=98.0)
+    agg.on_tick("BTC-USD", timestamp=60.0, price=110.0)  # completes the bucket above
+    assert agg.highs("BTC-USD") == [105.0]
+    assert agg.lows("BTC-USD") == [98.0]
+
+
+def test_highs_and_lows_window_returns_most_recent_n():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=10)
+    for i in range(5):
+        agg.on_tick("BTC-USD", timestamp=float(i * 60), price=float(100 + i))
+    assert agg.highs("BTC-USD") == [100.0, 101.0, 102.0, 103.0]
+    assert agg.lows("BTC-USD") == [100.0, 101.0, 102.0, 103.0]
+    assert agg.high_window("BTC-USD", 2) == [102.0, 103.0]
+    assert agg.low_window("BTC-USD", 2) == [102.0, 103.0]
+    assert agg.high_window("BTC-USD", 0) == []
+    assert agg.low_window("BTC-USD", 0) == []
+
+
+def test_max_bars_evicts_oldest_highs_and_lows_too():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=2)
+    for i in range(5):
+        agg.on_tick("BTC-USD", timestamp=float(i * 60), price=float(100 + i))
+    assert len(agg.highs("BTC-USD")) == 2
+    assert len(agg.lows("BTC-USD")) == 2

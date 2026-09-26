@@ -2,10 +2,10 @@
 """
 Trains a baseline classifier on the OHLC-derived bar features
 (strategy/indicators.py: sma_ratio, ema_ratio, rsi, realized_vol,
-bar_momentum, bollinger_percent_b, bollinger_bandwidth,
-awesome_oscillator) using real historical Kraken candles from Supabase,
-and saves it via joblib for use as strategy.model.kind = "sklearn" (see
-strategy_config.example.toml).
+bar_momentum, bollinger_percent_b, bollinger_bandwidth, awesome_oscillator,
+macd_histogram, cci, williams_percent_r) using real historical Kraken
+candles from Supabase, and saves it via joblib for use as
+strategy.model.kind = "sklearn" (see strategy_config.example.toml).
 
 This is the other half of the feature-parity work described in
 docs/model-training.md: strategy/features.py's FeatureEngine computes
@@ -65,10 +65,13 @@ from strategy.indicators import (
     bar_momentum,
     bollinger_bandwidth,
     bollinger_percent_b,
+    cci,
     ema_ratio,
+    macd_histogram,
     realized_vol,
     rsi,
     sma_ratio,
+    williams_percent_r,
 )
 
 FEATURE_ORDER = [
@@ -80,6 +83,9 @@ FEATURE_ORDER = [
     "bollinger_percent_b",
     "bollinger_bandwidth",
     "awesome_oscillator",
+    "macd_histogram",
+    "cci",
+    "williams_percent_r",
 ]
 
 
@@ -104,15 +110,18 @@ def connect():
     return psycopg2.connect(dsn)
 
 
-def load_ohlc(conn, symbol: str, interval_minutes: int) -> tuple[list[float], list[float]]:
-    """Returns (closes, midpoints) — midpoints = (high + low) / 2 per
-    candle, straight from Kraken's own recorded high/low (real traded
-    range), which is what awesome_oscillator is fed. This is actually a
-    truer midpoint series than the live engine gets (strategy/bars.py can
-    only approximate high/low from mid-price ticks seen within a bucket,
-    since there's no live trade feed wired up yet — see bars.py's module
-    docstring), a known, documented asymmetry, not a mismatch that breaks
-    parity on the close-based features."""
+def load_ohlc(conn, symbol: str, interval_minutes: int) -> tuple[list[float], list[float], list[float], list[float]]:
+    """Returns (closes, midpoints, highs, lows) — midpoints = (high + low)
+    / 2 per candle, straight from Kraken's own recorded high/low (real
+    traded range), which is what awesome_oscillator is fed; highs/lows are
+    the same real recorded values, needed unaveraged for cci (typical
+    price = (high+low+close)/3) and williams_percent_r (highest-high/
+    lowest-low over a window). This is actually a truer high/low series
+    than the live engine gets (strategy/bars.py can only approximate
+    high/low from mid-price ticks seen within a bucket, since there's no
+    live trade feed wired up yet — see bars.py's module docstring), a
+    known, documented asymmetry, not a mismatch that breaks parity on the
+    close-based features."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -125,13 +134,17 @@ def load_ohlc(conn, symbol: str, interval_minutes: int) -> tuple[list[float], li
         )
         rows = cur.fetchall()
     closes = [float(r[0]) for r in rows]
-    midpoints = [(float(r[1]) + float(r[2])) / 2.0 for r in rows]
-    return closes, midpoints
+    highs = [float(r[1]) for r in rows]
+    lows = [float(r[2]) for r in rows]
+    midpoints = [(h + l) / 2.0 for h, l in zip(highs, lows)]
+    return closes, midpoints, highs, lows
 
 
 def features_at(
     closes: list[float],
     midpoints: list[float],
+    highs: list[float],
+    lows: list[float],
     i: int,
     sma_window: int,
     ema_window: int,
@@ -142,12 +155,17 @@ def features_at(
     bollinger_num_std: float,
     ao_fast_window: int,
     ao_slow_window: int,
+    macd_fast_window: int,
+    macd_slow_window: int,
+    macd_signal_window: int,
+    cci_window: int,
+    williams_r_window: int,
 ) -> dict[str, float]:
     """The feature vector as of bar `i`, using the same window-slicing
     convention strategy/features.py's FeatureEngine applies live via
-    BarAggregator.window()/midpoint_window(): the most recent `size`
-    completed closes (or midpoints, for the Awesome Oscillator) up to and
-    including the current one."""
+    BarAggregator.window()/midpoint_window()/high_window()/low_window():
+    the most recent `size` completed closes (or midpoints/highs/lows) up
+    to and including the current one."""
     sma_win = closes[max(0, i - sma_window + 1) : i + 1]
     ema_win = closes[max(0, i - ema_window + 1) : i + 1]
     rsi_win = closes[max(0, i - rsi_window) : i + 1]  # rsi needs window+1 closes for `window` price changes
@@ -155,6 +173,16 @@ def features_at(
     mom_win = closes[max(0, i - bar_momentum_window + 1) : i + 1]
     boll_win = closes[max(0, i - bollinger_window + 1) : i + 1]
     ao_win = midpoints[max(0, i - ao_slow_window + 1) : i + 1]
+    macd_win = closes[max(0, i - (macd_slow_window + macd_signal_window) + 1) : i + 1]
+    typical_win_start = max(0, i - cci_window + 1)
+    typical_prices = [
+        (h + l + c) / 3.0
+        for h, l, c in zip(highs[typical_win_start : i + 1], lows[typical_win_start : i + 1], closes[typical_win_start : i + 1])
+    ]
+    wr_start = max(0, i - williams_r_window + 1)
+    wr_closes = closes[wr_start : i + 1]
+    wr_highs = highs[wr_start : i + 1]
+    wr_lows = lows[wr_start : i + 1]
     return {
         "sma_ratio": sma_ratio(sma_win),
         "ema_ratio": ema_ratio(ema_win),
@@ -164,12 +192,17 @@ def features_at(
         "bollinger_percent_b": bollinger_percent_b(boll_win, bollinger_num_std),
         "bollinger_bandwidth": bollinger_bandwidth(boll_win, bollinger_num_std),
         "awesome_oscillator": awesome_oscillator(ao_win, ao_fast_window, ao_slow_window),
+        "macd_histogram": macd_histogram(macd_win, macd_fast_window, macd_slow_window, macd_signal_window),
+        "cci": cci(typical_prices),
+        "williams_percent_r": williams_percent_r(wr_closes, wr_highs, wr_lows),
     }
 
 
 def build_dataset(
     closes: list[float],
     midpoints: list[float],
+    highs: list[float],
+    lows: list[float],
     sma_window: int,
     ema_window: int,
     rsi_window: int,
@@ -179,6 +212,11 @@ def build_dataset(
     bollinger_num_std: float,
     ao_fast_window: int,
     ao_slow_window: int,
+    macd_fast_window: int,
+    macd_slow_window: int,
+    macd_signal_window: int,
+    cci_window: int,
+    williams_r_window: int,
 ) -> tuple[list[list[float]], list[int]]:
     """Builds (X, y) — X rows in FEATURE_ORDER, y = 1 if the bar right
     after the features were computed closed higher, else 0. Skips the
@@ -187,7 +225,16 @@ def build_dataset(
     returns before there's enough history (a real, if rare, condition
     live too, but not one worth over-representing in a training set)."""
     warmup = max(
-        sma_window, ema_window, rsi_window + 1, vol_window + 1, bar_momentum_window, bollinger_window, ao_slow_window
+        sma_window,
+        ema_window,
+        rsi_window + 1,
+        vol_window + 1,
+        bar_momentum_window,
+        bollinger_window,
+        ao_slow_window,
+        macd_slow_window + macd_signal_window,
+        cci_window,
+        williams_r_window,
     )
     X: list[list[float]] = []
     y: list[int] = []
@@ -196,6 +243,8 @@ def build_dataset(
         feats = features_at(
             closes,
             midpoints,
+            highs,
+            lows,
             i,
             sma_window,
             ema_window,
@@ -206,6 +255,11 @@ def build_dataset(
             bollinger_num_std,
             ao_fast_window,
             ao_slow_window,
+            macd_fast_window,
+            macd_slow_window,
+            macd_signal_window,
+            cci_window,
+            williams_r_window,
         )
         X.append([feats[name] for name in FEATURE_ORDER])
         y.append(1 if closes[i + 1] > closes[i] else 0)
@@ -253,6 +307,11 @@ def main() -> None:
     parser.add_argument("--bollinger-num-std", type=float, default=2.0)
     parser.add_argument("--ao-fast-window", type=int, default=5)
     parser.add_argument("--ao-slow-window", type=int, default=34)
+    parser.add_argument("--macd-fast-window", type=int, default=12)
+    parser.add_argument("--macd-slow-window", type=int, default=26)
+    parser.add_argument("--macd-signal-window", type=int, default=9)
+    parser.add_argument("--cci-window", type=int, default=20)
+    parser.add_argument("--williams-r-window", type=int, default=14)
     parser.add_argument("--test-fraction", type=float, default=0.2, help="Fraction of the (time-ordered) data held out for testing.")
     parser.add_argument("--kind", choices=["logistic", "gboost"], default="logistic")
     parser.add_argument("--model-out", default=None, help="Defaults to models/<symbol>_<kind>.joblib")
@@ -266,7 +325,7 @@ def main() -> None:
 
     conn = connect()
     try:
-        closes, midpoints = load_ohlc(conn, args.symbol, args.interval)
+        closes, midpoints, highs, lows = load_ohlc(conn, args.symbol, args.interval)
     finally:
         conn.close()
 
@@ -278,13 +337,16 @@ def main() -> None:
         args.bar_momentum_window,
         args.bollinger_window,
         args.ao_slow_window,
+        args.macd_slow_window + args.macd_signal_window,
+        args.cci_window,
+        args.williams_r_window,
     )
     min_required = warmup + 10  # a little slack beyond bare warmup so there's an actual dataset, not one row
     if len(closes) < min_required:
         print(
             f"error: only {len(closes)} candles available for {args.symbol} at interval={args.interval}min, "
-            f"need at least {min_required} (warmup={warmup}, driven by ao_slow_window={args.ao_slow_window} "
-            "unless another window is larger, + a handful of rows to train/test on). "
+            f"need at least {min_required} (warmup={warmup}, driven by whichever window is largest — "
+            "ao_slow_window, macd_slow_window+macd_signal_window, etc. — + a handful of rows to train/test on). "
             "Run historical-data/backfill_ohlc.py or import_csv.py for more history first.",
             file=sys.stderr,
         )
@@ -293,6 +355,8 @@ def main() -> None:
     X, y = build_dataset(
         closes,
         midpoints,
+        highs,
+        lows,
         args.sma_window,
         args.ema_window,
         args.rsi_window,
@@ -302,6 +366,11 @@ def main() -> None:
         args.bollinger_num_std,
         args.ao_fast_window,
         args.ao_slow_window,
+        args.macd_fast_window,
+        args.macd_slow_window,
+        args.macd_signal_window,
+        args.cci_window,
+        args.williams_r_window,
     )
     X_train, y_train, X_test, y_test = time_ordered_split(X, y, args.test_fraction)
 

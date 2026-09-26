@@ -38,6 +38,13 @@ class _SymbolBars:
         # price" the Awesome Oscillator is traditionally computed on,
         # rather than the close.
         self.midpoints: deque[float] = deque(maxlen=max_bars)
+        # Raw per-bar high/low history — needed by indicators that can't be
+        # derived from the midpoint alone: CCI's typical price
+        # ((high+low+close)/3) and Williams %R's highest-high/lowest-low
+        # over a window both need the actual high and low, not just their
+        # average.
+        self.highs: deque[float] = deque(maxlen=max_bars)
+        self.lows: deque[float] = deque(maxlen=max_bars)
         self.current_bucket_start: int | None = None
         self.current_close: float = 0.0
         self.current_high: float = 0.0
@@ -94,6 +101,8 @@ class BarAggregator:
 
         state.closes.append(state.current_close)
         state.midpoints.append((state.current_high + state.current_low) / 2.0)
+        state.highs.append(state.current_high)
+        state.lows.append(state.current_low)
         state.current_bucket_start = bucket_start
         state.current_close = price
         state.current_high = price
@@ -115,6 +124,20 @@ class BarAggregator:
             return []
         return list(state.midpoints)
 
+    def highs(self, symbol: str) -> list[float]:
+        """Completed bars' highs, oldest first."""
+        state = self._state.get(symbol)
+        if state is None:
+            return []
+        return list(state.highs)
+
+    def lows(self, symbol: str) -> list[float]:
+        """Completed bars' lows, oldest first."""
+        state = self._state.get(symbol)
+        if state is None:
+            return []
+        return list(state.lows)
+
     def window(self, symbol: str, size: int) -> list[float]:
         """The most recent `size` completed bar closes for this symbol
         (fewer if there isn't yet that much history) — the slice callers
@@ -131,3 +154,17 @@ class BarAggregator:
         if size <= 0:
             return []
         return self.midpoints(symbol)[-size:]
+
+    def high_window(self, symbol: str, size: int) -> list[float]:
+        """The most recent `size` completed bar highs for this symbol
+        (fewer if there isn't yet that much history)."""
+        if size <= 0:
+            return []
+        return self.highs(symbol)[-size:]
+
+    def low_window(self, symbol: str, size: int) -> list[float]:
+        """The most recent `size` completed bar lows for this symbol
+        (fewer if there isn't yet that much history)."""
+        if size <= 0:
+            return []
+        return self.lows(symbol)[-size:]

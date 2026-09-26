@@ -42,6 +42,15 @@ class FeatureConfig:
     # AO's slow window (34) is much longer than anything else here.
     ao_fast_window: int = 5
     ao_slow_window: int = 34
+    # MACD's classic fast/slow EMA periods plus the signal-line EMA period
+    # applied to the MACD series itself.
+    macd_fast_window: int = 12
+    macd_slow_window: int = 26
+    macd_signal_window: int = 9
+    # CCI's classic typical-price window.
+    cci_window: int = 20
+    # Williams %R's classic high/low lookback window.
+    williams_r_window: int = 14
 
 
 @dataclass(frozen=True)
@@ -121,6 +130,11 @@ class Config:
                     bollinger_num_std=float(strategy_raw["features"].get("bollinger_num_std", 2.0)),
                     ao_fast_window=int(strategy_raw["features"].get("ao_fast_window", 5)),
                     ao_slow_window=int(strategy_raw["features"].get("ao_slow_window", 34)),
+                    macd_fast_window=int(strategy_raw["features"].get("macd_fast_window", 12)),
+                    macd_slow_window=int(strategy_raw["features"].get("macd_slow_window", 26)),
+                    macd_signal_window=int(strategy_raw["features"].get("macd_signal_window", 9)),
+                    cci_window=int(strategy_raw["features"].get("cci_window", 20)),
+                    williams_r_window=int(strategy_raw["features"].get("williams_r_window", 14)),
                 ),
                 model=ModelConfig(
                     kind=model_raw["kind"],

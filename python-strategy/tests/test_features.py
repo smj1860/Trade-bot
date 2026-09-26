@@ -85,6 +85,9 @@ def test_bar_derived_features_default_to_neutral_with_no_bar_history():
     assert features.bollinger_percent_b == 0.0
     assert features.bollinger_bandwidth == 0.0
     assert features.awesome_oscillator == 0.0
+    assert features.macd_histogram == 0.0
+    assert features.cci == 0.0
+    assert features.williams_percent_r == 0.0
 
 
 def test_bar_derived_features_populate_once_bars_complete():
@@ -134,3 +137,60 @@ def test_awesome_oscillator_populates_once_slow_window_completes():
         )
     assert features is not None
     assert features.awesome_oscillator > 0
+
+
+def test_macd_populates_once_windows_complete():
+    engine = FeatureEngine(
+        momentum_window=5,
+        bar_interval_seconds=60,
+        macd_fast_window=2,
+        macd_slow_window=4,
+        macd_signal_window=2,
+    )
+    # Steadily rising mid-prices -> steadily rising bar closes -> a
+    # positive MACD histogram (fast EMA pulling away above slow EMA).
+    for i in range(12):
+        features = engine.on_order_book_update(
+            "BTC-USD",
+            Decimal(100 + i),
+            Decimal(1),
+            Decimal(102 + i),
+            Decimal(1),
+            timestamp=float(i * 60),
+        )
+    assert features is not None
+    assert features.macd_histogram > 0
+
+
+def test_cci_populates_once_window_completes():
+    engine = FeatureEngine(momentum_window=5, bar_interval_seconds=60, cci_window=3)
+    # Rising mid-prices -> rising typical prices -> most recent above its
+    # average -> positive CCI.
+    for i in range(6):
+        features = engine.on_order_book_update(
+            "BTC-USD",
+            Decimal(100 + i),
+            Decimal(1),
+            Decimal(102 + i),
+            Decimal(1),
+            timestamp=float(i * 60),
+        )
+    assert features is not None
+    assert features.cci > 0
+
+
+def test_williams_r_populates_once_window_completes():
+    engine = FeatureEngine(momentum_window=5, bar_interval_seconds=60, williams_r_window=3)
+    # Steadily rising mid-prices -> the most recent close sits at (or near)
+    # the window's high -> williams %r close to +1 (bullish).
+    for i in range(6):
+        features = engine.on_order_book_update(
+            "BTC-USD",
+            Decimal(100 + i),
+            Decimal(1),
+            Decimal(102 + i),
+            Decimal(1),
+            timestamp=float(i * 60),
+        )
+    assert features is not None
+    assert features.williams_percent_r > 0

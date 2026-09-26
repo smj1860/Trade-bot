@@ -121,3 +121,19 @@ def test_sklearn_wrapper_feature_vector_includes_ema_bollinger_ao():
         ema_ratio=0.5, bollinger_percent_b=0.6, bollinger_bandwidth=0.7, awesome_oscillator=0.8
     )
     assert wrapper._feature_vector(features) == [0.5, 0.6, 0.7, 0.8]
+
+
+def test_sklearn_wrapper_feature_vector_includes_macd_cci_williams_r():
+    """Same as above, for the newest indicators (MACD, CCI, Williams %R)."""
+    from strategy.models import SklearnModelWrapper
+
+    class _FakeModel:
+        def predict(self, vector):
+            return [0.0]
+
+    wrapper = SklearnModelWrapper.__new__(SklearnModelWrapper)
+    wrapper._model = _FakeModel()
+    wrapper._feature_order = ["macd_histogram", "cci", "williams_percent_r"]
+
+    features = make_features(macd_histogram=0.1, cci=0.2, williams_percent_r=0.3)
+    assert wrapper._feature_vector(features) == [0.1, 0.2, 0.3]
