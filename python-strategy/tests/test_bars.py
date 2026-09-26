@@ -86,3 +86,43 @@ def test_invalid_construction_args_raise():
         BarAggregator(bar_interval_seconds=0, max_bars=10)
     with pytest.raises(ValueError):
         BarAggregator(bar_interval_seconds=60, max_bars=0)
+
+
+def test_no_history_midpoints_are_empty():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=10)
+    assert agg.midpoints("BTC-USD") == []
+    assert agg.midpoint_window("BTC-USD", 5) == []
+
+
+def test_midpoint_uses_bucket_high_low_not_just_close():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=10)
+    # bucket [0, 60): ticks 100, 105, 98 -> high=105, low=98, close=98 (last)
+    agg.on_tick("BTC-USD", timestamp=0.0, price=100.0)
+    agg.on_tick("BTC-USD", timestamp=20.0, price=105.0)
+    agg.on_tick("BTC-USD", timestamp=40.0, price=98.0)
+    agg.on_tick("BTC-USD", timestamp=60.0, price=110.0)  # completes the bucket above
+    assert agg.closes("BTC-USD") == [98.0]
+    assert agg.midpoints("BTC-USD") == [(105.0 + 98.0) / 2]
+
+
+def test_midpoint_single_tick_bucket_equals_that_price():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=10)
+    agg.on_tick("BTC-USD", timestamp=0.0, price=100.0)
+    agg.on_tick("BTC-USD", timestamp=60.0, price=110.0)  # completes a bucket with just one tick
+    assert agg.midpoints("BTC-USD") == [100.0]
+
+
+def test_midpoint_window_returns_most_recent_n():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=10)
+    for i in range(5):
+        agg.on_tick("BTC-USD", timestamp=float(i * 60), price=float(100 + i))
+    assert agg.midpoints("BTC-USD") == [100.0, 101.0, 102.0, 103.0]
+    assert agg.midpoint_window("BTC-USD", 2) == [102.0, 103.0]
+    assert agg.midpoint_window("BTC-USD", 0) == []
+
+
+def test_max_bars_evicts_oldest_midpoints_too():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=2)
+    for i in range(5):
+        agg.on_tick("BTC-USD", timestamp=float(i * 60), price=float(100 + i))
+    assert len(agg.midpoints("BTC-USD")) == 2

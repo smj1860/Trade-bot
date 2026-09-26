@@ -31,9 +31,17 @@ class FeatureConfig:
     # historical-data/backfill_ohlc.py backfills by default.
     bar_interval_minutes: int = 60
     sma_window: int = 20
+    ema_window: int = 12
     rsi_window: int = 14
     vol_window: int = 20
     bar_momentum_window: int = 10
+    bollinger_window: int = 20
+    bollinger_num_std: float = 2.0
+    # Bill Williams' classic Awesome Oscillator windows (fast/slow SMA of
+    # bar midpoints). Kept separate from the other windows above since
+    # AO's slow window (34) is much longer than anything else here.
+    ao_fast_window: int = 5
+    ao_slow_window: int = 34
 
 
 @dataclass(frozen=True)
@@ -105,9 +113,14 @@ class Config:
                     momentum_window=int(strategy_raw["features"]["momentum_window"]),
                     bar_interval_minutes=int(strategy_raw["features"].get("bar_interval_minutes", 60)),
                     sma_window=int(strategy_raw["features"].get("sma_window", 20)),
+                    ema_window=int(strategy_raw["features"].get("ema_window", 12)),
                     rsi_window=int(strategy_raw["features"].get("rsi_window", 14)),
                     vol_window=int(strategy_raw["features"].get("vol_window", 20)),
                     bar_momentum_window=int(strategy_raw["features"].get("bar_momentum_window", 10)),
+                    bollinger_window=int(strategy_raw["features"].get("bollinger_window", 20)),
+                    bollinger_num_std=float(strategy_raw["features"].get("bollinger_num_std", 2.0)),
+                    ao_fast_window=int(strategy_raw["features"].get("ao_fast_window", 5)),
+                    ao_slow_window=int(strategy_raw["features"].get("ao_slow_window", 34)),
                 ),
                 model=ModelConfig(
                     kind=model_raw["kind"],

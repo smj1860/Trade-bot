@@ -78,9 +78,13 @@ def test_bar_derived_features_default_to_neutral_with_no_bar_history():
         "BTC-USD", Decimal(100), Decimal(1), Decimal(102), Decimal(1), timestamp=0.0
     )
     assert features.sma_ratio == 0.0
+    assert features.ema_ratio == 0.0
     assert features.rsi == 0.0
     assert features.realized_vol == 0.0
     assert features.bar_momentum == 0.0
+    assert features.bollinger_percent_b == 0.0
+    assert features.bollinger_bandwidth == 0.0
+    assert features.awesome_oscillator == 0.0
 
 
 def test_bar_derived_features_populate_once_bars_complete():
@@ -88,9 +92,11 @@ def test_bar_derived_features_populate_once_bars_complete():
         momentum_window=5,
         bar_interval_seconds=60,
         sma_window=3,
+        ema_window=3,
         rsi_window=2,
         vol_window=2,
         bar_momentum_window=2,
+        bollinger_window=3,
     )
     # Each call's mid-price is (bid+ask)/2 = 100, 101, ..., rising steadily.
     # One tick per 60s bucket -> each call after the first completes a bar
@@ -110,3 +116,21 @@ def test_bar_derived_features_populate_once_bars_complete():
     assert features.bar_momentum > 0  # steadily rising closes
     assert features.rsi == 1.0  # every step was a gain
     assert features.sma_ratio > 0  # most recent close above the window's average
+    assert features.ema_ratio > 0  # most recent close above its EMA
+    assert features.bollinger_percent_b > 0  # most recent close above its middle band
+
+
+def test_awesome_oscillator_populates_once_slow_window_completes():
+    engine = FeatureEngine(momentum_window=5, bar_interval_seconds=60, ao_fast_window=2, ao_slow_window=4)
+    # Rising mid-prices -> rising bar midpoints -> fast SMA above slow SMA.
+    for i in range(6):
+        features = engine.on_order_book_update(
+            "BTC-USD",
+            Decimal(100 + i),
+            Decimal(1),
+            Decimal(102 + i),
+            Decimal(1),
+            timestamp=float(i * 60),
+        )
+    assert features is not None
+    assert features.awesome_oscillator > 0

@@ -102,3 +102,22 @@ def test_sklearn_wrapper_feature_vector_includes_bar_derived_features():
 
     features = make_features(sma_ratio=0.1, rsi=0.2, realized_vol=0.3, bar_momentum=0.4)
     assert wrapper._feature_vector(features) == [0.1, 0.2, 0.3, 0.4]
+
+
+def test_sklearn_wrapper_feature_vector_includes_ema_bollinger_ao():
+    """Same as above, for the newer indicators (EMA, Bollinger Bands,
+    Awesome Oscillator)."""
+    from strategy.models import SklearnModelWrapper
+
+    class _FakeModel:
+        def predict(self, vector):
+            return [0.0]
+
+    wrapper = SklearnModelWrapper.__new__(SklearnModelWrapper)
+    wrapper._model = _FakeModel()
+    wrapper._feature_order = ["ema_ratio", "bollinger_percent_b", "bollinger_bandwidth", "awesome_oscillator"]
+
+    features = make_features(
+        ema_ratio=0.5, bollinger_percent_b=0.6, bollinger_bandwidth=0.7, awesome_oscillator=0.8
+    )
+    assert wrapper._feature_vector(features) == [0.5, 0.6, 0.7, 0.8]

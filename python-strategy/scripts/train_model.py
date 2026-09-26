@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """
 Trains a baseline classifier on the OHLC-derived bar features
-(strategy/indicators.py: sma_ratio, rsi, realized_vol, bar_momentum) using
-real historical Kraken candles from Supabase, and saves it via joblib for
-use as strategy.model.kind = "sklearn" (see strategy_config.example.toml).
+(strategy/indicators.py: sma_ratio, ema_ratio, rsi, realized_vol,
+bar_momentum, bollinger_percent_b, bollinger_bandwidth,
+awesome_oscillator) using real historical Kraken candles from Supabase,
+and saves it via joblib for use as strategy.model.kind = "sklearn" (see
+strategy_config.example.toml).
 
 This is the other half of the feature-parity work described in
 docs/model-training.md: strategy/features.py's FeatureEngine computes
-these same four features live, from the same four pure functions in
+these same features live, from the same pure functions in
 strategy/indicators.py, over bars built by strategy/bars.py's
 BarAggregator. This script computes them the same way over completed
-windows of real historical closes, so a model trained here sees an
-identical feature definition to what it will be fed in production.
+windows of real historical closes (and, for the Awesome Oscillator,
+Kraken's own real historical high/low per candle — see
+awesome_oscillator's use of load_ohlc below, which is actually a slightly
+*better* midpoint series than the live engine's, which only approximates
+high/low from the tick range seen within a bucket), so a model trained
+here sees an identical feature definition to what it will be fed in
+production.
 
 Label (deliberately simple, NOT sophisticated): next-bar direction — did
 the close go up or down one bar after the features were computed. This is
@@ -53,9 +60,27 @@ from pathlib import Path
 # path so `import strategy...` resolves either way.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from strategy.indicators import bar_momentum, realized_vol, rsi, sma_ratio
+from strategy.indicators import (
+    awesome_oscillator,
+    bar_momentum,
+    bollinger_bandwidth,
+    bollinger_percent_b,
+    ema_ratio,
+    realized_vol,
+    rsi,
+    sma_ratio,
+)
 
-FEATURE_ORDER = ["sma_ratio", "rsi", "realized_vol", "bar_momentum"]
+FEATURE_ORDER = [
+    "sma_ratio",
+    "ema_ratio",
+    "rsi",
+    "realized_vol",
+    "bar_momentum",
+    "bollinger_percent_b",
+    "bollinger_bandwidth",
+    "awesome_oscillator",
+]
 
 
 class MissingCredentials(RuntimeError):
@@ -79,11 +104,19 @@ def connect():
     return psycopg2.connect(dsn)
 
 
-def load_closes(conn, symbol: str, interval_minutes: int) -> list[float]:
+def load_ohlc(conn, symbol: str, interval_minutes: int) -> tuple[list[float], list[float]]:
+    """Returns (closes, midpoints) — midpoints = (high + low) / 2 per
+    candle, straight from Kraken's own recorded high/low (real traded
+    range), which is what awesome_oscillator is fed. This is actually a
+    truer midpoint series than the live engine gets (strategy/bars.py can
+    only approximate high/low from mid-price ticks seen within a bucket,
+    since there's no live trade feed wired up yet — see bars.py's module
+    docstring), a known, documented asymmetry, not a mismatch that breaks
+    parity on the close-based features."""
     with conn.cursor() as cur:
         cur.execute(
             """
-            select close
+            select close, high, low
             from ohlc_candles
             where exchange = %s and symbol = %s and interval_minutes = %s
             order by ts asc
@@ -91,39 +124,61 @@ def load_closes(conn, symbol: str, interval_minutes: int) -> list[float]:
             ("kraken", symbol, interval_minutes),
         )
         rows = cur.fetchall()
-    return [float(r[0]) for r in rows]
+    closes = [float(r[0]) for r in rows]
+    midpoints = [(float(r[1]) + float(r[2])) / 2.0 for r in rows]
+    return closes, midpoints
 
 
 def features_at(
     closes: list[float],
+    midpoints: list[float],
     i: int,
     sma_window: int,
+    ema_window: int,
     rsi_window: int,
     vol_window: int,
     bar_momentum_window: int,
+    bollinger_window: int,
+    bollinger_num_std: float,
+    ao_fast_window: int,
+    ao_slow_window: int,
 ) -> dict[str, float]:
     """The feature vector as of bar `i`, using the same window-slicing
     convention strategy/features.py's FeatureEngine applies live via
-    BarAggregator.window(): the most recent `size` completed closes up to
-    and including the current one."""
+    BarAggregator.window()/midpoint_window(): the most recent `size`
+    completed closes (or midpoints, for the Awesome Oscillator) up to and
+    including the current one."""
     sma_win = closes[max(0, i - sma_window + 1) : i + 1]
+    ema_win = closes[max(0, i - ema_window + 1) : i + 1]
     rsi_win = closes[max(0, i - rsi_window) : i + 1]  # rsi needs window+1 closes for `window` price changes
     vol_win = closes[max(0, i - vol_window) : i + 1]
     mom_win = closes[max(0, i - bar_momentum_window + 1) : i + 1]
+    boll_win = closes[max(0, i - bollinger_window + 1) : i + 1]
+    ao_win = midpoints[max(0, i - ao_slow_window + 1) : i + 1]
     return {
         "sma_ratio": sma_ratio(sma_win),
+        "ema_ratio": ema_ratio(ema_win),
         "rsi": rsi(rsi_win),
         "realized_vol": realized_vol(vol_win),
         "bar_momentum": bar_momentum(mom_win),
+        "bollinger_percent_b": bollinger_percent_b(boll_win, bollinger_num_std),
+        "bollinger_bandwidth": bollinger_bandwidth(boll_win, bollinger_num_std),
+        "awesome_oscillator": awesome_oscillator(ao_win, ao_fast_window, ao_slow_window),
     }
 
 
 def build_dataset(
     closes: list[float],
+    midpoints: list[float],
     sma_window: int,
+    ema_window: int,
     rsi_window: int,
     vol_window: int,
     bar_momentum_window: int,
+    bollinger_window: int,
+    bollinger_num_std: float,
+    ao_fast_window: int,
+    ao_slow_window: int,
 ) -> tuple[list[list[float]], list[int]]:
     """Builds (X, y) — X rows in FEATURE_ORDER, y = 1 if the bar right
     after the features were computed closed higher, else 0. Skips the
@@ -131,12 +186,27 @@ def build_dataset(
     training isn't dominated by the neutral 0.0 values indicators.py
     returns before there's enough history (a real, if rare, condition
     live too, but not one worth over-representing in a training set)."""
-    warmup = max(sma_window, rsi_window + 1, vol_window + 1, bar_momentum_window)
+    warmup = max(
+        sma_window, ema_window, rsi_window + 1, vol_window + 1, bar_momentum_window, bollinger_window, ao_slow_window
+    )
     X: list[list[float]] = []
     y: list[int] = []
     # i is the bar the features are computed as-of; i+1 is the label bar.
     for i in range(warmup - 1, len(closes) - 1):
-        feats = features_at(closes, i, sma_window, rsi_window, vol_window, bar_momentum_window)
+        feats = features_at(
+            closes,
+            midpoints,
+            i,
+            sma_window,
+            ema_window,
+            rsi_window,
+            vol_window,
+            bar_momentum_window,
+            bollinger_window,
+            bollinger_num_std,
+            ao_fast_window,
+            ao_slow_window,
+        )
         X.append([feats[name] for name in FEATURE_ORDER])
         y.append(1 if closes[i + 1] > closes[i] else 0)
     return X, y
@@ -175,9 +245,14 @@ def main() -> None:
     parser.add_argument("--symbol", required=True, help="Normalized symbol (e.g. BTC-USD).")
     parser.add_argument("--interval", type=int, default=60, help="Candle resolution in minutes (default 60, matching strategy_config.example.toml's bar_interval_minutes).")
     parser.add_argument("--sma-window", type=int, default=20)
+    parser.add_argument("--ema-window", type=int, default=12)
     parser.add_argument("--rsi-window", type=int, default=14)
     parser.add_argument("--vol-window", type=int, default=20)
     parser.add_argument("--bar-momentum-window", type=int, default=10)
+    parser.add_argument("--bollinger-window", type=int, default=20)
+    parser.add_argument("--bollinger-num-std", type=float, default=2.0)
+    parser.add_argument("--ao-fast-window", type=int, default=5)
+    parser.add_argument("--ao-slow-window", type=int, default=34)
     parser.add_argument("--test-fraction", type=float, default=0.2, help="Fraction of the (time-ordered) data held out for testing.")
     parser.add_argument("--kind", choices=["logistic", "gboost"], default="logistic")
     parser.add_argument("--model-out", default=None, help="Defaults to models/<symbol>_<kind>.joblib")
@@ -191,22 +266,43 @@ def main() -> None:
 
     conn = connect()
     try:
-        closes = load_closes(conn, args.symbol, args.interval)
+        closes, midpoints = load_ohlc(conn, args.symbol, args.interval)
     finally:
         conn.close()
 
-    warmup = max(args.sma_window, args.rsi_window + 1, args.vol_window + 1, args.bar_momentum_window)
+    warmup = max(
+        args.sma_window,
+        args.ema_window,
+        args.rsi_window + 1,
+        args.vol_window + 1,
+        args.bar_momentum_window,
+        args.bollinger_window,
+        args.ao_slow_window,
+    )
     min_required = warmup + 10  # a little slack beyond bare warmup so there's an actual dataset, not one row
     if len(closes) < min_required:
         print(
             f"error: only {len(closes)} candles available for {args.symbol} at interval={args.interval}min, "
-            f"need at least {min_required} (warmup={warmup} + a handful of rows to train/test on). "
+            f"need at least {min_required} (warmup={warmup}, driven by ao_slow_window={args.ao_slow_window} "
+            "unless another window is larger, + a handful of rows to train/test on). "
             "Run historical-data/backfill_ohlc.py or import_csv.py for more history first.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    X, y = build_dataset(closes, args.sma_window, args.rsi_window, args.vol_window, args.bar_momentum_window)
+    X, y = build_dataset(
+        closes,
+        midpoints,
+        args.sma_window,
+        args.ema_window,
+        args.rsi_window,
+        args.vol_window,
+        args.bar_momentum_window,
+        args.bollinger_window,
+        args.bollinger_num_std,
+        args.ao_fast_window,
+        args.ao_slow_window,
+    )
     X_train, y_train, X_test, y_test = time_ordered_split(X, y, args.test_fraction)
 
     if len(set(y_train)) < 2:

@@ -11,10 +11,11 @@ Two families of feature live here side by side:
   the original version of this module. These can't be reconstructed from
   historical OHLC candle data (imbalance needs live bid/ask sizes), so
   they're live-only — there's no historical training signal for them.
-- Bar-level (sma_ratio, rsi, realized_vol, bar_momentum): computed by
-  strategy.indicators over a rolling history of completed bars built by
-  strategy.bars.BarAggregator from mid-price ticks. These are the ones a
-  model can actually be trained on, because the exact same indicator
+- Bar-level (sma_ratio, ema_ratio, rsi, realized_vol, bar_momentum,
+  bollinger_percent_b, bollinger_bandwidth, awesome_oscillator): computed
+  by strategy.indicators over a rolling history of completed bars built
+  by strategy.bars.BarAggregator from mid-price ticks. These are the ones
+  a model can actually be trained on, because the exact same indicator
   functions run identically over Kraken's historical OHLC candle closes
   (see historical-data/'s training script) — see docs/model-training.md
   for why this split exists.
@@ -27,7 +28,16 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from strategy.bars import BarAggregator
-from strategy.indicators import bar_momentum, realized_vol, rsi, sma_ratio
+from strategy.indicators import (
+    awesome_oscillator,
+    bar_momentum,
+    bollinger_bandwidth,
+    bollinger_percent_b,
+    ema_ratio,
+    realized_vol,
+    rsi,
+    sma_ratio,
+)
 
 
 @dataclass(frozen=True)
@@ -42,9 +52,13 @@ class Features:
     # not-enough-history convention) so existing callers that construct a
     # Features without these keeps working unchanged.
     sma_ratio: float = 0.0
+    ema_ratio: float = 0.0
     rsi: float = 0.0
     realized_vol: float = 0.0
     bar_momentum: float = 0.0
+    bollinger_percent_b: float = 0.0
+    bollinger_bandwidth: float = 0.0
+    awesome_oscillator: float = 0.0
 
 
 class _SymbolState:
@@ -69,22 +83,47 @@ class FeatureEngine:
         momentum_window: int,
         bar_interval_seconds: int = 3600,
         sma_window: int = 20,
+        ema_window: int = 12,
         rsi_window: int = 14,
         vol_window: int = 20,
         bar_momentum_window: int = 10,
+        bollinger_window: int = 20,
+        bollinger_num_std: float = 2.0,
+        ao_fast_window: int = 5,
+        ao_slow_window: int = 34,
     ) -> None:
         self._momentum_window = momentum_window
         self._state: dict[str, _SymbolState] = {}
 
         self._sma_window = sma_window
+        self._ema_window = ema_window
         self._rsi_window = rsi_window
         self._vol_window = vol_window
         self._bar_momentum_window = bar_momentum_window
+        self._bollinger_window = bollinger_window
+        self._bollinger_num_std = bollinger_num_std
+        self._ao_fast_window = ao_fast_window
+        self._ao_slow_window = ao_slow_window
         # rsi/realized_vol need one extra close to produce N price changes
         # from a window of N+1 closes — size the bar history for the
-        # largest window any of the four indicators actually needs.
-        max_bars = max(sma_window, rsi_window + 1, vol_window + 1, bar_momentum_window) + 1
-        self._bars = BarAggregator(bar_interval_seconds=bar_interval_seconds, max_bars=max_bars)
+        # largest window any close-based indicator actually needs.
+        max_bars = (
+            max(
+                sma_window,
+                ema_window,
+                rsi_window + 1,
+                vol_window + 1,
+                bar_momentum_window,
+                bollinger_window,
+            )
+            + 1
+        )
+        # The Awesome Oscillator runs over a separate (midpoint) series
+        # with its own, usually much longer, window — size that history
+        # independently rather than forcing every other indicator's
+        # window to grow to match AO's classic 34-bar slow window.
+        max_ao_bars = ao_slow_window + 1
+        self._bars = BarAggregator(bar_interval_seconds=bar_interval_seconds, max_bars=max(max_bars, max_ao_bars))
 
     def on_order_book_update(
         self,
@@ -134,7 +173,19 @@ class FeatureEngine:
             imbalance=imbalance,
             momentum=momentum,
             sma_ratio=sma_ratio(self._bars.window(symbol, self._sma_window)),
+            ema_ratio=ema_ratio(self._bars.window(symbol, self._ema_window)),
             rsi=rsi(self._bars.window(symbol, self._rsi_window + 1)),
             realized_vol=realized_vol(self._bars.window(symbol, self._vol_window + 1)),
             bar_momentum=bar_momentum(self._bars.window(symbol, self._bar_momentum_window)),
+            bollinger_percent_b=bollinger_percent_b(
+                self._bars.window(symbol, self._bollinger_window), self._bollinger_num_std
+            ),
+            bollinger_bandwidth=bollinger_bandwidth(
+                self._bars.window(symbol, self._bollinger_window), self._bollinger_num_std
+            ),
+            awesome_oscillator=awesome_oscillator(
+                self._bars.midpoint_window(symbol, self._ao_slow_window),
+                self._ao_fast_window,
+                self._ao_slow_window,
+            ),
         )

@@ -27,9 +27,14 @@ class ImbalanceMomentumStrategy(Strategy):
             momentum_window=config.strategy.features.momentum_window,
             bar_interval_seconds=config.strategy.features.bar_interval_minutes * 60,
             sma_window=config.strategy.features.sma_window,
+            ema_window=config.strategy.features.ema_window,
             rsi_window=config.strategy.features.rsi_window,
             vol_window=config.strategy.features.vol_window,
             bar_momentum_window=config.strategy.features.bar_momentum_window,
+            bollinger_window=config.strategy.features.bollinger_window,
+            bollinger_num_std=config.strategy.features.bollinger_num_std,
+            ao_fast_window=config.strategy.features.ao_fast_window,
+            ao_slow_window=config.strategy.features.ao_slow_window,
         )
         self._model: ModelWrapper = build_model(
             config.strategy.model.kind,

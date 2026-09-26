@@ -96,3 +96,97 @@ def bar_momentum(closes: Sequence[float]) -> float:
     if len(closes) < 2 or closes[0] == 0:
         return 0.0
     return (closes[-1] - closes[0]) / closes[0]
+
+
+def ema(closes: Sequence[float]) -> float:
+    """Exponential moving average of the given closes, using the window's
+    own length as the EMA period — mirrors sma()'s convention (the caller
+    passes exactly the window it wants used) rather than taking a
+    separate period argument. Standard smoothing factor alpha = 2/(N+1),
+    seeded with the oldest close in the window. Needs at least 1 close;
+    returns 0.0 otherwise."""
+    if not closes:
+        return 0.0
+    alpha = 2.0 / (len(closes) + 1)
+    value = closes[0]
+    for c in closes[1:]:
+        value = alpha * c + (1.0 - alpha) * value
+    return value
+
+
+def ema_ratio(closes: Sequence[float]) -> float:
+    """(most recent close / EMA of the window) - 1 — the EMA-based analog
+    of sma_ratio(): positive means price is above its EMA, negative means
+    below. Needs at least 1 close; returns 0.0 otherwise."""
+    if not closes:
+        return 0.0
+    average = ema(closes)
+    if average == 0:
+        return 0.0
+    return (closes[-1] / average) - 1.0
+
+
+def _stdev(values: Sequence[float]) -> float:
+    """Population standard deviation (divides by N, not N-1) — matches
+    the conventional Bollinger Bands formula, which uses the standard
+    deviation of the same window the SMA is computed over. Needs at least
+    2 values; returns 0.0 otherwise."""
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    variance = sum((v - mean) ** 2 for v in values) / len(values)
+    return math.sqrt(variance)
+
+
+def bollinger_percent_b(closes: Sequence[float], num_std: float = 2.0) -> float:
+    """Where the most recent close sits relative to its Bollinger Bands,
+    rescaled from the traditional [0, 1] %b (0 = lower band, 1 = upper
+    band) to roughly [-1, 1] (0 = middle band/SMA, +1 = upper band, -1 =
+    lower band) so it composes with this project's other [-1, 1]-scaled
+    signals. Deliberately left unclipped beyond +-1 — a close outside the
+    bands (a real breakout) should look different from one sitting right
+    at the band, not be capped to look the same. Needs at least 2 closes
+    to compute a standard deviation, and a non-flat window (std > 0);
+    returns 0.0 (neutral — at the average) otherwise."""
+    if len(closes) < 2:
+        return 0.0
+    std = _stdev(closes)
+    if std == 0:
+        return 0.0
+    middle = sma(closes)
+    return (closes[-1] - middle) / (num_std * std)
+
+
+def bollinger_bandwidth(closes: Sequence[float], num_std: float = 2.0) -> float:
+    """Bollinger Band width relative to the middle band (SMA) — a
+    volatility feature: wider bands (a bigger number) mean more recent
+    price dispersion. Unlike realized_vol (std of log returns), this is
+    std of raw price relative to price level, so it's on a similar scale
+    across symbols at different price levels. Needs at least 2 closes and
+    a non-zero average price; returns 0.0 otherwise."""
+    if len(closes) < 2:
+        return 0.0
+    middle = sma(closes)
+    if middle == 0:
+        return 0.0
+    std = _stdev(closes)
+    return (2.0 * num_std * std) / middle
+
+
+def awesome_oscillator(midpoints: Sequence[float], fast_window: int = 5, slow_window: int = 34) -> float:
+    """Bill Williams' Awesome Oscillator: SMA(fast_window) of bar
+    midpoints ((high + low) / 2, see strategy/bars.py) minus
+    SMA(slow_window) of the same, expressed as a fraction of the slow SMA
+    rather than a raw price-unit difference — that keeps it comparable
+    across symbols at very different price levels (e.g. BTC vs. a
+    low-priced altcoin), the same reasoning as bar_momentum's and
+    sma_ratio's normalization. Classic default windows (5, 34) per
+    Williams' original definition. Needs at least `slow_window` midpoints
+    (the larger of the two SMAs); returns 0.0 otherwise."""
+    if len(midpoints) < slow_window or slow_window <= 0 or fast_window <= 0:
+        return 0.0
+    fast = sma(midpoints[-fast_window:])
+    slow = sma(midpoints[-slow_window:])
+    if slow == 0:
+        return 0.0
+    return (fast - slow) / slow

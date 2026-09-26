@@ -156,6 +156,73 @@ now excludes `python-strategy/models/`) precisely because it isn't a
 validated result — regenerate it from real Supabase data with the command
 above rather than trusting a stale binary.
 
+## Second round: EMA, Bollinger Bands, Awesome Oscillator (2026-09-26)
+
+Added three more bar-derived indicators to `strategy/indicators.py`, following
+the same pure-function/no-state pattern as the first four:
+
+- **`ema` / `ema_ratio`** — exponential moving average and the EMA-based
+  analog of `sma_ratio` (price vs. its EMA).
+- **`bollinger_percent_b` / `bollinger_bandwidth`** — where price sits
+  relative to its Bollinger Bands (rescaled to roughly `[-1, 1]`, 0 = at
+  the middle band, unlike the traditional `[0, 1]` %b, so it composes with
+  this project's other signals) and how wide the bands currently are (a
+  volatility feature, distinct from `realized_vol`'s log-return-based
+  measure).
+- **`awesome_oscillator`** — Bill Williams' classic 5/34-period SMA
+  difference, computed over bar *midpoints* (`(high + low) / 2`), not
+  closes — the one indicator here that needs more than a close per bar.
+
+That last point required extending `strategy/bars.py`'s `BarAggregator` to
+also track each bar's high/low (from the tick range seen within that
+bucket) and expose a parallel `midpoints()`/`midpoint_window()` history
+alongside the existing `closes()`/`window()`. Historically, this is
+actually *better* than the live approximation: `scripts/train_model.py`
+computes AO from Kraken's own real recorded high/low per candle, while the
+live engine can only approximate a bar's high/low from whatever mid-price
+ticks it happened to see in that bucket — a known, documented asymmetry
+between the two (see `bars.py`'s docstring), not a silent one.
+
+`Features`, `FeatureEngine`, `models.py`'s wrappers, `config.py` +
+`strategy_config.example.toml`, and `scripts/train_model.py` were all
+extended the same way as the first round: new fields/config keys with
+sensible defaults, nothing existing broken. 22 new tests (85 total, all
+passing). Ran the extended training script against BTC-USD's real 723
+hourly candles with all 8 features: 0.522 model accuracy vs. 0.529
+majority-class / 0.486 persistence baseline — still not a clear win, same
+honest conclusion as the first round (see below).
+
+### Indicators considered but not (yet) added
+
+A few other well-known technical indicators, and why they're not here:
+
+- **MACD** (moving average convergence/divergence) — a natural next
+  addition; essentially a difference of two EMAs plus a signal-line EMA of
+  that difference. Not added yet only because nothing has asked for it —
+  same `indicators.py` pattern would fit it directly.
+- **Stochastic Oscillator** — needs high/low per bar (now available via
+  `bars.py`'s midpoint tracking, or real candle high/low historically),
+  same shape as Awesome Oscillator. Not yet added.
+- **ATR (Average True Range)** — a volatility measure like
+  `bollinger_bandwidth`/`realized_vol`, but computed from true range
+  (accounts for gaps between bars), which needs the *previous* bar's close
+  as well as the current bar's high/low. Not yet added.
+- **ADX (Average Directional Index)** — a trend-strength indicator built
+  on top of directional movement + ATR; meaningfully more involved to
+  implement correctly than anything here so far. Not added.
+- **CCI (Commodity Channel Index)**, **Williams %R** — both similar in
+  spirit to Bollinger %b/RSI (price relative to a recent range); would be
+  quick additions in the same pattern if wanted.
+- **OBV (On-Balance Volume)**, **VWAP** — both need real traded volume
+  attributed to price direction. Kraken's OHLC candles *do* carry a volume
+  column (unused so far), but the live engine has no live volume signal at
+  all (only order-book ticks) — these would need the same kind of
+  live/historical parity thinking the rest of this doc is about, and
+  aren't started.
+- **Parabolic SAR**, **Ichimoku Cloud** — more elaborate, multi-line
+  indicators; skipped for now since nothing built here needs that level of
+  sophistication yet, and simpler indicators haven't shown signal.
+
 ### Not yet done / natural next steps
 
 - More history: 723 hourly candles is thin for training; either let the

@@ -96,9 +96,13 @@ class SklearnModelWrapper(ModelWrapper):
             "imbalance": features.imbalance,
             "momentum": features.momentum,
             "sma_ratio": features.sma_ratio,
+            "ema_ratio": features.ema_ratio,
             "rsi": features.rsi,
             "realized_vol": features.realized_vol,
             "bar_momentum": features.bar_momentum,
+            "bollinger_percent_b": features.bollinger_percent_b,
+            "bollinger_bandwidth": features.bollinger_bandwidth,
+            "awesome_oscillator": features.awesome_oscillator,
         }
         try:
             return [values[name] for name in self._feature_order]
@@ -145,9 +149,13 @@ class TorchModelWrapper(ModelWrapper):
             "imbalance": features.imbalance,
             "momentum": features.momentum,
             "sma_ratio": features.sma_ratio,
+            "ema_ratio": features.ema_ratio,
             "rsi": features.rsi,
             "realized_vol": features.realized_vol,
             "bar_momentum": features.bar_momentum,
+            "bollinger_percent_b": features.bollinger_percent_b,
+            "bollinger_bandwidth": features.bollinger_bandwidth,
+            "awesome_oscillator": features.awesome_oscillator,
         }
         try:
             return [values[name] for name in self._feature_order]
