@@ -254,6 +254,67 @@ factor looks like it's the data/label, not the feature set. This is the
 signal to try pooling more symbols and/or a better label next, rather
 than continuing to add indicators one at a time.
 
+## Multi-symbol pooling (2026-09-26)
+
+`scripts/train_model.py --symbol` now also accepts a comma-separated list
+("BTC-USD,ETH-USD,SOL-USD") or the literal `all` (every symbol with data
+at the given `--interval`, discovered with a `select distinct symbol`
+query rather than importing `historical-data/`'s `symbols.py` — this
+script stays intentionally standalone). Both pool multiple symbols'
+history into one combined training set, instead of training a separate
+model per symbol from ~700 rows each.
+
+Every bar-derived feature here was already a ratio or a value rescaled to
+roughly `[-1, 1]` — a deliberate choice from the first round on, so a
+symbol at $80,000/BTC and one at $1/DOGE produce comparable numbers — so
+pooling is a matter of computing each symbol's features independently
+over its own close/high/low history (no cross-symbol math anywhere) and
+combining the resulting rows. What still had to be handled carefully:
+each symbol is time-ordered split *individually* before any pooling
+happens, then every symbol's train rows are concatenated together and
+every symbol's test rows are concatenated together — never split the
+pooled rows as one long sequence, which would let one symbol's split
+boundary land in the middle of another symbol's history and leak
+lookahead across a symbol boundary that time itself never crosses.
+Baselines are pooled the same way: majority-class over the pooled
+training labels, and persistence accuracy aggregated as
+total-correct/total-bars across every symbol's own held-out period (not
+an average of per-symbol accuracies, so a symbol with more test bars
+counts proportionally more). A symbol with too little history to clear
+warmup is skipped with a warning rather than aborting the whole run.
+
+New tests in `tests/test_train_model.py` cover `resolve_symbols` (single
+symbol, comma-list, `all`), the warmup-skip behavior, and — the important
+one — that pooling's per-symbol-then-concatenate approach never lets a
+row cross from one symbol's train split into another symbol's test split
+(117 tests total, all passing).
+
+Ran it for real against all 13 symbols' real Supabase history (723 hourly
+candles each, fetched live via the Supabase MCP tool rather than
+`SUPABASE_DB_URL`, which isn't set in this sandbox):
+
+| | value |
+|---|---|
+| symbols pooled | 13 (AAVE, AVAX, BTC, DOGE, ETH, LINK, NEAR, PENDLE, SOL, SUI, TAO, UNI, XRP, all -USD) |
+| dataset rows (after warmup, pooled) | 8,944 |
+| train / test split | 7,150 / 1,794 (each symbol time-split individually, then concatenated) |
+| positive-label rate (train) | 50.4% |
+| **model accuracy** | **0.514** |
+| majority-class baseline | 0.513 |
+| persistence baseline | 0.484 |
+
+**Still not a clear win** — the model barely edges the majority-class
+baseline (0.514 vs 0.513, essentially noise) — but this is the most
+informative negative result yet: going from ~700 rows (one symbol) to
+~9,000 rows (13 symbols pooled) moved the positive-label rate to almost
+exactly 50/50 (a genuinely harder, less exploitable target) without the
+model gaining any real edge over guessing the majority class. That's
+consistent with next-bar direction on hourly crypto candles being close
+to a random walk regardless of how much more data or how many more
+technical indicators get thrown at it — the next thing worth trying is a
+different label (a magnitude threshold, or a multi-bar-ahead horizon),
+not more data or more indicators in this same shape.
+
 ### Indicators considered but not (yet) added
 
 A few other well-known technical indicators, and why they're not here:
@@ -289,9 +350,10 @@ A few other well-known technical indicators, and why they're not here:
   unit time.
 - A better label than raw next-bar direction (e.g. a magnitude threshold,
   or a multi-bar-ahead horizon) — next-bar direction is the simplest
-  possible thing to try first, not the right final target.
-- Multi-symbol training (pool all 13 symbols' candles into one dataset)
-  rather than one model per symbol from ~700 rows each.
+  possible thing to try first, not the right final target, and now the
+  clearest lead after three rounds of indicators and multi-symbol pooling
+  both failed to move accuracy meaningfully past the majority-class
+  baseline.
 - Once a model actually beats its baselines convincingly, wire
   `feature_order` into `strategy_config.toml` and switch
   `strategy.model.kind` to `"sklearn"` — not before.

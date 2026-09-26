@@ -44,6 +44,27 @@ Usage:
     python3 scripts/train_model.py --symbol BTC-USD --interval 60 --kind gboost \
         --model-out models/btc_usd_gboost.joblib
 
+    # Pool multiple symbols' history into one combined training set,
+    # instead of one model per symbol from ~700 rows each:
+    python3 scripts/train_model.py --symbol BTC-USD,ETH-USD,SOL-USD
+    python3 scripts/train_model.py --symbol all   # every symbol with data at --interval
+
+Pooling ("--symbol" given a comma-separated list, or the literal "all")
+computes each symbol's features independently over its own close/high/low
+history — every bar-derived feature here is already a ratio/normalized
+value (a fraction of price, or rescaled to roughly [-1, 1]), specifically
+so it's comparable across symbols at very different price levels, which
+is what makes pooling reasonable rather than mixing incomparable raw
+numbers. Each symbol is still time-ordered split *individually* (so a bar
+from symbol A is never trained on using a chronologically later bar from
+symbol A, and one symbol's split boundary never leaks into another's) and
+only then are all symbols' train rows concatenated into one training set,
+and all their test rows into one test set. Baselines are computed the
+same pooled way: majority-class over the pooled training labels, and
+persistence accuracy aggregated across every symbol's own test-period bars
+(total correct / total bars, not an average of per-symbol accuracies,
+so a symbol with more test bars contributes proportionally more).
+
 Requires: psycopg2-binary (requirements-training.txt) and scikit-learn +
 joblib (requirements-ml.txt).
 """
@@ -138,6 +159,25 @@ def load_ohlc(conn, symbol: str, interval_minutes: int) -> tuple[list[float], li
     lows = [float(r[2]) for r in rows]
     midpoints = [(h + l) / 2.0 for h, l in zip(highs, lows)]
     return closes, midpoints, highs, lows
+
+
+def list_available_symbols(conn, interval_minutes: int) -> list[str]:
+    """Every distinct symbol with at least one candle at this interval —
+    used by `--symbol all` to discover the full symbol universe without
+    importing historical-data/'s symbols.py (this script is deliberately
+    standalone; see the module docstring). Alphabetical, so runs are
+    reproducible."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select distinct symbol
+            from ohlc_candles
+            where exchange = %s and interval_minutes = %s
+            order by symbol asc
+            """,
+            ("kraken", interval_minutes),
+        )
+        return [r[0] for r in cur.fetchall()]
 
 
 def features_at(
@@ -294,9 +334,82 @@ def persistence_accuracy(closes: list[float], warmup: int, split_index: int) -> 
     return correct / total if total else 0.0
 
 
+def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: argparse.Namespace):
+    """Loads and builds one symbol's (X, y) dataset plus everything needed
+    to time-split it and score a persistence baseline against it. Returns
+    None (after printing a warning) rather than raising if this symbol
+    doesn't have enough history yet — that lets pooling skip a thin symbol
+    instead of aborting the whole run over one gap."""
+    closes, midpoints, highs, lows = load_ohlc(conn, symbol, interval_minutes)
+
+    warmup = max(
+        window_args.sma_window,
+        window_args.ema_window,
+        window_args.rsi_window + 1,
+        window_args.vol_window + 1,
+        window_args.bar_momentum_window,
+        window_args.bollinger_window,
+        window_args.ao_slow_window,
+        window_args.macd_slow_window + window_args.macd_signal_window,
+        window_args.cci_window,
+        window_args.williams_r_window,
+    )
+    min_required = warmup + 10  # a little slack beyond bare warmup so there's an actual dataset, not one row
+    if len(closes) < min_required:
+        print(
+            f"warning: skipping {symbol} — only {len(closes)} candles at interval={interval_minutes}min, "
+            f"need at least {min_required} (warmup={warmup}, driven by whichever window is largest — "
+            "ao_slow_window, macd_slow_window+macd_signal_window, etc. — + a handful of rows to train/test on).",
+            file=sys.stderr,
+        )
+        return None
+
+    X, y = build_dataset(
+        closes,
+        midpoints,
+        highs,
+        lows,
+        window_args.sma_window,
+        window_args.ema_window,
+        window_args.rsi_window,
+        window_args.vol_window,
+        window_args.bar_momentum_window,
+        window_args.bollinger_window,
+        window_args.bollinger_num_std,
+        window_args.ao_fast_window,
+        window_args.ao_slow_window,
+        window_args.macd_fast_window,
+        window_args.macd_slow_window,
+        window_args.macd_signal_window,
+        window_args.cci_window,
+        window_args.williams_r_window,
+    )
+    return {"symbol": symbol, "closes": closes, "warmup": warmup, "X": X, "y": y}
+
+
+def resolve_symbols(conn, symbol_arg: str, interval_minutes: int) -> list[str]:
+    """`--symbol` accepts a single symbol (e.g. "BTC-USD"), a
+    comma-separated list ("BTC-USD,ETH-USD"), or the literal "all" — every
+    symbol that has at least one candle at this interval, discovered via
+    list_available_symbols() rather than importing historical-data/'s
+    symbols.py (this script stays standalone; see module docstring)."""
+    if symbol_arg.strip().lower() == "all":
+        symbols = list_available_symbols(conn, interval_minutes)
+        if not symbols:
+            print(f"error: no symbols have candles at interval={interval_minutes}min.", file=sys.stderr)
+            sys.exit(1)
+        return symbols
+    return [s.strip() for s in symbol_arg.split(",") if s.strip()]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--symbol", required=True, help="Normalized symbol (e.g. BTC-USD).")
+    parser.add_argument(
+        "--symbol",
+        required=True,
+        help='Normalized symbol (e.g. BTC-USD), a comma-separated list to pool ("BTC-USD,ETH-USD"), '
+        'or "all" to pool every symbol with data at --interval.',
+    )
     parser.add_argument("--interval", type=int, default=60, help="Candle resolution in minutes (default 60, matching strategy_config.example.toml's bar_interval_minutes).")
     parser.add_argument("--sma-window", type=int, default=20)
     parser.add_argument("--ema-window", type=int, default=12)
@@ -312,9 +425,9 @@ def main() -> None:
     parser.add_argument("--macd-signal-window", type=int, default=9)
     parser.add_argument("--cci-window", type=int, default=20)
     parser.add_argument("--williams-r-window", type=int, default=14)
-    parser.add_argument("--test-fraction", type=float, default=0.2, help="Fraction of the (time-ordered) data held out for testing.")
+    parser.add_argument("--test-fraction", type=float, default=0.2, help="Fraction of each symbol's (time-ordered) data held out for testing.")
     parser.add_argument("--kind", choices=["logistic", "gboost"], default="logistic")
-    parser.add_argument("--model-out", default=None, help="Defaults to models/<symbol>_<kind>.joblib")
+    parser.add_argument("--model-out", default=None, help="Defaults to models/<symbol>_<kind>.joblib, or models/pooled_<kind>.joblib when pooling more than one symbol.")
     args = parser.parse_args()
 
     try:
@@ -325,54 +438,48 @@ def main() -> None:
 
     conn = connect()
     try:
-        closes, midpoints, highs, lows = load_ohlc(conn, args.symbol, args.interval)
+        symbols = resolve_symbols(conn, args.symbol, args.interval)
+        datasets = [d for d in (load_symbol_dataset(conn, s, args.interval, args) for s in symbols) if d is not None]
     finally:
         conn.close()
 
-    warmup = max(
-        args.sma_window,
-        args.ema_window,
-        args.rsi_window + 1,
-        args.vol_window + 1,
-        args.bar_momentum_window,
-        args.bollinger_window,
-        args.ao_slow_window,
-        args.macd_slow_window + args.macd_signal_window,
-        args.cci_window,
-        args.williams_r_window,
-    )
-    min_required = warmup + 10  # a little slack beyond bare warmup so there's an actual dataset, not one row
-    if len(closes) < min_required:
-        print(
-            f"error: only {len(closes)} candles available for {args.symbol} at interval={args.interval}min, "
-            f"need at least {min_required} (warmup={warmup}, driven by whichever window is largest — "
-            "ao_slow_window, macd_slow_window+macd_signal_window, etc. — + a handful of rows to train/test on). "
-            "Run historical-data/backfill_ohlc.py or import_csv.py for more history first.",
-            file=sys.stderr,
-        )
+    if not datasets:
+        print("error: no symbol had enough history to build a dataset.", file=sys.stderr)
         sys.exit(1)
 
-    X, y = build_dataset(
-        closes,
-        midpoints,
-        highs,
-        lows,
-        args.sma_window,
-        args.ema_window,
-        args.rsi_window,
-        args.vol_window,
-        args.bar_momentum_window,
-        args.bollinger_window,
-        args.bollinger_num_std,
-        args.ao_fast_window,
-        args.ao_slow_window,
-        args.macd_fast_window,
-        args.macd_slow_window,
-        args.macd_signal_window,
-        args.cci_window,
-        args.williams_r_window,
-    )
-    X_train, y_train, X_test, y_test = time_ordered_split(X, y, args.test_fraction)
+    pooling = len(datasets) > 1
+
+    # Time-order split each symbol *individually* first (so a later bar
+    # from one symbol never trains on an earlier held-out bar from that
+    # same symbol, and one symbol's split boundary never leaks into
+    # another's), then concatenate every symbol's train rows together and
+    # every symbol's test rows together into one pooled dataset.
+    X_train: list[list[float]] = []
+    y_train: list[int] = []
+    X_test: list[list[float]] = []
+    y_test: list[int] = []
+    persistence_correct = 0
+    persistence_total = 0
+    for d in datasets:
+        sym_X_train, sym_y_train, sym_X_test, sym_y_test = time_ordered_split(d["X"], d["y"], args.test_fraction)
+        X_train.extend(sym_X_train)
+        y_train.extend(sym_y_train)
+        X_test.extend(sym_X_test)
+        y_test.extend(sym_y_test)
+
+        split_index = len(sym_X_train)
+        closes = d["closes"]
+        warmup = d["warmup"]
+        for i in range(warmup - 1 + split_index, len(closes) - 1):
+            if i == 0:
+                continue
+            predicted_up = closes[i] > closes[i - 1]
+            actual_up = closes[i + 1] > closes[i]
+            persistence_correct += int(predicted_up == actual_up)
+            persistence_total += 1
+
+        print(f"[{d['symbol']}] {len(d['closes'])} candles, "
+              f"{len(sym_X_train)} train / {len(sym_X_test)} test rows", file=sys.stderr)
 
     if len(set(y_train)) < 2:
         print("error: training labels are all one class — can't train a classifier on this window.", file=sys.stderr)
@@ -390,16 +497,20 @@ def main() -> None:
     model.fit(X_train, y_train)
     model_accuracy = model.score(X_test, y_test)
     baseline_accuracy = majority_class_accuracy(y_train, y_test)
+    persistence_baseline = persistence_correct / persistence_total if persistence_total else 0.0
 
-    split_index = len(X_train)
-    persistence_baseline = persistence_accuracy(closes, warmup, split_index)
-
-    model_out = args.model_out or f"models/{args.symbol.lower().replace('-', '_')}_{args.kind}.joblib"
+    if args.model_out:
+        model_out = args.model_out
+    elif pooling:
+        model_out = f"models/pooled_{args.kind}.joblib"
+    else:
+        model_out = f"models/{datasets[0]['symbol'].lower().replace('-', '_')}_{args.kind}.joblib"
     Path(model_out).parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, model_out)
 
-    print(f"[{args.symbol}] interval={args.interval}min, {len(closes)} candles, "
-          f"{len(X_train)} train / {len(X_test)} test rows (time-ordered split)", file=sys.stderr)
+    label = f"pooled across {len(datasets)} symbols" if pooling else datasets[0]["symbol"]
+    print(f"[{label}] interval={args.interval}min, "
+          f"{len(X_train)} train / {len(X_test)} test rows total (time-ordered split)", file=sys.stderr)
     print(f"  model accuracy:              {model_accuracy:.3f}", file=sys.stderr)
     print(f"  majority-class baseline:     {baseline_accuracy:.3f}", file=sys.stderr)
     print(f"  persistence baseline:        {persistence_baseline:.3f}", file=sys.stderr)
