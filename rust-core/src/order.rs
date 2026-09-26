@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use tokio_stream::Stream;
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
 use crate::config::Config;
@@ -12,6 +15,16 @@ use crate::proto::pb::{
     StreamOrderUpdatesRequest,
 };
 use crate::risk::{RiskEngine, RiskVerdict};
+
+/// client_order_id -> strategy_id, so a later fill/status event arriving
+/// on the private execution feed (which carries no strategy_id of its
+/// own — see trading.proto's OrderUpdate) can still be routed to the
+/// right `StreamOrderUpdates` subscriber. Entries are added when an order
+/// is actually sent to Kraken (never for a dry-run validate=true call,
+/// which can never produce a real execution report) and are NOT evicted
+/// on a non-terminal status — a known, minor, unbounded-growth
+/// simplification, acceptable for now because entries are just strings.
+pub type StrategyRegistry = Arc<Mutex<HashMap<String, String>>>;
 
 /// Receives order requests from Python and runs them through the risk
 /// engine, then — if the order is Approved — forwards it to the
@@ -26,6 +39,8 @@ pub struct OrderServiceImpl {
     risk: Arc<RiskEngine>,
     config: Arc<Config>,
     execution_clients: Arc<HashMap<String, KrakenRestClient>>,
+    order_updates: broadcast::Sender<OrderUpdate>,
+    strategy_registry: StrategyRegistry,
 }
 
 impl OrderServiceImpl {
@@ -33,11 +48,15 @@ impl OrderServiceImpl {
         risk: Arc<RiskEngine>,
         config: Arc<Config>,
         execution_clients: Arc<HashMap<String, KrakenRestClient>>,
+        order_updates: broadcast::Sender<OrderUpdate>,
+        strategy_registry: StrategyRegistry,
     ) -> Self {
         Self {
             risk,
             config,
             execution_clients,
+            order_updates,
+            strategy_registry,
         }
     }
 
@@ -119,6 +138,15 @@ impl OrderServiceImpl {
             dry_run = self.config.execution.dry_run,
             "sending order to Kraken"
         );
+
+        // Only a REAL submission can ever produce a real execution report
+        // on the private feed — a validate=true dry-run never reaches
+        // Kraken's matching engine, so registering it would just be a
+        // permanent, pointless entry.
+        if !self.config.execution.dry_run {
+            let mut registry = self.strategy_registry.lock().unwrap();
+            registry.insert(order.client_order_id.clone(), order.strategy_id.clone());
+        }
 
         let outcome = client
             .add_order(&add_order)
@@ -215,7 +243,33 @@ impl OrderService for OrderServiceImpl {
         let strategy_id = request.into_inner().strategy_id;
         tracing::info!(%strategy_id, "order update subscription received");
 
-        let stream = tokio_stream::empty();
+        let rx = self.order_updates.subscribe();
+        let registry = self.strategy_registry.clone();
+        let stream = BroadcastStream::new(rx).filter_map(move |item| match item {
+            Ok(update) => {
+                if strategy_id.is_empty() {
+                    return Some(Ok(update));
+                }
+                let matches = registry
+                    .lock()
+                    .unwrap()
+                    .get(&update.client_order_id)
+                    .map(|owner| owner == &strategy_id)
+                    .unwrap_or(false);
+                matches.then_some(Ok(update))
+            }
+            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                // A slow subscriber missed some updates. Position state
+                // built from this stream can drift when this happens —
+                // unlike market data, a missed fill isn't self-correcting
+                // on the next message. Logged loudly for that reason; a
+                // reconciliation pass against Kraken's own order/position
+                // state would be the real fix, and doesn't exist yet.
+                tracing::error!(skipped, "order-update subscriber lagged — position tracking may now be stale");
+                None
+            }
+        });
+
         Ok(Response::new(Box::pin(stream)))
     }
 }

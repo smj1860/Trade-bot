@@ -131,6 +131,23 @@ pub enum KrakenRestError {
 }
 
 const ADD_ORDER_PATH: &str = "/0/private/AddOrder";
+const GET_WEBSOCKETS_TOKEN_PATH: &str = "/0/private/GetWebSocketsToken";
+
+/// A token for Kraken's private (authenticated) WebSocket v2 feed —
+/// separate entirely from the public market-data feed in kraken.rs, which
+/// needs no authentication. Used by kraken_private_ws.rs to subscribe to
+/// the `executions` channel (real order fills/status changes).
+#[derive(Debug, Deserialize)]
+pub struct WebSocketsToken {
+    pub token: String,
+    /// Seconds until the token expires if never used. Per Kraken's docs,
+    /// a token already in use on an open, maintained connection does not
+    /// expire — this project fetches a fresh token on every (re)connect
+    /// rather than trying to track or reuse expiry, which is simpler and
+    /// avoids ever presenting a stale token.
+    #[serde(default)]
+    pub expires: u64,
+}
 
 impl KrakenRestClient {
     pub fn new(rest_url: impl Into<String>, credentials: KrakenCredentials) -> Self {
@@ -142,10 +159,7 @@ impl KrakenRestClient {
     }
 
     pub async fn add_order(&self, req: &AddOrderRequest) -> Result<AddOrderOutcome, KrakenRestError> {
-        let nonce = nonce_millis()?;
-
         let mut form: Vec<(&str, String)> = vec![
-            ("nonce", nonce.clone()),
             ("ordertype", req.order_type.to_string()),
             ("type", req.side.as_kraken_str().to_string()),
             ("volume", req.volume.clone()),
@@ -159,13 +173,52 @@ impl KrakenRestClient {
             form.push(("validate", "true".to_string()));
         }
 
-        let body = serde_urlencoded::to_string(&form)
+        let text = self.signed_post(ADD_ORDER_PATH, form).await?;
+        let parsed: KrakenResponse<AddOrderResult> = serde_json::from_str(&text)
+            .map_err(|e| KrakenRestError::Parse(format!("{e} — raw body: {text}")))?;
+
+        if !parsed.error.is_empty() {
+            return Ok(AddOrderOutcome::KrakenRejected { messages: parsed.error });
+        }
+
+        let exchange_order_id = parsed.result.and_then(|r| r.txid.into_iter().next());
+        Ok(AddOrderOutcome::Accepted { exchange_order_id })
+    }
+
+    /// Fetches a fresh token for the private WebSocket feed. This uses the
+    /// same classic private-REST signing scheme as `add_order` — this
+    /// project has NOT independently confirmed that against a real,
+    /// funded account any more than `add_order`'s signing has been (see
+    /// this module's top-level docs); it's implemented consistently with
+    /// Kraken's documented behavior for the private REST API as a whole,
+    /// not verified byte-for-byte against this specific endpoint.
+    pub async fn get_websockets_token(&self) -> Result<WebSocketsToken, KrakenRestError> {
+        let text = self.signed_post(GET_WEBSOCKETS_TOKEN_PATH, vec![]).await?;
+        let parsed: KrakenResponse<WebSocketsToken> = serde_json::from_str(&text)
+            .map_err(|e| KrakenRestError::Parse(format!("{e} — raw body: {text}")))?;
+
+        if !parsed.error.is_empty() {
+            return Err(KrakenRestError::Parse(format!("Kraken rejected GetWebSocketsToken: {:?}", parsed.error)));
+        }
+        parsed
+            .result
+            .ok_or_else(|| KrakenRestError::Parse("GetWebSocketsToken response had no error but also no result".to_string()))
+    }
+
+    /// Shared signed-POST plumbing: builds the nonce, form-encodes
+    /// `params` (with nonce prepended), signs, sends, and returns the raw
+    /// response body for the caller to parse into its own result type.
+    async fn signed_post(&self, path: &str, mut params: Vec<(&str, String)>) -> Result<String, KrakenRestError> {
+        let nonce = nonce_millis()?;
+        params.insert(0, ("nonce", nonce.clone()));
+
+        let body = serde_urlencoded::to_string(&params)
             .map_err(|e| KrakenRestError::Parse(format!("failed to encode form body: {e}")))?;
 
-        let signature = sign(&self.credentials.api_secret, ADD_ORDER_PATH, &nonce, &body)
+        let signature = sign(&self.credentials.api_secret, path, &nonce, &body)
             .map_err(|e| KrakenRestError::Parse(format!("failed to compute request signature: {e}")))?;
 
-        let url = format!("{}{}", self.rest_url, ADD_ORDER_PATH);
+        let url = format!("{}{}", self.rest_url, path);
         let response = self
             .http
             .post(&url)
@@ -176,16 +229,7 @@ impl KrakenRestClient {
             .send()
             .await?;
 
-        let text = response.text().await?;
-        let parsed: KrakenResponse<AddOrderResult> = serde_json::from_str(&text)
-            .map_err(|e| KrakenRestError::Parse(format!("{e} — raw body: {text}")))?;
-
-        if !parsed.error.is_empty() {
-            return Ok(AddOrderOutcome::KrakenRejected { messages: parsed.error });
-        }
-
-        let exchange_order_id = parsed.result.and_then(|r| r.txid.into_iter().next());
-        Ok(AddOrderOutcome::Accepted { exchange_order_id })
+        Ok(response.text().await?)
     }
 }
 

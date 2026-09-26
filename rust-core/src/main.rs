@@ -1,5 +1,6 @@
 mod config;
 mod kraken;
+mod kraken_private_ws;
 mod kraken_rest;
 mod market_data;
 mod order;
@@ -8,7 +9,7 @@ mod proto;
 mod risk;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
 use tonic::transport::Server;
@@ -107,6 +108,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // Real fills/status changes come from Kraken's private (authenticated)
+    // WebSocket feed — entirely separate from the public market-data feed
+    // above. One task per exchange that actually has an execution client
+    // configured (no credentials -> no client -> nothing to authenticate
+    // as, so no point starting this). All updates funnel onto one
+    // broadcast channel that OrderServiceImpl.StreamOrderUpdates fans out
+    // from, filtered per-subscriber by strategy_id via `strategy_registry`
+    // (populated in order.rs when an order is actually sent to Kraken).
+    let (order_updates_tx, _rx) = broadcast::channel(4096);
+    let strategy_registry: order::StrategyRegistry = Arc::new(Mutex::new(HashMap::new()));
+    for exchange in &config.exchanges {
+        let Some(client) = execution_clients.get(&exchange.name) else {
+            continue;
+        };
+        let symbols = config.symbols_for_exchange(&exchange.name);
+        let client = client.clone();
+        let order_updates_tx = order_updates_tx.clone();
+        tokio::spawn(kraken_private_ws::run(symbols, client, order_updates_tx));
+    }
+
     let execution_clients = Arc::new(execution_clients);
 
     let addr = "0.0.0.0:50051".parse()?;
@@ -118,6 +139,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             risk_engine,
             config,
             execution_clients,
+            order_updates_tx,
+            strategy_registry,
         )))
         .serve(addr)
         .await?;

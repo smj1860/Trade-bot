@@ -48,7 +48,9 @@ python-strategy/           Process B: strategy, ML, portfolio management
 5. Kraken REST order execution client — wires an Approved order to
    Kraken's real `/0/private/AddOrder` endpoint. ✅ done — see below.
 6. Strategy/model layer, client-side portfolio tracking, structured
-   logging + log visualization. ✅ done — see below. Persistence (a real
+   logging + log visualization. ✅ done — see below.
+7. Real fill/status tracking from Kraken's private WebSocket feed, wired
+   into `StreamOrderUpdates`. ✅ done — see below. Persistence (a real
    database instead of in-memory state) still not started.
 
 ## Notes from building this
@@ -253,3 +255,60 @@ cooldown/order-history state live in memory and reset on restart. No
 backtesting harness. No real ML model. Order-book imbalance uses
 top-of-book only, not full depth. All reasonable next steps, none of
 them done here.
+
+## Real fill tracking (rust-core/src/kraken_private_ws.rs)
+
+Closes the gap flagged in every earlier section of this README:
+`StreamOrderUpdates` is no longer an empty stub. Order fills and status
+changes now come from Kraken's **private** (authenticated) WebSocket v2
+feed — a separate connection entirely from the public market-data feed in
+`kraken.rs`, requiring a short-lived token fetched via a new
+`KrakenRestClient::get_websockets_token` (same HMAC-SHA512 signing scheme
+as `AddOrder`, refactored into a shared `signed_post` helper now used by
+both).
+
+**How it's wired**: `main.rs` starts one `kraken_private_ws::run` task per
+exchange that has an execution client configured (no credentials -> no
+client -> nothing to authenticate as -> task doesn't start). It fetches a
+fresh token on every (re)connect, subscribes to the `executions` channel,
+and publishes every fill/status event onto a broadcast channel.
+`OrderServiceImpl::stream_order_updates` fans that out to gRPC
+subscribers, filtered by `strategy_id` via a new shared registry
+(`client_order_id -> strategy_id`, populated in `order.rs` at the moment
+an order is actually sent to Kraken — never for a `dry_run` validate-only
+call, which can never produce a real execution report).
+
+**Verified live**, with deliberately fake API credentials: the signed
+request to `/0/private/GetWebSocketsToken` reaches Kraken's real server
+and gets back a genuine, correctly-parsed `EAPI:Invalid key` rejection —
+the same category of evidence as the `AddOrder` signing test. The
+reconnect loop was also confirmed live, backing off 3 seconds and
+retrying indefinitely without crashing when the token fetch fails. 6 new
+unit tests (`cargo test`, 22/22 passing project-wide) cover parsing a
+synthetic Kraken-shaped execution report into an `OrderUpdate` — partial
+fill, full fill, missing/unattributable fields, and every `order_status`
+mapping.
+
+**What's NOT verified, because it requires a real, funded Kraken
+account**: the private WebSocket connection itself was never reached (the
+fake-credential token fetch fails before that point), so neither the
+connection URL (`wss://ws-auth.kraken.com/v2`, inferred from Kraken's
+confirmed v1 private-feed host plus the `/v2` suffix the public feed
+uses) nor the `executions` channel's exact message schema has been
+confirmed against a real execution report — both come from Kraken's
+public documentation. Before relying on this for real position tracking,
+get a real token from a real account and confirm both against an actual
+fill.
+
+**What's stubbed, on purpose**: the `strategy_id` registry never evicts
+entries (unbounded growth over a long-running process — low-severity
+since entries are just short strings, but a real fix would need a TTL or
+eviction-on-terminal-status). A lagged broadcast subscriber logs loudly
+(`tracing::error!`, not `warn!`, unlike the equivalent market-data case)
+but still has no reconciliation path against Kraken's own order state to
+recover from a missed fill — that gap is now explicit rather than hidden
+behind an empty stream. `PortfolioManager` on the Python side (see the
+Strategy layer section above) can now, in principle, receive real
+updates through this path — that hasn't been exercised together with a
+funded account either, for the same reason nothing else funded-account-only
+has been in this project.
