@@ -1,0 +1,94 @@
+name: Train / validate model
+
+# Runs python-strategy/scripts/train_model.py on GitHub's own servers, on
+# demand, so the SUPABASE_DB_URL credential never has to leave the repo's
+# secrets (see that script's module docstring for what it does and why).
+#
+# --folds > 1 is validation-only (walk-forward, no model saved) — use that
+# for sweeping --horizon/--label-scheme/etc. and judging accuracy + net
+# P&L against both baselines before ever training a model meant to be
+# used. --folds 1 (the default) trains and uploads the resulting
+# .joblib as a workflow artifact instead, for the one config that's
+# actually earned it.
+#
+# Requires the same SUPABASE_DB_URL repository secret as
+# historical-backfill.yml / historical-backfill-trades.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'Normalized symbol, comma-separated list, or "all"'
+        required: false
+        default: "all"
+      interval:
+        description: "Candle resolution in minutes"
+        required: false
+        default: "60"
+      horizon:
+        description: "Bars ahead the label looks (fixed-horizon) or max hold (triple-barrier)"
+        required: false
+        default: "12"
+      label_scheme:
+        description: "fixed-horizon or triple-barrier"
+        required: false
+        default: "triple-barrier"
+      folds:
+        description: "1 = single split, train + save. >1 = walk-forward validation only, no save."
+        required: false
+        default: "5"
+      kind:
+        description: "logistic or gboost"
+        required: false
+        default: "gboost"
+      extra_args:
+        description: "Any additional train_model.py flags, space-separated (e.g. --min-move 0.02)"
+        required: false
+        default: ""
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: python-strategy
+        run: |
+          pip install -r requirements-training.txt
+          pip install -r requirements-ml.txt
+
+      - name: Run train_model.py
+        working-directory: python-strategy
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          python scripts/train_model.py \
+            --symbol "${{ github.event.inputs.symbol }}" \
+            --interval "${{ github.event.inputs.interval }}" \
+            --horizon "${{ github.event.inputs.horizon }}" \
+            --label-scheme "${{ github.event.inputs.label_scheme }}" \
+            --folds "${{ github.event.inputs.folds }}" \
+            --kind "${{ github.event.inputs.kind }}" \
+            ${{ github.event.inputs.extra_args }} \
+            | tee train_output.log
+
+      - name: Upload console output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: train-output-${{ github.run_id }}
+          path: python-strategy/train_output.log
+
+      - name: Upload trained model (folds=1 only)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-${{ github.run_id }}
+          path: python-strategy/models/*.joblib
+          if-no-files-found: ignore
