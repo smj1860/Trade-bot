@@ -30,6 +30,7 @@ from scripts.train_model import (
     simulate_net_pnl,
     split_point,
     time_ordered_split,
+    walk_forward_splits,
 )
 
 
@@ -344,3 +345,66 @@ def test_load_symbol_dataset_explicit_min_move_overrides_fee_derivation(monkeypa
     result = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=_make_window_args(min_move=0.0, taker_fee=0.008))
     assert result is not None
     assert result["min_move_threshold"] == pytest.approx(0.0)
+
+
+def test_walk_forward_splits_expanding_window_train_grows_each_fold():
+    # 10 rows, 4 folds -> 5 blocks of 2 rows each: block 1 is the initial
+    # train, blocks 2-5 are each fold's test block in turn.
+    X = [[float(i)] for i in range(10)]
+    y = [i % 2 for i in range(10)]
+    indices = list(range(10))
+
+    folds = list(walk_forward_splits(X, y, indices, n_folds=4))
+    assert len(folds) == 4
+
+    train_sizes = [len(f[0]) for f in folds]
+    test_sizes = [len(f[3]) for f in folds]
+    assert train_sizes == [2, 4, 6, 8]  # strictly expanding
+    assert test_sizes == [2, 2, 2, 2]
+
+
+def test_walk_forward_splits_train_never_overlaps_test_chronologically():
+    X = [[float(i)] for i in range(12)]
+    y = [i % 2 for i in range(12)]
+    indices = list(range(12))
+
+    for X_train, y_train, idx_train, X_test, y_test, idx_test in walk_forward_splits(X, y, indices, n_folds=3):
+        assert max(idx_train) < min(idx_test)  # no lookahead leakage
+        assert len(X_train) == len(y_train) == len(idx_train)
+        assert len(X_test) == len(y_test) == len(idx_test)
+
+
+def test_walk_forward_splits_successive_folds_test_different_periods():
+    X = [[float(i)] for i in range(10)]
+    y = [i % 2 for i in range(10)]
+    indices = list(range(10))
+
+    folds = list(walk_forward_splits(X, y, indices, n_folds=4))
+    test_index_sets = [set(f[5]) for f in folds]
+    # Every fold's test block is disjoint from every other fold's.
+    for a in range(len(test_index_sets)):
+        for b in range(a + 1, len(test_index_sets)):
+            assert test_index_sets[a].isdisjoint(test_index_sets[b])
+
+
+def test_walk_forward_splits_too_little_data_yields_nothing():
+    X = [[1.0], [2.0], [3.0]]
+    y = [0, 1, 0]
+    indices = [0, 1, 2]
+    # 3 rows, 5 folds -> block_size = 3 // 6 = 0 -> no usable folds.
+    assert list(walk_forward_splits(X, y, indices, n_folds=5)) == []
+
+
+def test_walk_forward_splits_remainder_absorbed_into_final_test_block():
+    # 11 rows, 2 folds -> 3 blocks of floor(11/3)=3 rows, with the leftover
+    # 2 rows absorbed into the final (last fold's test) block rather than
+    # dropped.
+    X = [[float(i)] for i in range(11)]
+    y = [i % 2 for i in range(11)]
+    indices = list(range(11))
+
+    folds = list(walk_forward_splits(X, y, indices, n_folds=2))
+    assert len(folds) == 2
+    assert len(folds[0][3]) == 3          # first fold's test block: exactly one block
+    assert len(folds[1][3]) == 11 - 3 - 3  # second (last) fold's test block absorbs the remainder
+    assert sum(len(f[3]) for f in folds) + len(folds[0][0]) == 11  # every row accounted for

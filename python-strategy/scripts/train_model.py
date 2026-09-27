@@ -115,6 +115,13 @@ Usage:
     # the top/bottom 30% of that symbol's 12h moves, whichever is bigger):
     python3 scripts/train_model.py --symbol all --horizon 12 --min-move 0.045 --top-fraction 0.3
 
+    # Walk-forward validation instead of one static 80/20 split: 5 folds,
+    # each training on everything before it and testing on a later,
+    # different block. No model is saved in this mode — it's a check on
+    # whether a configuration holds up across multiple time periods before
+    # committing to it with a normal (--folds 1, the default) run.
+    python3 scripts/train_model.py --symbol all --horizon 12 --folds 5
+
 Pooling ("--symbol" given a comma-separated list, or the literal "all")
 computes each symbol's features independently over its own close/high/low
 history — every bar-derived feature here is already a ratio/normalized
@@ -476,6 +483,38 @@ def time_ordered_split(X: list, y: list, test_fraction: float):
     return X[:split], y[:split], X[split:], y[split:]
 
 
+def walk_forward_splits(X: list, y: list, indices: list, n_folds: int):
+    """Yields n_folds (X_train, y_train, idx_train, X_test, y_test, idx_test)
+    tuples using an expanding-window time series split: the data is cut
+    into n_folds+1 contiguous, chronologically-ordered blocks; fold k's
+    (1-indexed) test set is block k+1, and its train set is every block
+    before it concatenated together. So each fold's model never trains on
+    data chronologically after what it's tested on (no lookahead leakage,
+    same discipline as time_ordered_split), and each successive fold
+    evaluates on a *different* period rather than always the same tail-end
+    slice a single static split would use — the gap this closes is: even
+    with more regime-diverse training data, a single 80/20 split's test set
+    is always whatever the most recent ~20% happens to be (right now, one
+    all-up month), so the evaluation itself is still one-directional.
+
+    Yields nothing if there isn't enough data for at least one non-empty
+    train and test block (n_folds+1 blocks of at least 1 row each)."""
+    n = len(X)
+    block_size = n // (n_folds + 1)
+    if block_size < 1:
+        return
+    boundaries = [i * block_size for i in range(n_folds + 2)]
+    boundaries[-1] = n  # last boundary absorbs any remainder from integer division
+    for k in range(1, n_folds + 1):
+        train_end = boundaries[k]
+        test_end = boundaries[k + 1]
+        X_train, y_train, idx_train = X[:train_end], y[:train_end], indices[:train_end]
+        X_test, y_test, idx_test = X[train_end:test_end], y[train_end:test_end], indices[train_end:test_end]
+        if not X_train or not X_test:
+            continue
+        yield X_train, y_train, idx_train, X_test, y_test, idx_test
+
+
 def majority_class_accuracy(y_train: list[int], y_test: list[int]) -> float:
     majority = 1 if sum(y_train) >= len(y_train) / 2 else 0
     correct = sum(1 for actual in y_test if actual == majority)
@@ -606,6 +645,209 @@ def resolve_symbols(conn, symbol_arg: str, interval_minutes: int) -> list[str]:
     return [s.strip() for s in symbol_arg.split(",") if s.strip()]
 
 
+def _train_and_evaluate(
+    X_train: list,
+    y_train: list,
+    X_test: list,
+    y_test: list,
+    per_symbol_test: list[dict],
+    persistence_correct: int,
+    persistence_total: int,
+    kind: str,
+) -> dict:
+    """Trains one model of the given `kind` on (X_train, y_train) and scores
+    it — on both classification accuracy and simulated net P&L — against
+    the held-out (X_test, y_test) plus the majority-class and persistence
+    baselines. `per_symbol_test` carries, per pooled symbol, the (closes,
+    horizon, round_trip_cost, idx_test, start, end) needed to slice pooled
+    predictions back out per symbol for net-P&L simulation (see
+    simulate_net_pnl). This is the one evaluation implementation shared by
+    the single-split path and every walk-forward fold, so both call one
+    tested codepath rather than risk two copies quietly drifting apart.
+    Returns a metrics dict; does not save the model — the caller decides
+    whether and where to persist it."""
+    if kind == "logistic":
+        from sklearn.linear_model import LogisticRegression
+
+        model = LogisticRegression()
+    else:
+        from sklearn.ensemble import GradientBoostingClassifier
+
+        model = GradientBoostingClassifier()
+
+    model.fit(X_train, y_train)
+    model_accuracy = model.score(X_test, y_test)
+    baseline_accuracy = majority_class_accuracy(y_train, y_test)
+    persistence_baseline = persistence_correct / persistence_total if persistence_total else 0.0
+
+    model_predictions = list(model.predict(X_test))
+    majority_class = 1 if sum(y_train) >= len(y_train) / 2 else 0
+
+    model_pnl_total = majority_pnl_total = persistence_pnl_total = 0.0
+    model_pnl_count = majority_pnl_count = persistence_pnl_count = 0
+    for entry in per_symbol_test:
+        sym_predictions = model_predictions[entry["start"] : entry["end"]]
+        total, count = simulate_net_pnl(
+            entry["closes"], entry["idx_test"], entry["horizon"], sym_predictions, entry["round_trip_cost"]
+        )
+        model_pnl_total += total
+        model_pnl_count += count
+
+        majority_predictions = [majority_class] * len(entry["idx_test"])
+        total, count = simulate_net_pnl(
+            entry["closes"], entry["idx_test"], entry["horizon"], majority_predictions, entry["round_trip_cost"]
+        )
+        majority_pnl_total += total
+        majority_pnl_count += count
+
+        persistence_predictions = [
+            1 if entry["closes"][i] > entry["closes"][i - entry["horizon"]] else 0
+            for i in entry["idx_test"]
+            if i - entry["horizon"] >= 0
+        ]
+        persistence_indices = [i for i in entry["idx_test"] if i - entry["horizon"] >= 0]
+        total, count = simulate_net_pnl(
+            entry["closes"], persistence_indices, entry["horizon"], persistence_predictions, entry["round_trip_cost"]
+        )
+        persistence_pnl_total += total
+        persistence_pnl_count += count
+
+    return {
+        "model": model,
+        "n_train": len(X_train),
+        "n_test": len(X_test),
+        "model_accuracy": model_accuracy,
+        "baseline_accuracy": baseline_accuracy,
+        "persistence_baseline": persistence_baseline,
+        "model_mean_pnl": model_pnl_total / model_pnl_count if model_pnl_count else 0.0,
+        "majority_mean_pnl": majority_pnl_total / majority_pnl_count if majority_pnl_count else 0.0,
+        "persistence_mean_pnl": persistence_pnl_total / persistence_pnl_count if persistence_pnl_count else 0.0,
+        "model_pnl_count": model_pnl_count,
+        "model_pnl_total": model_pnl_total,
+        "majority_pnl_count": majority_pnl_count,
+        "majority_pnl_total": majority_pnl_total,
+        "persistence_pnl_count": persistence_pnl_count,
+        "persistence_pnl_total": persistence_pnl_total,
+    }
+
+
+def _print_fold_report(fold_idx: int, n_folds: int, metrics: dict) -> None:
+    label = f"fold {fold_idx + 1}/{n_folds}"
+    print(f"[{label}] {metrics['n_train']} train / {metrics['n_test']} test rows", file=sys.stderr)
+    print(f"  model accuracy:              {metrics['model_accuracy']:.3f}", file=sys.stderr)
+    print(f"  majority-class baseline:     {metrics['baseline_accuracy']:.3f}", file=sys.stderr)
+    print(f"  persistence baseline:        {metrics['persistence_baseline']:.3f}", file=sys.stderr)
+    print(f"  model net P&L:               {metrics['model_mean_pnl']:+.4f} ({metrics['model_pnl_count']} trades)", file=sys.stderr)
+    print(f"  majority-class net P&L:      {metrics['majority_mean_pnl']:+.4f} ({metrics['majority_pnl_count']} trades)", file=sys.stderr)
+    print(f"  persistence net P&L:         {metrics['persistence_mean_pnl']:+.4f} ({metrics['persistence_pnl_count']} trades)", file=sys.stderr)
+
+
+def _print_walk_forward_summary(fold_results: list[dict]) -> None:
+    n = len(fold_results)
+
+    def avg(key: str) -> float:
+        return sum(m[key] for m in fold_results) / n
+
+    beat_accuracy = sum(1 for m in fold_results if m["model_accuracy"] > max(m["baseline_accuracy"], m["persistence_baseline"]))
+    beat_pnl = sum(1 for m in fold_results if m["model_mean_pnl"] > max(m["majority_mean_pnl"], m["persistence_mean_pnl"]))
+    print(f"--- walk-forward summary across {n} fold(s) ---", file=sys.stderr)
+    print(f"  avg model accuracy:          {avg('model_accuracy'):.3f}  (beat both baselines in {beat_accuracy}/{n} folds)", file=sys.stderr)
+    print(f"  avg majority-class baseline: {avg('baseline_accuracy'):.3f}", file=sys.stderr)
+    print(f"  avg persistence baseline:    {avg('persistence_baseline'):.3f}", file=sys.stderr)
+    print(f"  avg model net P&L:           {avg('model_mean_pnl'):+.4f}  (beat both baselines' net P&L in {beat_pnl}/{n} folds)", file=sys.stderr)
+    print(f"  avg majority-class net P&L:  {avg('majority_mean_pnl'):+.4f}", file=sys.stderr)
+    print(f"  avg persistence net P&L:     {avg('persistence_mean_pnl'):+.4f}", file=sys.stderr)
+    if beat_accuracy < n or beat_pnl < n:
+        print(
+            "  WARNING: model did not beat both naive baselines (accuracy and/or net P&L) in every "
+            "fold — a result that only looks good on one time period isn't a validated trading model. "
+            "See docs/model-training.md.",
+            file=sys.stderr,
+        )
+    print(
+        "  note: walk-forward is a validation tool — no model file is saved here. "
+        "Once a configuration looks good across folds, run again with --folds 1 (the default) "
+        "to train and save the production model on the full time-ordered split.",
+        file=sys.stderr,
+    )
+
+
+def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
+    """Runs args.folds expanding-window folds (see walk_forward_splits) for
+    each dataset independently, then pools per fold index across symbols
+    exactly the way the single-split path pools across symbols for one
+    split — every fold is a full miniature run: a fresh model trained and
+    evaluated against both baselines, on both accuracy and net P&L, on a
+    different held-out period than every other fold. A symbol with too
+    little history for args.folds folds is skipped with a warning rather
+    than aborting the whole run; a symbol that runs out of usable folds
+    before others (rare, only with very uneven per-symbol history) simply
+    doesn't contribute to those later folds. Ends with a summary averaged
+    across whichever folds actually produced a usable split."""
+    per_symbol_folds = []
+    for d in datasets:
+        folds = list(walk_forward_splits(d["X"], d["y"], d["indices"], args.folds))
+        if not folds:
+            print(
+                f"warning: {d['symbol']} has too little data for {args.folds} walk-forward folds — "
+                "skipped from walk-forward evaluation.",
+                file=sys.stderr,
+            )
+            continue
+        per_symbol_folds.append((d, folds))
+
+    if not per_symbol_folds:
+        print(f"error: no symbol had enough history for even one walk-forward fold at --folds {args.folds}.", file=sys.stderr)
+        sys.exit(1)
+
+    fold_results = []
+    for fold_idx in range(args.folds):
+        X_train, y_train, X_test, y_test = [], [], [], []
+        persistence_correct = persistence_total = 0
+        per_symbol_test: list[dict] = []
+        for d, folds in per_symbol_folds:
+            if fold_idx >= len(folds):
+                continue  # this symbol ran out of usable folds before the others did
+            sym_X_train, sym_y_train, _sym_idx_train, sym_X_test, sym_y_test, sym_idx_test = folds[fold_idx]
+            X_train.extend(sym_X_train)
+            y_train.extend(sym_y_train)
+            test_start = len(X_test)
+            X_test.extend(sym_X_test)
+            y_test.extend(sym_y_test)
+            per_symbol_test.append({
+                "symbol": d["symbol"],
+                "closes": d["closes"],
+                "horizon": d["horizon"],
+                "round_trip_cost": d["round_trip_cost"],
+                "idx_test": sym_idx_test,
+                "start": test_start,
+                "end": len(X_test),
+            })
+            correct, total = persistence_correct_and_total(d["closes"], sym_idx_test, d["horizon"])
+            persistence_correct += correct
+            persistence_total += total
+
+        if len(set(y_train)) < 2 or not X_test:
+            print(
+                f"[fold {fold_idx + 1}/{args.folds}] skipped — training labels are all one class, "
+                "or no symbol had test rows in this fold.",
+                file=sys.stderr,
+            )
+            continue
+
+        metrics = _train_and_evaluate(
+            X_train, y_train, X_test, y_test, per_symbol_test, persistence_correct, persistence_total, args.kind
+        )
+        fold_results.append(metrics)
+        _print_fold_report(fold_idx, args.folds, metrics)
+
+    if not fold_results:
+        print("error: no fold produced a usable train/test split.", file=sys.stderr)
+        sys.exit(1)
+
+    _print_walk_forward_summary(fold_results)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -635,6 +877,16 @@ def main() -> None:
     parser.add_argument("--taker-fee", type=float, default=0.008, help="Kraken's spot taker fee as a fraction (default 0.008 = 0.80%%, the entry 30-day-volume tier). Doubled for a round trip, used to derive --min-move's default.")
     parser.add_argument("--profit-margin", type=float, default=0.0, help="Required edge above breakeven (a fraction, default 0.0), added to round-trip cost when deriving --min-move's default.")
     parser.add_argument("--test-fraction", type=float, default=0.2, help="Fraction of each symbol's (time-ordered) data held out for testing.")
+    parser.add_argument(
+        "--folds",
+        type=int,
+        default=1,
+        help="Default 1 = the original single time-ordered 80/20 split, trained and saved as usual. "
+        "N > 1 runs an expanding-window walk-forward validation instead (see walk_forward_splits): "
+        "N folds, each training on all data before it and testing on a different, later block, so "
+        "the evaluation isn't always scored on just the most recent slice. Validation only — no "
+        "model is saved in this mode.",
+    )
     parser.add_argument("--kind", choices=["logistic", "gboost"], default="logistic")
     parser.add_argument("--model-out", default=None, help="Defaults to models/<symbol>_<kind>.joblib, or models/pooled_<kind>.joblib when pooling more than one symbol.")
     args = parser.parse_args()
@@ -655,6 +907,10 @@ def main() -> None:
     if not datasets:
         print("error: no symbol had enough history to build a dataset.", file=sys.stderr)
         sys.exit(1)
+
+    if args.folds > 1:
+        run_walk_forward(datasets, args)
+        return
 
     pooling = len(datasets) > 1
 
@@ -706,60 +962,21 @@ def main() -> None:
         print("error: training labels are all one class — can't train a classifier on this window.", file=sys.stderr)
         sys.exit(1)
 
-    if args.kind == "logistic":
-        from sklearn.linear_model import LogisticRegression
-
-        model = LogisticRegression()
-    else:
-        from sklearn.ensemble import GradientBoostingClassifier
-
-        model = GradientBoostingClassifier()
-
-    model.fit(X_train, y_train)
-    model_accuracy = model.score(X_test, y_test)
-    baseline_accuracy = majority_class_accuracy(y_train, y_test)
-    persistence_baseline = persistence_correct / persistence_total if persistence_total else 0.0
-
-    # Simulated net P&L: the model's predictions on the pooled test set,
-    # sliced back per symbol so each trade's return is computed against
-    # that symbol's own closes/horizon/round_trip_cost, then aggregated —
-    # see net_pnl()/simulate_net_pnl() and the module docstring.
-    model_predictions = list(model.predict(X_test))
-    majority_class = 1 if sum(y_train) >= len(y_train) / 2 else 0
-
-    model_pnl_total, model_pnl_count = 0.0, 0
-    majority_pnl_total, majority_pnl_count = 0.0, 0
-    persistence_pnl_total, persistence_pnl_count = 0.0, 0
-    for entry in per_symbol_test:
-        sym_predictions = model_predictions[entry["start"] : entry["end"]]
-        total, count = simulate_net_pnl(
-            entry["closes"], entry["idx_test"], entry["horizon"], sym_predictions, entry["round_trip_cost"]
-        )
-        model_pnl_total += total
-        model_pnl_count += count
-
-        majority_predictions = [majority_class] * len(entry["idx_test"])
-        total, count = simulate_net_pnl(
-            entry["closes"], entry["idx_test"], entry["horizon"], majority_predictions, entry["round_trip_cost"]
-        )
-        majority_pnl_total += total
-        majority_pnl_count += count
-
-        persistence_predictions = [
-            1 if entry["closes"][i] > entry["closes"][i - entry["horizon"]] else 0
-            for i in entry["idx_test"]
-            if i - entry["horizon"] >= 0
-        ]
-        persistence_indices = [i for i in entry["idx_test"] if i - entry["horizon"] >= 0]
-        total, count = simulate_net_pnl(
-            entry["closes"], persistence_indices, entry["horizon"], persistence_predictions, entry["round_trip_cost"]
-        )
-        persistence_pnl_total += total
-        persistence_pnl_count += count
-
-    model_mean_pnl = model_pnl_total / model_pnl_count if model_pnl_count else 0.0
-    majority_mean_pnl = majority_pnl_total / majority_pnl_count if majority_pnl_count else 0.0
-    persistence_mean_pnl = persistence_pnl_total / persistence_pnl_count if persistence_pnl_count else 0.0
+    # Same evaluation every walk-forward fold uses (see _train_and_evaluate) —
+    # one tested implementation, not a parallel copy that could drift.
+    metrics = _train_and_evaluate(
+        X_train, y_train, X_test, y_test, per_symbol_test, persistence_correct, persistence_total, args.kind
+    )
+    model = metrics["model"]
+    model_accuracy = metrics["model_accuracy"]
+    baseline_accuracy = metrics["baseline_accuracy"]
+    persistence_baseline = metrics["persistence_baseline"]
+    model_mean_pnl = metrics["model_mean_pnl"]
+    majority_mean_pnl = metrics["majority_mean_pnl"]
+    persistence_mean_pnl = metrics["persistence_mean_pnl"]
+    model_pnl_count, model_pnl_total = metrics["model_pnl_count"], metrics["model_pnl_total"]
+    majority_pnl_count, majority_pnl_total = metrics["majority_pnl_count"], metrics["majority_pnl_total"]
+    persistence_pnl_count, persistence_pnl_total = metrics["persistence_pnl_count"], metrics["persistence_pnl_total"]
 
     if args.model_out:
         model_out = args.model_out
