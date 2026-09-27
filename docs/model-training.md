@@ -497,3 +497,68 @@ missing: more history spanning more than one trend regime.
 - Once a model actually beats its baselines convincingly, wire
   `feature_order` into `strategy_config.toml` and switch
   `strategy.model.kind` to `"sklearn"` — not before.
+
+### Deep-history horizon sweep with walk-forward + triple-barrier (2026-09-27)
+
+With all 14 symbols now carrying a full 6-month deep backfill (via
+`historical-data/backfill_ohlc_from_trades.py`) and both `--folds`
+(expanding-window walk-forward validation) and `--label-scheme
+triple-barrier` built in `scripts/train_model.py`, the natural next step
+was to actually run the sweep the earlier rounds kept saying was blocked
+on "more history."
+
+Ran `--symbol all --label-scheme triple-barrier --folds 5 --kind gboost`
+across `--horizon` ∈ {4, 8, 12, 24, 48} bars (hourly candles), via the new
+`train-model.yml` GitHub Actions workflow (added this round so
+`SUPABASE_DB_URL` never has to leave the repo's secrets — see that
+workflow's own docstring). Each horizon's barrier width is the same
+fee-derived threshold used throughout this doc (round-trip taker fee +
+slippage, no profit margin), so a "win" nets roughly breakeven and a
+"loss" nets roughly `-2 × barrier_pct` — see `triple_barrier_net_pnl`.
+
+| horizon (bars) | avg accuracy | vs majority / persistence | avg net P&L/trade | vs majority / persistence | folds beating both baselines (of 5) |
+|---|---|---|---|---|---|
+| 4 | 0.513 | 0.479 / 0.501 | -0.0166 | -0.0177 / -0.0170 | 2 |
+| 8 | 0.495 | 0.467 / 0.509 | -0.0172 | -0.0181 / -0.0167 | 1 |
+| 12 | 0.482 | 0.474 / 0.519 | -0.0176 | -0.0179 / -0.0164 | 0 |
+| 24 | 0.477 | 0.484 / 0.514 | -0.0178 | -0.0176 / -0.0165 | 0 |
+| 48 | 0.482 | 0.490 / 0.501 | -0.0176 | -0.0173 / -0.0170 | 1 |
+
+**Honest read: none of these clear the bar.** Horizon=4 is the closest —
+its *averaged* accuracy and net P&L both edge out both baselines — but it
+only actually beats both baselines, on both metrics, in 2 of 5 folds. An
+average that looks good only because a couple of folds carried it is
+exactly the "looks good on one time period" failure mode this doc has
+flagged before; it is not a validated result, and none of the five
+horizons pass "beats both baselines on both metrics, consistently."
+
+Net P&L being negative for the model *and both baselines*, in every fold,
+at every horizon, is also worth being straight about: because each
+barrier is sized at the fee-derived breakeven threshold (no profit
+margin), a correct call nets roughly 0 before slippage noise and an
+incorrect call nets roughly `-2 × barrier_pct` — so even a "good" model
+here is fighting to lose less, not actually turning a profit, by
+construction. That's a labeling-threshold artifact, not evidence the
+underlying signal is hopeless; a real profit-margin sweep (`--profit-margin
+0.01` etc., same as the earlier flat-4.5%-threshold experiment showing a
+sign of life) hasn't been tried on the full deep-history pooled dataset
+yet and is the more informative next experiment than more horizons at
+breakeven.
+
+**Verdict: no model saved or wired in this round.** Per the standing rule
+above, `feature_order`/`strategy.model.kind` stay untouched until a
+configuration actually earns it.
+
+Natural next steps, in the order they'd actually move the needle:
+1. Re-run the sweep with `--profit-margin` > 0 (e.g. 0.01, 0.02) on the
+   full deep-history pooled dataset — the flat-4.5%-threshold result from
+   the prior round (before deep history existed) was the one time a model
+   went net-positive, and margin is the parameter that recreates that
+   condition properly (fee-derived, not an arbitrary flat number).
+2. Sweep `--min-move`/`--top-fraction` independently of horizon now that
+   there's enough history per symbol to not immediately starve the test
+   set.
+3. Re-run per-symbol (not just pooled) now that 6 months exists per
+   symbol — pooling assumes one feature/threshold combination generalizes
+   across very different coins, which hasn't been checked against the
+   deep-history data yet.
