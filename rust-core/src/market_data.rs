@@ -63,6 +63,7 @@ fn event_symbol(event: &MarketDataEvent) -> Option<&str> {
     match &event.event {
         Some(Event::OrderBookUpdate(u)) => Some(&u.symbol),
         Some(Event::Metric(m)) => Some(&m.symbol),
+        Some(Event::TradeUpdate(t)) => Some(&t.symbol),
         None => None,
     }
 }

@@ -78,3 +78,16 @@ class ImbalanceMomentumStrategy(Strategy):
         signal = self._model.predict(features)
         intent = self._policy.decide(features, signal, current_position)
         return StrategyDecision(features=features, signal=signal, intent=intent)
+
+    def on_trade(
+        self,
+        symbol: str,
+        price: Decimal,
+        volume: Decimal,
+        *,
+        timestamp: Optional[float] = None,
+    ) -> None:
+        if symbol not in self._tradeable_symbols:
+            return None
+        self._features.on_trade(symbol, price, volume, timestamp=timestamp)
+        return None

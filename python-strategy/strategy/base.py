@@ -56,3 +56,28 @@ class Strategy(ABC):
         keep working unchanged — the feature engine falls back to
         wall-clock time when it's omitted."""
         raise NotImplementedError
+
+    def on_trade(
+        self,
+        symbol: str,
+        price: Decimal,
+        volume: Decimal,
+        *,
+        timestamp: Optional[float] = None,
+    ) -> None:
+        """Called once per real executed trade for a symbol this strategy
+        trades (see proto/trading.proto's TradeUpdate and
+        strategy/engine.py's market-data loop) — feeds bar-derived
+        features real traded price/volume instead of the mid-price-tick
+        approximation on_order_book_update falls back to. Unlike that
+        method, this never produces a StrategyDecision on its own: a trade
+        print carries no bid/ask sizes to compute imbalance/momentum from,
+        so there's nothing to decide on here — a bar completing from this
+        call still shapes the *next* order-book-driven decision's
+        bar-derived features.
+
+        Default no-op, so a strategy with no bar-derived features (or a
+        caller/test with no trade feed wired up) needs no override.
+        ImbalanceMomentumStrategy overrides this to feed its
+        FeatureEngine."""
+        return None

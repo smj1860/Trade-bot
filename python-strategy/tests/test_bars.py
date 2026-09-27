@@ -165,3 +165,106 @@ def test_max_bars_evicts_oldest_highs_and_lows_too():
         agg.on_tick("BTC-USD", timestamp=float(i * 60), price=float(100 + i))
     assert len(agg.highs("BTC-USD")) == 2
     assert len(agg.lows("BTC-USD")) == 2
+
+
+def test_on_trade_first_trade_opens_bucket_but_completes_no_bar():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=10)
+    agg.on_trade("BTC-USD", timestamp=1000.0, price=100.0, volume=1.0)
+    assert agg.closes("BTC-USD") == []
+    assert agg.volumes("BTC-USD") == []
+
+
+def test_on_trade_completes_bar_with_real_close_high_low():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=10)
+    # bucket [0, 60): trades at 100, 105, 98 -> high=105, low=98, close=98 (last)
+    agg.on_trade("BTC-USD", timestamp=0.0, price=100.0, volume=1.0)
+    agg.on_trade("BTC-USD", timestamp=20.0, price=105.0, volume=2.0)
+    agg.on_trade("BTC-USD", timestamp=40.0, price=98.0, volume=1.0)
+    agg.on_trade("BTC-USD", timestamp=60.0, price=110.0, volume=1.0)  # completes the bucket above
+    assert agg.closes("BTC-USD") == [98.0]
+    assert agg.highs("BTC-USD") == [105.0]
+    assert agg.lows("BTC-USD") == [98.0]
+
+
+def test_on_trade_midpoint_is_real_volume_weighted_vwap_not_high_low_average():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=10)
+    # bucket [0, 60): (price=100, vol=1) and (price=200, vol=3)
+    # vwap = (100*1 + 200*3) / (1 + 3) = 700 / 4 = 175, NOT (100+200)/2 = 150
+    agg.on_trade("BTC-USD", timestamp=0.0, price=100.0, volume=1.0)
+    agg.on_trade("BTC-USD", timestamp=20.0, price=200.0, volume=3.0)
+    agg.on_trade("BTC-USD", timestamp=60.0, price=999.0, volume=1.0)  # completes the bucket above
+    assert agg.midpoints("BTC-USD") == [175.0]
+
+
+def test_on_trade_accumulates_real_volume_per_bar():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=10)
+    agg.on_trade("BTC-USD", timestamp=0.0, price=100.0, volume=1.5)
+    agg.on_trade("BTC-USD", timestamp=20.0, price=101.0, volume=2.5)
+    agg.on_trade("BTC-USD", timestamp=60.0, price=102.0, volume=1.0)  # completes the bucket above
+    assert agg.volumes("BTC-USD") == [4.0]
+    assert agg.volume_window("BTC-USD", 1) == [4.0]
+
+
+def test_on_trade_out_of_order_trade_is_ignored():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=10)
+    agg.on_trade("BTC-USD", timestamp=120.0, price=100.0, volume=1.0)
+    agg.on_trade("BTC-USD", timestamp=180.0, price=110.0, volume=1.0)  # completes bar[0]=100
+    agg.on_trade("BTC-USD", timestamp=30.0, price=999.0, volume=99.0)  # stale, earlier bucket
+    assert agg.closes("BTC-USD") == [100.0]
+
+
+def test_on_trade_single_trade_bucket_vwap_equals_that_price():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=10)
+    agg.on_trade("BTC-USD", timestamp=0.0, price=100.0, volume=5.0)
+    agg.on_trade("BTC-USD", timestamp=60.0, price=110.0, volume=1.0)  # completes the bucket above
+    assert agg.midpoints("BTC-USD") == [100.0]
+
+
+def test_bucket_with_any_real_trade_uses_vwap_even_if_ticks_also_arrived():
+    # A bucket that saw both on_tick and on_trade calls uses real VWAP for
+    # its midpoint (not the tick-range average) the moment any real trade
+    # landed in it — see _complete_bucket's "any real volume" rule.
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=10)
+    agg.on_tick("BTC-USD", timestamp=0.0, price=100.0)     # tick, no volume
+    agg.on_trade("BTC-USD", timestamp=20.0, price=200.0, volume=2.0)  # real trade
+    agg.on_trade("BTC-USD", timestamp=60.0, price=999.0, volume=1.0)  # completes the bucket above
+    # vwap over the whole bucket = 200*2 / 2 = 200 (the tick contributed no
+    # volume, so it doesn't pull the VWAP toward 100)
+    assert agg.midpoints("BTC-USD") == [200.0]
+
+
+def test_tick_only_bucket_still_falls_back_to_high_low_average():
+    # A bucket fed only by on_tick (no real trade at all) keeps the
+    # pre-existing (high+low)/2 approximation — volume stays 0.0 for it.
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=10)
+    agg.on_tick("BTC-USD", timestamp=0.0, price=100.0)
+    agg.on_tick("BTC-USD", timestamp=20.0, price=105.0)
+    agg.on_tick("BTC-USD", timestamp=40.0, price=98.0)
+    agg.on_tick("BTC-USD", timestamp=60.0, price=110.0)
+    assert agg.midpoints("BTC-USD") == [(105.0 + 98.0) / 2]
+    assert agg.volumes("BTC-USD") == [0.0]
+
+
+def test_on_trade_and_on_tick_track_symbols_independently():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=10)
+    agg.on_trade("BTC-USD", timestamp=0.0, price=100.0, volume=1.0)
+    agg.on_trade("BTC-USD", timestamp=60.0, price=110.0, volume=1.0)
+    agg.on_tick("ETH-USD", timestamp=0.0, price=10.0)
+    agg.on_tick("ETH-USD", timestamp=60.0, price=11.0)
+    assert agg.closes("BTC-USD") == [100.0]
+    assert agg.closes("ETH-USD") == [10.0]
+    assert agg.volumes("BTC-USD") == [1.0]
+    assert agg.volumes("ETH-USD") == [0.0]
+
+
+def test_max_bars_evicts_oldest_volumes_too():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=2)
+    for i in range(5):
+        agg.on_trade("BTC-USD", timestamp=float(i * 60), price=float(100 + i), volume=1.0)
+    assert len(agg.volumes("BTC-USD")) == 2
+
+
+def test_no_history_volumes_are_empty():
+    agg = BarAggregator(bar_interval_seconds=60, max_bars=10)
+    assert agg.volumes("BTC-USD") == []
+    assert agg.volume_window("BTC-USD", 5) == []

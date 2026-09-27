@@ -42,10 +42,27 @@ message Metric {
   int64 timestamp_ns = 4;
 }
 
+// A single executed trade (public tape), not an order book level — this is
+// the real traded price/size the exchange matched, which is what
+// strategy.bars.BarAggregator now builds live bars and VWAP from instead of
+// approximating them from order-book mid-price snapshots. `side` is the
+// taker's side when the exchange reports it (Kraken does); unset otherwise.
+message TradeUpdate {
+  string symbol = 1;          // normalized, e.g. "BTC-USD"
+  string exchange = 2;
+  int64 exchange_timestamp_ns = 3;
+  int64 received_timestamp_ns = 4;
+  Decimal price = 5;
+  Decimal quantity = 6;
+  OrderSide side = 7;         // taker side; ORDER_SIDE_UNSPECIFIED if unknown
+  string trade_id = 8;        // exchange-native trade id, for logging/dedup
+}
+
 message MarketDataEvent {
   oneof event {
     OrderBookUpdate order_book_update = 1;
     Metric metric = 2;
+    TradeUpdate trade_update = 3;
   }
 }
 

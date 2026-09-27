@@ -222,6 +222,34 @@ class FeatureEngine:
             ),
         )
 
+    def on_trade(
+        self,
+        symbol: str,
+        price: Decimal,
+        volume: Decimal,
+        *,
+        timestamp: float | None = None,
+    ) -> None:
+        """Feeds one real executed trade into this symbol's bars (see
+        strategy/bars.py's BarAggregator.on_trade) — the source bar-derived
+        features should actually be built from wherever a live trade feed
+        is available, rather than only the mid-price-tick approximation
+        on_order_book_update's own bar-feeding falls back to. Once a
+        bucket has received any real trade, BarAggregator uses genuine
+        VWAP for that bar's midpoint (see its module docstring), so this
+        is what closes the live/historical feature-parity gap for symbols
+        with a real trade feed wired up (see strategy/engine.py).
+
+        Produces no Features snapshot: a trade print carries no bid/ask
+        sizes to compute imbalance/momentum from, so there's nothing new
+        to decide on here — the next order-book update for this symbol
+        will see the updated bar history."""
+        if timestamp is None:
+            import time
+
+            timestamp = time.time()
+        self._bars.on_trade(symbol, timestamp, float(price), float(volume))
+
     def _typical_price_window(self, symbol: str, size: int) -> list[float]:
         """(high + low + close) / 3 per bar, over the most recent `size`
         completed bars — the "typical price" series CCI is traditionally

@@ -75,8 +75,28 @@ class Engine:
             async for event in market_stub.SubscribeMarketData(request):
                 if event.HasField("order_book_update"):
                     await self._handle_order_book_update(event.order_book_update, order_stub)
+                elif event.HasField("trade_update"):
+                    self._handle_trade_update(event.trade_update)
         except grpc.aio.AioRpcError as e:
             self.log.log("market_data_stream_error", detail=str(e))
+
+    def _handle_trade_update(self, update) -> None:
+        # Real executed trade (see proto/trading.proto's TradeUpdate and
+        # rust-core/src/kraken.rs's trade-channel subscription) — feeds
+        # strategy.bars.BarAggregator's real-VWAP path via
+        # Strategy.on_trade, closing the live/historical feature-parity
+        # gap that on_order_book_update's mid-price-tick fallback left
+        # open. Produces no decision/order on its own (see
+        # Strategy.on_trade's docstring), so there's nothing to log here
+        # beyond what bar completion will surface on the next order book
+        # update's "signal" log line.
+        timestamp = update.exchange_timestamp_ns / 1_000_000_000 if update.exchange_timestamp_ns else None
+        self.strategy.on_trade(
+            update.symbol,
+            Decimal(update.price.value),
+            Decimal(update.quantity.value),
+            timestamp=timestamp,
+        )
 
     async def _handle_order_book_update(self, update, order_stub) -> None:
         if not update.bids or not update.asks:

@@ -45,6 +45,15 @@ def run() -> None:
                 elif event.HasField("metric"):
                     m = event.metric
                     log.info("metric: %s.%s = %s", m.symbol, m.name, m.value.value)
+                elif event.HasField("trade_update"):
+                    t = event.trade_update
+                    log.info(
+                        "trade: %s side=%s price=%s qty=%s",
+                        t.symbol,
+                        t.side,
+                        t.price.value,
+                        t.quantity.value,
+                    )
         except grpc.RpcError as e:
             log.error("stream ended: %s", e)
 

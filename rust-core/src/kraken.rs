@@ -1,13 +1,20 @@
-//! Kraken WebSocket API v2 ingestion: connects, subscribes to the `book`
-//! channel for the configured symbols, maintains per-symbol order book
-//! state, and publishes `MarketDataEvent`s onto a broadcast channel that
-//! `MarketDataServiceImpl` streams out to gRPC subscribers.
+//! Kraken WebSocket API v2 ingestion: connects, subscribes to both the
+//! `book` and `trade` channels for the configured symbols, maintains
+//! per-symbol order book state, and publishes `MarketDataEvent`s onto a
+//! broadcast channel that `MarketDataServiceImpl` streams out to gRPC
+//! subscribers.
 //!
 //! Kraken specifics (as of WS API v2): pairs are slash-delimited modern
 //! asset codes (e.g. "BTC/USD", not the legacy REST v0 "XXBTZUSD"). The
 //! `book` channel sends a `snapshot` message once per symbol on subscribe,
 //! then `update` deltas; a quantity of 0 in an update means "remove this
-//! price level."
+//! price level." The `trade` channel sends one message per batch of
+//! executed trades — real traded price/size/side, not a book level — which
+//! is what lets strategy.bars.BarAggregator on the Python side build live
+//! bars (close/high/low) and VWAP from actual executions instead of
+//! approximating them from mid-price book snapshots (see that module's
+//! docstring and this crate's TradeUpdate proto message for why this
+//! matters for train/live feature parity).
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -22,7 +29,7 @@ use crate::config::{ExchangeConfig, SymbolConfig};
 use crate::orderbook::{OrderBook, SharedBooks};
 use crate::proto::pb::market_data_event::Event;
 use crate::proto::pb::{
-    Decimal as PbDecimal, MarketDataEvent, OrderBookLevel, OrderBookUpdate,
+    Decimal as PbDecimal, MarketDataEvent, OrderBookLevel, OrderBookUpdate, OrderSide, TradeUpdate,
 };
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
@@ -64,7 +71,7 @@ async fn connect_and_stream(
     let (mut write, mut read) = ws_stream.split();
 
     let native_symbols: Vec<&str> = symbols.iter().map(|s| s.exchange_native_symbol.as_str()).collect();
-    let subscribe_msg = serde_json::json!({
+    let book_subscribe_msg = serde_json::json!({
         "method": "subscribe",
         "params": {
             "channel": "book",
@@ -72,8 +79,20 @@ async fn connect_and_stream(
             "depth": BOOK_DEPTH,
         }
     });
-    write.send(Message::Text(subscribe_msg.to_string())).await?;
+    write.send(Message::Text(book_subscribe_msg.to_string())).await?;
     tracing::info!(symbols = ?native_symbols, "sent book subscription");
+
+    // A separate subscribe message for the public trade tape — Kraken WS v2
+    // treats each channel as its own subscription even over one connection.
+    let trade_subscribe_msg = serde_json::json!({
+        "method": "subscribe",
+        "params": {
+            "channel": "trade",
+            "symbol": native_symbols,
+        }
+    });
+    write.send(Message::Text(trade_subscribe_msg.to_string())).await?;
+    tracing::info!(symbols = ?native_symbols, "sent trade subscription");
 
     // native symbol ("BTC/USD") -> normalized symbol ("BTC-USD"). Actual book
     // state lives in the shared `books` map, keyed by normalized symbol, so
@@ -107,68 +126,122 @@ async fn connect_and_stream(
             }
         };
 
-        // Non-book messages (subscribe ack, heartbeat, status) are expected
-        // and not errors — just nothing to publish.
-        if value.get("channel").and_then(|c| c.as_str()) != Some("book") {
-            continue;
-        }
+        // Anything besides book/trade data messages (subscribe ack,
+        // heartbeat, status) is expected and not an error — just nothing to
+        // publish.
+        let channel = value.get("channel").and_then(|c| c.as_str());
         let msg_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let Some(entries) = value.get("data").and_then(|d| d.as_array()) else {
             continue;
         };
 
-        for entry in entries {
-            let Some(native_symbol) = entry.get("symbol").and_then(|s| s.as_str()) else {
-                continue;
-            };
-            let Some(normalized_symbol) = native_to_normalized.get(native_symbol) else {
-                tracing::warn!(%native_symbol, "book update for a symbol we didn't subscribe to");
-                continue;
-            };
-
-            let bids = parse_levels(entry.get("bids"));
-            let asks = parse_levels(entry.get("asks"));
-
-            // Hold the lock only long enough to apply the delta and read
-            // back the levels we're about to publish — never across an
-            // await point, so a slow subscriber can't stall ingestion.
-            let (published_bids, published_asks) = {
-                let mut guard = books.lock().await;
-                let book = guard
-                    .entry(normalized_symbol.clone())
-                    .or_insert_with(|| OrderBook::new(normalized_symbol.clone()));
-
-                match msg_type {
-                    "snapshot" => book.apply_snapshot(bids, asks),
-                    "update" => book.apply_update(bids, asks),
-                    other => {
-                        tracing::debug!(msg_type = other, "unhandled book message type");
-                        continue;
-                    }
+        match channel {
+            Some("book") => {
+                for entry in entries {
+                    handle_book_entry(entry, msg_type, exchange, &native_to_normalized, books, tx).await;
                 }
-
-                (book.bid_levels(PUBLISHED_LEVELS), book.ask_levels(PUBLISHED_LEVELS))
-            };
-
-            let event = MarketDataEvent {
-                event: Some(Event::OrderBookUpdate(OrderBookUpdate {
-                    symbol: normalized_symbol.clone(),
-                    exchange: exchange.name.clone(),
-                    exchange_timestamp_ns: 0, // Kraken's timestamp string isn't parsed yet; not needed for the pipe to work
-                    received_timestamp_ns: now_ns(),
-                    bids: to_levels(published_bids),
-                    asks: to_levels(published_asks),
-                    sequence: 0, // Kraken v2's checksum serves this role; not wired in yet
-                })),
-            };
-
-            // No subscribers yet is not an error — the ingestion loop keeps
-            // the book warm regardless of whether anyone's listening.
-            let _ = tx.send(event);
+            }
+            Some("trade") => {
+                for entry in entries {
+                    handle_trade_entry(entry, exchange, &native_to_normalized, tx);
+                }
+            }
+            _ => continue,
         }
     }
 
     Ok(())
+}
+
+async fn handle_book_entry(
+    entry: &serde_json::Value,
+    msg_type: &str,
+    exchange: &ExchangeConfig,
+    native_to_normalized: &HashMap<String, String>,
+    books: &SharedBooks,
+    tx: &broadcast::Sender<MarketDataEvent>,
+) {
+    let Some(native_symbol) = entry.get("symbol").and_then(|s| s.as_str()) else {
+        return;
+    };
+    let Some(normalized_symbol) = native_to_normalized.get(native_symbol) else {
+        tracing::warn!(%native_symbol, "book update for a symbol we didn't subscribe to");
+        return;
+    };
+
+    let bids = parse_levels(entry.get("bids"));
+    let asks = parse_levels(entry.get("asks"));
+
+    // Hold the lock only long enough to apply the delta and read back the
+    // levels we're about to publish — never across an await point, so a
+    // slow subscriber can't stall ingestion.
+    let (published_bids, published_asks) = {
+        let mut guard = books.lock().await;
+        let book = guard
+            .entry(normalized_symbol.clone())
+            .or_insert_with(|| OrderBook::new(normalized_symbol.clone()));
+
+        match msg_type {
+            "snapshot" => book.apply_snapshot(bids, asks),
+            "update" => book.apply_update(bids, asks),
+            other => {
+                tracing::debug!(msg_type = other, "unhandled book message type");
+                return;
+            }
+        }
+
+        (book.bid_levels(PUBLISHED_LEVELS), book.ask_levels(PUBLISHED_LEVELS))
+    };
+
+    let event = MarketDataEvent {
+        event: Some(Event::OrderBookUpdate(OrderBookUpdate {
+            symbol: normalized_symbol.clone(),
+            exchange: exchange.name.clone(),
+            exchange_timestamp_ns: 0, // Kraken's timestamp string isn't parsed yet; not needed for the pipe to work
+            received_timestamp_ns: now_ns(),
+            bids: to_levels(published_bids),
+            asks: to_levels(published_asks),
+            sequence: 0, // Kraken v2's checksum serves this role; not wired in yet
+        })),
+    };
+
+    // No subscribers yet is not an error — the ingestion loop keeps the
+    // book warm regardless of whether anyone's listening.
+    let _ = tx.send(event);
+}
+
+fn handle_trade_entry(
+    entry: &serde_json::Value,
+    exchange: &ExchangeConfig,
+    native_to_normalized: &HashMap<String, String>,
+    tx: &broadcast::Sender<MarketDataEvent>,
+) {
+    let Some(native_symbol) = entry.get("symbol").and_then(|s| s.as_str()) else {
+        return;
+    };
+    let Some(normalized_symbol) = native_to_normalized.get(native_symbol) else {
+        tracing::warn!(%native_symbol, "trade for a symbol we didn't subscribe to");
+        return;
+    };
+    let Some(trade) = parse_trade_entry(entry) else {
+        tracing::warn!(%native_symbol, raw = %entry, "failed to parse trade entry, skipping");
+        return;
+    };
+
+    let event = MarketDataEvent {
+        event: Some(Event::TradeUpdate(TradeUpdate {
+            symbol: normalized_symbol.clone(),
+            exchange: exchange.name.clone(),
+            exchange_timestamp_ns: 0, // Kraken's timestamp string isn't parsed yet, same simplification as book updates
+            received_timestamp_ns: now_ns(),
+            price: Some(PbDecimal { value: trade.price.to_string() }),
+            quantity: Some(PbDecimal { value: trade.quantity.to_string() }),
+            side: trade.side as i32,
+            trade_id: trade.trade_id,
+        })),
+    };
+
+    let _ = tx.send(event);
 }
 
 /// Kraken sends price/qty as JSON numbers. `arbitrary_precision` on
@@ -190,6 +263,43 @@ fn parse_levels(value: Option<&serde_json::Value>) -> Vec<(Decimal, Decimal)> {
         .collect()
 }
 
+struct ParsedTrade {
+    price: Decimal,
+    quantity: Decimal,
+    side: OrderSide,
+    trade_id: String,
+}
+
+/// Parses one entry of a Kraken `trade` channel message, e.g.:
+/// `{"symbol": "BTC/USD", "side": "buy", "price": 43000.1, "qty": 0.001,
+/// "ord_type": "market", "trade_id": 123456789, "timestamp": "..."}`.
+/// Returns None if price or qty is missing/unparseable — a trade without a
+/// real price/size isn't one this pipeline can do anything useful with, so
+/// it's dropped (and logged by the caller) rather than published with a
+/// zero/placeholder value that could silently corrupt a bar's VWAP.
+fn parse_trade_entry(entry: &serde_json::Value) -> Option<ParsedTrade> {
+    let price = entry.get("price")?;
+    let qty = entry.get("qty")?;
+    let price = Decimal::from_str(&price.to_string()).ok()?;
+    let quantity = Decimal::from_str(&qty.to_string()).ok()?;
+    let side = match entry.get("side").and_then(|s| s.as_str()) {
+        Some("buy") => OrderSide::Buy,
+        Some("sell") => OrderSide::Sell,
+        _ => OrderSide::Unspecified,
+    };
+    // trade_id may come through as a JSON number or (on some feeds) a
+    // string; either way it's carried as an opaque string for logging/dedup
+    // on the Python side, never parsed as a number here.
+    let trade_id = entry
+        .get("trade_id")
+        .map(|v| match v.as_str() {
+            Some(s) => s.to_string(),
+            None => v.to_string(),
+        })
+        .unwrap_or_default();
+    Some(ParsedTrade { price, quantity, side, trade_id })
+}
+
 fn to_levels(levels: Vec<(Decimal, Decimal)>) -> Vec<OrderBookLevel> {
     levels
         .into_iter()
@@ -205,4 +315,81 @@ fn now_ns() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_trade_entry_buy_side() {
+        let entry = serde_json::json!({
+            "symbol": "BTC/USD",
+            "side": "buy",
+            "price": 43000.1,
+            "qty": 0.001,
+            "ord_type": "market",
+            "trade_id": 123456789,
+            "timestamp": "2023-09-25T07:49:37.708299Z",
+        });
+        let trade = parse_trade_entry(&entry).expect("should parse");
+        assert_eq!(trade.price, Decimal::from_str("43000.1").unwrap());
+        assert_eq!(trade.quantity, Decimal::from_str("0.001").unwrap());
+        assert_eq!(trade.side, OrderSide::Buy);
+        assert_eq!(trade.trade_id, "123456789");
+    }
+
+    #[test]
+    fn parse_trade_entry_sell_side() {
+        let entry = serde_json::json!({
+            "symbol": "ETH/USD",
+            "side": "sell",
+            "price": 2500.55,
+            "qty": 0.25,
+            "trade_id": 42,
+        });
+        let trade = parse_trade_entry(&entry).expect("should parse");
+        assert_eq!(trade.side, OrderSide::Sell);
+    }
+
+    #[test]
+    fn parse_trade_entry_unrecognized_side_is_unspecified() {
+        let entry = serde_json::json!({
+            "symbol": "BTC/USD",
+            "price": 43000.1,
+            "qty": 0.001,
+        });
+        let trade = parse_trade_entry(&entry).expect("should still parse without a side");
+        assert_eq!(trade.side, OrderSide::Unspecified);
+        assert_eq!(trade.trade_id, ""); // missing trade_id defaults to empty, not an error
+    }
+
+    #[test]
+    fn parse_trade_entry_string_trade_id_kept_verbatim() {
+        let entry = serde_json::json!({
+            "price": 100.0,
+            "qty": 1.0,
+            "trade_id": "abc-123",
+        });
+        let trade = parse_trade_entry(&entry).expect("should parse");
+        assert_eq!(trade.trade_id, "abc-123");
+    }
+
+    #[test]
+    fn parse_trade_entry_missing_price_returns_none() {
+        let entry = serde_json::json!({ "qty": 1.0 });
+        assert!(parse_trade_entry(&entry).is_none());
+    }
+
+    #[test]
+    fn parse_trade_entry_missing_qty_returns_none() {
+        let entry = serde_json::json!({ "price": 100.0 });
+        assert!(parse_trade_entry(&entry).is_none());
+    }
+
+    #[test]
+    fn parse_trade_entry_unparseable_price_returns_none() {
+        let entry = serde_json::json!({ "price": "not-a-number", "qty": 1.0 });
+        assert!(parse_trade_entry(&entry).is_none());
+    }
 }
