@@ -13,6 +13,8 @@ docs/model-training.md, not repeated here as an automated test.
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.train_model import (
@@ -20,7 +22,11 @@ from scripts.train_model import (
     build_dataset,
     list_available_symbols,
     load_symbol_dataset,
+    move,
+    per_symbol_move_threshold,
+    persistence_correct_and_total,
     resolve_symbols,
+    split_point,
     time_ordered_split,
 )
 
@@ -141,8 +147,8 @@ def test_pooling_concatenates_per_symbol_splits_without_cross_contamination():
         bollinger_window=5, bollinger_num_std=2.0, ao_fast_window=2, ao_slow_window=5,
         macd_fast_window=2, macd_slow_window=5, macd_signal_window=2, cci_window=5, williams_r_window=5,
     )
-    X_a, y_a = build_dataset(closes_a, midpoints_a, highs_a, lows_a, **kwargs)
-    X_b, y_b = build_dataset(closes_b, midpoints_b, highs_b, lows_b, **kwargs)
+    X_a, y_a, _ = build_dataset(closes_a, midpoints_a, highs_a, lows_a, **kwargs)
+    X_b, y_b, _ = build_dataset(closes_b, midpoints_b, highs_b, lows_b, **kwargs)
 
     a_train_X, a_train_y, a_test_X, a_test_y = time_ordered_split(X_a, y_a, 0.2)
     b_train_X, b_train_y, b_test_X, b_test_y = time_ordered_split(X_b, y_b, 0.2)
@@ -156,3 +162,89 @@ def test_pooling_concatenates_per_symbol_splits_without_cross_contamination():
     assert all(row in a_test_X or row in b_test_X for row in pooled_test_X)
     assert len(pooled_train_X) == len(a_train_X) + len(b_train_X)
     assert len(pooled_test_X) == len(a_test_X) + len(b_test_X)
+
+
+def test_move_computes_fractional_change_over_horizon():
+    closes = [100.0, 105.0, 110.0, 90.0]
+    assert move(closes, 0, 1) == pytest.approx(0.05)
+    assert move(closes, 0, 2) == pytest.approx(0.10)
+    assert move(closes, 2, 1) == pytest.approx((90.0 - 110.0) / 110.0)
+
+
+def test_move_zero_base_is_safe():
+    assert move([0.0, 5.0], 0, 1) == 0.0
+
+
+def test_build_dataset_horizon_labels_further_ahead_bar():
+    # closes rise then fall right after bar 4: a 1-bar label at i=4 would
+    # be "down" (closes[5] < closes[4]), but a 3-bar-ahead label should
+    # reflect where price actually is 3 bars later.
+    closes = [100.0] * 5 + [99.0, 98.0, 200.0]
+    highs = [c + 1.0 for c in closes]
+    lows = [c - 1.0 for c in closes]
+    midpoints = [(h + l) / 2.0 for h, l in zip(highs, lows)]
+    kwargs = dict(
+        sma_window=2, ema_window=2, rsi_window=2, vol_window=2, bar_momentum_window=2,
+        bollinger_window=2, bollinger_num_std=2.0, ao_fast_window=1, ao_slow_window=2,
+        macd_fast_window=1, macd_slow_window=2, macd_signal_window=1, cci_window=2, williams_r_window=2,
+    )
+    X1, y1, idx1 = build_dataset(closes, midpoints, highs, lows, horizon=1, **kwargs)
+    X3, y3, idx3 = build_dataset(closes, midpoints, highs, lows, horizon=3, **kwargs)
+    # bar index 4: 1-bar-ahead is down (99 < 100), 3-bar-ahead is up (200 > 100)
+    assert y1[idx1.index(4)] == 0
+    assert y3[idx3.index(4)] == 1
+
+
+def test_build_dataset_min_move_threshold_drops_small_moves():
+    closes = [100.0, 100.1, 100.2, 100.1, 110.0, 100.0, 90.0]
+    highs = [c + 1.0 for c in closes]
+    lows = [c - 1.0 for c in closes]
+    midpoints = [(h + l) / 2.0 for h, l in zip(highs, lows)]
+    kwargs = dict(
+        sma_window=2, ema_window=2, rsi_window=2, vol_window=2, bar_momentum_window=2,
+        bollinger_window=2, bollinger_num_std=2.0, ao_fast_window=1, ao_slow_window=2,
+        macd_fast_window=1, macd_slow_window=2, macd_signal_window=1, cci_window=2, williams_r_window=2,
+    )
+    X_unfiltered, y_unfiltered, idx_unfiltered = build_dataset(closes, midpoints, highs, lows, horizon=1, min_move_threshold=0.0, **kwargs)
+    X_filtered, y_filtered, idx_filtered = build_dataset(closes, midpoints, highs, lows, horizon=1, min_move_threshold=0.05, **kwargs)
+    assert len(X_filtered) < len(X_unfiltered)
+    for i in idx_filtered:
+        assert abs(move(closes, i, 1)) >= 0.05
+
+
+def test_per_symbol_move_threshold_no_filtering_at_top_fraction_one():
+    closes = [100.0 + i for i in range(30)]
+    assert per_symbol_move_threshold(closes, warmup=5, horizon=1, top_fraction=1.0) == 0.0
+
+
+def test_per_symbol_move_threshold_keeps_only_extreme_moves():
+    # Mostly flat moves with a few large spikes near the end.
+    closes = [100.0] * 20 + [100.0, 150.0, 100.0, 50.0, 100.0]
+    threshold = per_symbol_move_threshold(closes, warmup=5, horizon=1, top_fraction=0.1)
+    assert threshold > 0.0
+    # A move of 0.0 (the flat stretch) should not clear this threshold.
+    assert 0.0 < threshold
+
+
+def test_persistence_correct_and_total_matches_hand_computed():
+    # Alternating up/down moves; "persistence" predicts the last move continues.
+    closes = [100.0, 110.0, 100.0, 110.0, 100.0]
+    # indices 1,2,3 are candidate label bars (need i-1 and i+1 in range)
+    correct, total = persistence_correct_and_total(closes, indices=[1, 2, 3], horizon=1)
+    # i=1: last move (0->1) up, actual (1->2) down -> wrong
+    # i=2: last move (1->2) down, actual (2->3) up -> wrong
+    # i=3: last move (2->3) up, actual (3->4) down -> wrong
+    assert total == 3
+    assert correct == 0
+
+
+def test_persistence_correct_and_total_skips_indices_without_prior_bar():
+    closes = [100.0, 110.0, 120.0]
+    correct, total = persistence_correct_and_total(closes, indices=[0], horizon=1)
+    assert total == 0  # i=0 has no i-horizon bar to compare against
+
+
+def test_split_point_keeps_at_least_one_row_each_side():
+    assert split_point(10, 0.2) == 8
+    assert split_point(2, 0.5) == 1
+    assert split_point(1, 0.5) == 1

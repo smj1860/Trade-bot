@@ -20,16 +20,48 @@ high/low from the tick range seen within a bucket), so a model trained
 here sees an identical feature definition to what it will be fed in
 production.
 
-Label (deliberately simple, NOT sophisticated): next-bar direction — did
-the close go up or down one bar after the features were computed. This is
-a naive baseline label, chosen to get a first honest read on whether these
-features carry any predictive signal at all, not a claim that next-bar
-direction is the right thing to trade on. Evaluated against two baselines
-so a small accuracy edge doesn't get oversold:
+Label: by default, naive next-bar direction — did the close go up or down
+one bar after the features were computed. This was deliberately the
+simplest possible thing to try first, not a claim that it's the right
+target — three rounds of adding indicators (see docs/model-training.md)
+and one round of pooling 13 symbols both failed to move accuracy past a
+coin flip on this label, which points at the label itself as the limiting
+factor. Two knobs loosen it, and can be combined:
+
+  --horizon N       Label bar i by the direction of the move from bar i to
+                     bar i+N (default N=1, the original next-bar label).
+                     A longer horizon gives price more room to make a real
+                     move before averaging is forced to call a direction,
+                     at the cost of overlapping (correlated) label windows
+                     and fewer non-overlapping-in-spirit examples.
+
+  --min-move X      Drop any row whose |move| over the horizon is smaller
+                     than X (a fraction, e.g. 0.02 = 2%) — filters out the
+                     noisy near-zero moves a 1-bar label is forced to call
+                     one way or the other. Size this above your actual
+                     round-trip trading cost (Kraken's spot taker fee plus
+                     spread) plus a profit margin, or a "correct" label is
+                     still a loser after costs.
+
+  --top-fraction F  Instead of (or combined with) a fixed --min-move,
+                     keep only the most extreme F fraction of moves (e.g.
+                     0.3 = keep the top/bottom 30%), computed *per symbol*
+                     from that symbol's own horizon-move distribution —
+                     this adapts to each symbol's own volatility instead
+                     of one flat percentage meaning something very
+                     different for BTC than for a high-volatility altcoin.
+                     When both --min-move and --top-fraction are given,
+                     whichever threshold is larger for that symbol wins,
+                     so both constraints hold.
+
+Evaluated against two baselines so a small accuracy edge doesn't get
+oversold:
   - majority-class baseline: always predict whichever direction was more
-    common in the training set
+    common in the (post-filtering) training set
   - persistence baseline: predict the same direction as the most recent
-    completed move (a classic "trend continues" naive forecaster)
+    completed horizon-length move (a classic "trend continues" naive
+    forecaster), evaluated on the same filtered rows the model is scored
+    on, so it's an apples-to-apples comparison
 If the trained model can't beat both by a meaningful margin, that's a real
 result to know, not a reason to hide the run.
 
@@ -48,6 +80,10 @@ Usage:
     # instead of one model per symbol from ~700 rows each:
     python3 scripts/train_model.py --symbol BTC-USD,ETH-USD,SOL-USD
     python3 scripts/train_model.py --symbol all   # every symbol with data at --interval
+
+    # A 12-hour-ahead label, only keeping moves >= 4.5% (or, per symbol,
+    # the top/bottom 30% of that symbol's 12h moves, whichever is bigger):
+    python3 scripts/train_model.py --symbol all --horizon 12 --min-move 0.045 --top-fraction 0.3
 
 Pooling ("--symbol" given a comma-separated list, or the literal "all")
 computes each symbol's features independently over its own close/high/low
@@ -238,6 +274,68 @@ def features_at(
     }
 
 
+def dataset_warmup(
+    sma_window: int,
+    ema_window: int,
+    rsi_window: int,
+    vol_window: int,
+    bar_momentum_window: int,
+    bollinger_window: int,
+    ao_slow_window: int,
+    macd_slow_window: int,
+    macd_signal_window: int,
+    cci_window: int,
+    williams_r_window: int,
+) -> int:
+    """The number of bars needed before every indicator's window has a
+    full history — shared by build_dataset (to know where to start) and
+    load_symbol_dataset (to know whether a symbol has enough history at
+    all)."""
+    return max(
+        sma_window,
+        ema_window,
+        rsi_window + 1,
+        vol_window + 1,
+        bar_momentum_window,
+        bollinger_window,
+        ao_slow_window,
+        macd_slow_window + macd_signal_window,
+        cci_window,
+        williams_r_window,
+    )
+
+
+def move(closes: list[float], i: int, horizon: int) -> float:
+    """Fractional price change from bar i to bar i+horizon — the raw
+    quantity both the label and the persistence baseline are built from.
+    Returns 0.0 if closes[i] is 0 (degenerate, shouldn't happen with real
+    price data) rather than dividing by zero."""
+    if closes[i] == 0:
+        return 0.0
+    return (closes[i + horizon] - closes[i]) / closes[i]
+
+
+def per_symbol_move_threshold(closes: list[float], warmup: int, horizon: int, top_fraction: float) -> float:
+    """The |move| cutoff that keeps only the most extreme `top_fraction`
+    of this symbol's horizon-length moves (e.g. top_fraction=0.3 keeps the
+    most extreme 30%), computed over the same candidate bars build_dataset
+    would consider. Sizing this per symbol, from that symbol's own move
+    distribution, is what makes a "top fraction" threshold mean the same
+    thing for a calm major (BTC) and a choppy altcoin, unlike one flat
+    percentage applied to both. Returns 0.0 (no filtering) when
+    top_fraction >= 1.0 or there isn't enough history to compute a
+    distribution from."""
+    if top_fraction >= 1.0:
+        return 0.0
+    magnitudes = [abs(move(closes, i, horizon)) for i in range(warmup - 1, len(closes) - horizon)]
+    if not magnitudes:
+        return 0.0
+    magnitudes.sort()
+    cutoff_index = int(len(magnitudes) * (1.0 - top_fraction))
+    cutoff_index = min(max(cutoff_index, 0), len(magnitudes) - 1)
+    return magnitudes[cutoff_index]
+
+
 def build_dataset(
     closes: list[float],
     midpoints: list[float],
@@ -257,29 +355,32 @@ def build_dataset(
     macd_signal_window: int,
     cci_window: int,
     williams_r_window: int,
-) -> tuple[list[list[float]], list[int]]:
-    """Builds (X, y) — X rows in FEATURE_ORDER, y = 1 if the bar right
-    after the features were computed closed higher, else 0. Skips the
-    warmup period before the largest window has a full history, so
-    training isn't dominated by the neutral 0.0 values indicators.py
-    returns before there's enough history (a real, if rare, condition
-    live too, but not one worth over-representing in a training set)."""
-    warmup = max(
-        sma_window,
-        ema_window,
-        rsi_window + 1,
-        vol_window + 1,
-        bar_momentum_window,
-        bollinger_window,
-        ao_slow_window,
-        macd_slow_window + macd_signal_window,
-        cci_window,
-        williams_r_window,
+    horizon: int = 1,
+    min_move_threshold: float = 0.0,
+) -> tuple[list[list[float]], list[int], list[int]]:
+    """Builds (X, y, indices) — X rows in FEATURE_ORDER, y = 1 if the bar
+    `horizon` bars after the features were computed closed higher, else 0,
+    and `indices` is the bar index `i` each row was computed as-of (needed
+    by callers to score a matching persistence baseline on exactly the
+    same rows). Skips the warmup period before the largest window has a
+    full history, so training isn't dominated by the neutral 0.0 values
+    indicators.py returns before there's enough history. When
+    min_move_threshold > 0, also skips any bar whose |move| over the
+    horizon doesn't clear it — see the module docstring for --min-move /
+    --top-fraction."""
+    warmup = dataset_warmup(
+        sma_window, ema_window, rsi_window, vol_window, bar_momentum_window,
+        bollinger_window, ao_slow_window, macd_slow_window, macd_signal_window,
+        cci_window, williams_r_window,
     )
     X: list[list[float]] = []
     y: list[int] = []
-    # i is the bar the features are computed as-of; i+1 is the label bar.
-    for i in range(warmup - 1, len(closes) - 1):
+    indices: list[int] = []
+    # i is the bar the features are computed as-of; i+horizon is the label bar.
+    for i in range(warmup - 1, len(closes) - horizon):
+        bar_move = move(closes, i, horizon)
+        if abs(bar_move) < min_move_threshold:
+            continue
         feats = features_at(
             closes,
             midpoints,
@@ -302,13 +403,20 @@ def build_dataset(
             williams_r_window,
         )
         X.append([feats[name] for name in FEATURE_ORDER])
-        y.append(1 if closes[i + 1] > closes[i] else 0)
-    return X, y
+        y.append(1 if bar_move > 0 else 0)
+        indices.append(i)
+    return X, y, indices
+
+
+def split_point(n: int, test_fraction: float) -> int:
+    """The index that divides n time-ordered rows into (1 - test_fraction)
+    train / test_fraction test, keeping at least one row on each side."""
+    split = int(n * (1 - test_fraction))
+    return max(1, min(n - 1, split))
 
 
 def time_ordered_split(X: list, y: list, test_fraction: float):
-    split = int(len(X) * (1 - test_fraction))
-    split = max(1, min(len(X) - 1, split))  # keep at least one row on each side
+    split = split_point(len(X), test_fraction)
     return X[:split], y[:split], X[split:], y[split:]
 
 
@@ -318,53 +426,74 @@ def majority_class_accuracy(y_train: list[int], y_test: list[int]) -> float:
     return correct / len(y_test)
 
 
-def persistence_accuracy(closes: list[float], warmup: int, split_index: int) -> float:
-    """"Predict the same direction as the most recent completed move" —
-    for label index i (predicting closes[i+1] vs closes[i]), the most
-    recent completed move is closes[i] vs closes[i-1]."""
+def persistence_correct_and_total(closes: list[float], indices: list[int], horizon: int) -> tuple[int, int]:
+    """"Predict the same direction as the most recent completed
+    horizon-length move" — for label index i (predicting closes[i+horizon]
+    vs closes[i]), the most recent completed move of the same length is
+    closes[i] vs closes[i-horizon]. Evaluated only over the given
+    `indices` (the exact rows a dataset kept, post min-move/top-fraction
+    filtering) so the baseline is scored on the same bars the model is,
+    not a differently-filtered set. Returns (correct, total) rather than
+    a ratio so callers can aggregate across symbols before dividing."""
     correct = 0
     total = 0
-    for i in range(warmup - 1 + split_index, len(closes) - 1):
-        if i == 0:
+    for i in indices:
+        if i - horizon < 0:
             continue
-        predicted_up = closes[i] > closes[i - 1]
-        actual_up = closes[i + 1] > closes[i]
+        predicted_up = closes[i] > closes[i - horizon]
+        actual_up = closes[i + horizon] > closes[i]
         correct += int(predicted_up == actual_up)
         total += 1
-    return correct / total if total else 0.0
+    return correct, total
 
 
 def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: argparse.Namespace):
-    """Loads and builds one symbol's (X, y) dataset plus everything needed
-    to time-split it and score a persistence baseline against it. Returns
-    None (after printing a warning) rather than raising if this symbol
-    doesn't have enough history yet — that lets pooling skip a thin symbol
-    instead of aborting the whole run over one gap."""
+    """Loads and builds one symbol's (X, y, indices) dataset plus
+    everything needed to time-split it and score a persistence baseline
+    against it. Returns None (after printing a warning) rather than
+    raising if this symbol doesn't have enough history yet — that lets
+    pooling skip a thin symbol instead of aborting the whole run over one
+    gap.
+
+    `window_args` is expected to carry (in addition to the indicator
+    window params) `horizon`, `min_move`, and `top_fraction` — see the
+    module docstring for what those do. The effective per-symbol move
+    threshold is the *larger* of the fixed --min-move and the --top-
+    fraction cutoff computed from this symbol's own move distribution, so
+    both constraints hold when both are given."""
     closes, midpoints, highs, lows = load_ohlc(conn, symbol, interval_minutes)
 
-    warmup = max(
+    horizon = getattr(window_args, "horizon", 1)
+    min_move = getattr(window_args, "min_move", 0.0)
+    top_fraction = getattr(window_args, "top_fraction", 1.0)
+
+    warmup = dataset_warmup(
         window_args.sma_window,
         window_args.ema_window,
-        window_args.rsi_window + 1,
-        window_args.vol_window + 1,
+        window_args.rsi_window,
+        window_args.vol_window,
         window_args.bar_momentum_window,
         window_args.bollinger_window,
         window_args.ao_slow_window,
-        window_args.macd_slow_window + window_args.macd_signal_window,
+        window_args.macd_slow_window,
+        window_args.macd_signal_window,
         window_args.cci_window,
         window_args.williams_r_window,
     )
-    min_required = warmup + 10  # a little slack beyond bare warmup so there's an actual dataset, not one row
+    min_required = warmup + horizon + 10  # a little slack beyond bare warmup so there's an actual dataset, not one row
     if len(closes) < min_required:
         print(
             f"warning: skipping {symbol} — only {len(closes)} candles at interval={interval_minutes}min, "
-            f"need at least {min_required} (warmup={warmup}, driven by whichever window is largest — "
-            "ao_slow_window, macd_slow_window+macd_signal_window, etc. — + a handful of rows to train/test on).",
+            f"need at least {min_required} (warmup={warmup} + horizon={horizon}, driven by whichever window is "
+            "largest — ao_slow_window, macd_slow_window+macd_signal_window, etc. — + a handful of rows to train/test on).",
             file=sys.stderr,
         )
         return None
 
-    X, y = build_dataset(
+    quantile_threshold = per_symbol_move_threshold(closes, warmup, horizon, top_fraction)
+    min_move_threshold = max(min_move, quantile_threshold)
+
+    X, y, indices = build_dataset(
         closes,
         midpoints,
         highs,
@@ -383,8 +512,19 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
         window_args.macd_signal_window,
         window_args.cci_window,
         window_args.williams_r_window,
+        horizon=horizon,
+        min_move_threshold=min_move_threshold,
     )
-    return {"symbol": symbol, "closes": closes, "warmup": warmup, "X": X, "y": y}
+    return {
+        "symbol": symbol,
+        "closes": closes,
+        "warmup": warmup,
+        "horizon": horizon,
+        "min_move_threshold": min_move_threshold,
+        "X": X,
+        "y": y,
+        "indices": indices,
+    }
 
 
 def resolve_symbols(conn, symbol_arg: str, interval_minutes: int) -> list[str]:
@@ -425,6 +565,9 @@ def main() -> None:
     parser.add_argument("--macd-signal-window", type=int, default=9)
     parser.add_argument("--cci-window", type=int, default=20)
     parser.add_argument("--williams-r-window", type=int, default=14)
+    parser.add_argument("--horizon", type=int, default=1, help="Label bar i by the direction of the move to bar i+horizon (default 1 = next-bar direction).")
+    parser.add_argument("--min-move", type=float, default=0.0, help="Drop rows whose |move| over --horizon is smaller than this fraction (e.g. 0.02 = 2%%). Default 0.0 = no filtering.")
+    parser.add_argument("--top-fraction", type=float, default=1.0, help="Keep only the most extreme fraction of each symbol's moves (e.g. 0.3 = top/bottom 30%%), computed per symbol. Default 1.0 = no filtering. Combined with --min-move via max() when both are set.")
     parser.add_argument("--test-fraction", type=float, default=0.2, help="Fraction of each symbol's (time-ordered) data held out for testing.")
     parser.add_argument("--kind", choices=["logistic", "gboost"], default="logistic")
     parser.add_argument("--model-out", default=None, help="Defaults to models/<symbol>_<kind>.joblib, or models/pooled_<kind>.joblib when pooling more than one symbol.")
@@ -461,25 +604,21 @@ def main() -> None:
     persistence_correct = 0
     persistence_total = 0
     for d in datasets:
-        sym_X_train, sym_y_train, sym_X_test, sym_y_test = time_ordered_split(d["X"], d["y"], args.test_fraction)
+        split = split_point(len(d["X"]), args.test_fraction)
+        sym_X_train, sym_y_train, sym_idx_train = d["X"][:split], d["y"][:split], d["indices"][:split]
+        sym_X_test, sym_y_test, sym_idx_test = d["X"][split:], d["y"][split:], d["indices"][split:]
         X_train.extend(sym_X_train)
         y_train.extend(sym_y_train)
         X_test.extend(sym_X_test)
         y_test.extend(sym_y_test)
 
-        split_index = len(sym_X_train)
-        closes = d["closes"]
-        warmup = d["warmup"]
-        for i in range(warmup - 1 + split_index, len(closes) - 1):
-            if i == 0:
-                continue
-            predicted_up = closes[i] > closes[i - 1]
-            actual_up = closes[i + 1] > closes[i]
-            persistence_correct += int(predicted_up == actual_up)
-            persistence_total += 1
+        correct, total = persistence_correct_and_total(d["closes"], sym_idx_test, d["horizon"])
+        persistence_correct += correct
+        persistence_total += total
 
+        threshold_note = f", min_move_threshold={d['min_move_threshold']:.4f}" if d["min_move_threshold"] > 0 else ""
         print(f"[{d['symbol']}] {len(d['closes'])} candles, "
-              f"{len(sym_X_train)} train / {len(sym_X_test)} test rows", file=sys.stderr)
+              f"{len(sym_X_train)} train / {len(sym_X_test)} test rows (post-filtering{threshold_note})", file=sys.stderr)
 
     if len(set(y_train)) < 2:
         print("error: training labels are all one class — can't train a classifier on this window.", file=sys.stderr)

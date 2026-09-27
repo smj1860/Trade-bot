@@ -315,6 +315,64 @@ technical indicators get thrown at it — the next thing worth trying is a
 different label (a magnitude threshold, or a multi-bar-ahead horizon),
 not more data or more indicators in this same shape.
 
+## Label engineering: horizon + magnitude threshold (2026-09-26)
+
+Kraken's spot taker fee at the entry volume tier is 0.80% — a round trip
+(in + out) costs at least 1.6% before spread/slippage, so "did price go up
+or down" is the wrong question for a 1-hour-ahead label anyway: a bar that
+moves 0.1% and gets called "up" is not a trade worth making even if the
+label is technically correct. `scripts/train_model.py` gained two label
+knobs, combinable:
+
+- **`--horizon N`** — label bar `i` by the direction of the move to bar
+  `i+N`, instead of always `i+1`. Longer horizons give price more room to
+  make a real move (at the cost of overlapping, correlated label windows).
+- **`--min-move X`** / **`--top-fraction F`** — drop any row whose move
+  over the horizon doesn't clear a fixed fraction (`--min-move`) or the
+  most-extreme-`F`-fraction cutoff computed from *that symbol's own* move
+  distribution (`--top-fraction`, so the threshold means the same thing
+  for calm BTC and choppy DOGE instead of one flat percentage). When both
+  are given, whichever is larger for that symbol wins.
+
+The persistence baseline was updated to match: it now predicts the same
+direction as the most recent completed *horizon-length* move, and is
+scored only on the exact rows the min-move/top-fraction filtering kept —
+otherwise a "which baseline is stronger" comparison would silently be
+comparing accuracy on two different sets of bars. `build_dataset` now
+also returns each kept row's bar index, so a pooled run can score the
+baseline correctly per symbol even after filtering shrinks each symbol's
+row count differently. 9 new tests (126 total, all passing).
+
+Ran it for real, against the same pooled 13-symbol dataset (fetched live
+via the Supabase MCP tool), sizing the threshold above the actual 1.6%
+round-trip cost with a profit margin (4.5%), at two horizons:
+
+| | 1h (baseline) | 12h | 24h |
+|---|---|---|---|
+| threshold | none | 4.5% (or top 30%, per symbol) | 4.5% (or top 30%, per symbol) |
+| pooled rows | 8,944 | 1,173 | 2,049 |
+| train / test | 7,150 / 1,794 | 933 / 240 | 1,638 / 411 |
+| positive-label rate | 50.4% | 77.7% | 77.0% |
+| **model accuracy** | 0.514 | 0.625 | 0.650 |
+| majority-class baseline | 0.513 | **0.637** | **0.657** |
+| persistence baseline | 0.484 | 0.467 | 0.399 |
+
+**Filtering to big moves didn't create an easier problem — it created a
+skewed one.** Over this particular ~1-month window, most moves large
+enough to clear 4.5% happened to be *up* moves (77% positive-label rate,
+vs. the roughly 50/50 split at 1h), which makes "always predict up" a
+strong baseline almost by definition — 0.637–0.657 accuracy just from
+guessing the majority class every time. The model still doesn't beat that
+strengthened baseline at either horizon. Two honest caveats, not spin:
+this dataset is one month of a market that was mostly trending up over
+that stretch, so the 77% skew is a property of *this sample window*, not
+necessarily a durable fact about crypto; and filtering shrinks the dataset
+hard (roughly 9,000 rows down to ~1,200–2,000), which is its own separate
+reason results here carry less statistical weight than the unfiltered
+runs. The label change was worth making — it's the economically correct
+question to ask — but by itself, with only one month of history, it
+hasn't produced a model that's actually tradeable either.
+
 ### Indicators considered but not (yet) added
 
 A few other well-known technical indicators, and why they're not here:
@@ -348,12 +406,20 @@ A few other well-known technical indicators, and why they're not here:
 - Try daily (1440-minute) candles too — more history per candle, a
   possibly less noisy target, at the cost of far fewer completed bars per
   unit time.
-- A better label than raw next-bar direction (e.g. a magnitude threshold,
-  or a multi-bar-ahead horizon) — next-bar direction is the simplest
-  possible thing to try first, not the right final target, and now the
-  clearest lead after three rounds of indicators and multi-symbol pooling
-  both failed to move accuracy meaningfully past the majority-class
-  baseline.
+- More history above all else: every round so far — three of indicators,
+  one of pooling, one of label engineering — has run into the same wall,
+  ~1 month of hourly candles per symbol. The label-engineering round
+  specifically showed that a magnitude-thresholded label needs enough
+  history that "moves big enough to clear the threshold" isn't dominated
+  by whichever direction happened to trend during that one month. Without
+  more history, `--horizon`/`--min-move`/`--top-fraction` can be re-run
+  as data accumulates, but a truly different verdict is unlikely from the
+  same month of data sliced a different way.
+- Once real trending-vs-ranging periods are represented (which needs
+  multiple months, not one), the label-engineering approach here should
+  be revisited — it's still the economically correct question (a label
+  that ignores trading costs was always going to be an odd thing to
+  train on), just underpowered on a month of mostly-one-direction data.
 - Once a model actually beats its baselines convincingly, wire
   `feature_order` into `strategy_config.toml` and switch
   `strategy.model.kind` to `"sklearn"` — not before.
