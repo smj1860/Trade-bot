@@ -38,32 +38,62 @@ factor. Two knobs loosen it, and can be combined:
   --min-move X      Drop any row whose |move| over the horizon is smaller
                      than X (a fraction, e.g. 0.02 = 2%) — filters out the
                      noisy near-zero moves a 1-bar label is forced to call
-                     one way or the other. Size this above your actual
-                     round-trip trading cost (Kraken's spot taker fee plus
-                     spread) plus a profit margin, or a "correct" label is
-                     still a loser after costs.
+                     one way or the other. Defaults to None, meaning "derive
+                     it from real trading costs" — see --taker-fee /
+                     --profit-margin below — rather than an arbitrary
+                     number; pass this explicitly to override that.
 
-  --top-fraction F  Instead of (or combined with) a fixed --min-move,
-                     keep only the most extreme F fraction of moves (e.g.
-                     0.3 = keep the top/bottom 30%), computed *per symbol*
-                     from that symbol's own horizon-move distribution —
-                     this adapts to each symbol's own volatility instead
-                     of one flat percentage meaning something very
-                     different for BTC than for a high-volatility altcoin.
-                     When both --min-move and --top-fraction are given,
-                     whichever threshold is larger for that symbol wins,
-                     so both constraints hold.
+  --top-fraction F  Instead of (or combined with) --min-move, keep only
+                     the most extreme F fraction of moves (e.g. 0.3 = keep
+                     the top/bottom 30%), computed *per symbol* from that
+                     symbol's own horizon-move distribution — this adapts
+                     to each symbol's own volatility instead of one flat
+                     percentage meaning something very different for BTC
+                     than for a high-volatility altcoin. When both
+                     --min-move (or its derived default) and --top-fraction
+                     apply, whichever threshold is larger for that symbol
+                     wins, so both constraints hold.
+
+  --taker-fee X     Kraken's spot taker fee as a fraction (default 0.008 =
+                     0.80%, the entry 30-day-volume tier — see Kraken's fee
+                     schedule for higher tiers). Used, doubled for a round
+                     trip (enter + exit), to derive --min-move's default
+                     when --min-move isn't given explicitly: a label that
+                     doesn't clear real trading costs isn't a trade worth
+                     labeling "correct" even if the price direction call
+                     was right.
+
+  --profit-margin X Required edge *above* breakeven (a fraction, default
+                     0.0), added to the round-trip cost when deriving
+                     --min-move's default. E.g. --profit-margin 0.01 with
+                     the default 0.008 taker fee requires a move worth at
+                     least 1.6% (round-trip cost) + 1% (margin) = 2.6%
+                     before a row counts as a labeled trade.
+
+This turns the label into something closer to "simulated paper trading":
+instead of asking "did price go up or down" (or even "did it move a lot"),
+every row that survives filtering represents a hypothetical round-trip
+trade that would have cleared real transaction costs. The script goes a
+step further and simulates the actual money each evaluated strategy would
+have made on the held-out test period — see "Evaluated against" below —
+using historical data now rather than waiting weeks/months for a live
+paper-trading feed to accumulate the same information forward.
 
 Evaluated against two baselines so a small accuracy edge doesn't get
-oversold:
+oversold, on both classification accuracy AND simulated net P&L (mean
+per-trade return after the same round-trip cost, on the test period):
   - majority-class baseline: always predict whichever direction was more
     common in the (post-filtering) training set
   - persistence baseline: predict the same direction as the most recent
     completed horizon-length move (a classic "trend continues" naive
     forecaster), evaluated on the same filtered rows the model is scored
     on, so it's an apples-to-apples comparison
-If the trained model can't beat both by a meaningful margin, that's a real
-result to know, not a reason to hide the run.
+Net P&L is the metric that actually matters for a trading strategy — a
+model can have higher accuracy than a baseline and still make less money
+per trade (or lose money) if its correct calls are on smaller moves and
+its wrong calls are on larger ones. If the trained model can't beat both
+baselines' net P&L by a meaningful margin, that's a real result to know,
+not a reason to hide the run.
 
 Train/test split is time-ordered (earliest N% train, latest test) —
 never shuffled — because shuffling would let the model train on rows that
@@ -336,6 +366,32 @@ def per_symbol_move_threshold(closes: list[float], warmup: int, horizon: int, to
     return magnitudes[cutoff_index]
 
 
+def net_pnl(closes: list[float], i: int, horizon: int, predicted_up: bool, round_trip_cost: float) -> float:
+    """The simulated net return of one paper trade: go long if
+    `predicted_up`, short otherwise, held from bar i to bar i+horizon,
+    minus `round_trip_cost` (both legs' fees, e.g. 2x Kraken's taker fee).
+    This is the actual paper-trading question — not "was the direction
+    call right" but "would this specific trade have made money after real
+    costs" — and can be computed directly over historical closes rather
+    than waiting for a live paper-trading feed to accumulate the same
+    information forward in real time."""
+    actual_move = move(closes, i, horizon)
+    directional_return = actual_move if predicted_up else -actual_move
+    return directional_return - round_trip_cost
+
+
+def simulate_net_pnl(closes: list[float], indices: list[int], horizon: int, predictions: list[int], round_trip_cost: float) -> tuple[float, int]:
+    """Total and count of simulated net P&L (see net_pnl()) across every
+    (index, prediction) pair — `predictions` must be 1 (predicted up) or 0
+    (predicted down), aligned 1:1 with `indices`. Returns (total, count)
+    rather than a mean so callers can aggregate across symbols before
+    dividing."""
+    total = 0.0
+    for i, pred in zip(indices, predictions):
+        total += net_pnl(closes, i, horizon, predicted_up=bool(pred), round_trip_cost=round_trip_cost)
+    return total, len(indices)
+
+
 def build_dataset(
     closes: list[float],
     midpoints: list[float],
@@ -456,16 +512,23 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
     gap.
 
     `window_args` is expected to carry (in addition to the indicator
-    window params) `horizon`, `min_move`, and `top_fraction` — see the
-    module docstring for what those do. The effective per-symbol move
-    threshold is the *larger* of the fixed --min-move and the --top-
-    fraction cutoff computed from this symbol's own move distribution, so
-    both constraints hold when both are given."""
+    window params) `horizon`, `min_move`, `top_fraction`, `taker_fee`, and
+    `profit_margin` — see the module docstring for what those do. When
+    `min_move` is None (the default), it's derived from real trading costs
+    (2x taker_fee, for a round trip) plus profit_margin, rather than an
+    arbitrary number. The effective per-symbol move threshold is then the
+    *larger* of that (or the explicit --min-move override) and the
+    --top-fraction cutoff computed from this symbol's own move
+    distribution, so both constraints hold when both apply."""
     closes, midpoints, highs, lows = load_ohlc(conn, symbol, interval_minutes)
 
     horizon = getattr(window_args, "horizon", 1)
-    min_move = getattr(window_args, "min_move", 0.0)
     top_fraction = getattr(window_args, "top_fraction", 1.0)
+    taker_fee = getattr(window_args, "taker_fee", 0.008)
+    profit_margin = getattr(window_args, "profit_margin", 0.0)
+    round_trip_cost = 2.0 * taker_fee
+    explicit_min_move = getattr(window_args, "min_move", None)
+    min_move = explicit_min_move if explicit_min_move is not None else (round_trip_cost + profit_margin)
 
     warmup = dataset_warmup(
         window_args.sma_window,
@@ -521,6 +584,7 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
         "warmup": warmup,
         "horizon": horizon,
         "min_move_threshold": min_move_threshold,
+        "round_trip_cost": round_trip_cost,
         "X": X,
         "y": y,
         "indices": indices,
@@ -566,8 +630,10 @@ def main() -> None:
     parser.add_argument("--cci-window", type=int, default=20)
     parser.add_argument("--williams-r-window", type=int, default=14)
     parser.add_argument("--horizon", type=int, default=1, help="Label bar i by the direction of the move to bar i+horizon (default 1 = next-bar direction).")
-    parser.add_argument("--min-move", type=float, default=0.0, help="Drop rows whose |move| over --horizon is smaller than this fraction (e.g. 0.02 = 2%%). Default 0.0 = no filtering.")
-    parser.add_argument("--top-fraction", type=float, default=1.0, help="Keep only the most extreme fraction of each symbol's moves (e.g. 0.3 = top/bottom 30%%), computed per symbol. Default 1.0 = no filtering. Combined with --min-move via max() when both are set.")
+    parser.add_argument("--min-move", type=float, default=None, help="Drop rows whose |move| over --horizon is smaller than this fraction (e.g. 0.02 = 2%%). Default None = derive it from real trading costs (2x --taker-fee + --profit-margin) instead of an arbitrary number.")
+    parser.add_argument("--top-fraction", type=float, default=1.0, help="Keep only the most extreme fraction of each symbol's moves (e.g. 0.3 = top/bottom 30%%), computed per symbol. Default 1.0 = no filtering. Combined with --min-move (or its derived default) via max() when both are set.")
+    parser.add_argument("--taker-fee", type=float, default=0.008, help="Kraken's spot taker fee as a fraction (default 0.008 = 0.80%%, the entry 30-day-volume tier). Doubled for a round trip, used to derive --min-move's default.")
+    parser.add_argument("--profit-margin", type=float, default=0.0, help="Required edge above breakeven (a fraction, default 0.0), added to round-trip cost when deriving --min-move's default.")
     parser.add_argument("--test-fraction", type=float, default=0.2, help="Fraction of each symbol's (time-ordered) data held out for testing.")
     parser.add_argument("--kind", choices=["logistic", "gboost"], default="logistic")
     parser.add_argument("--model-out", default=None, help="Defaults to models/<symbol>_<kind>.joblib, or models/pooled_<kind>.joblib when pooling more than one symbol.")
@@ -603,14 +669,30 @@ def main() -> None:
     y_test: list[int] = []
     persistence_correct = 0
     persistence_total = 0
+    # Per-symbol test-set bookkeeping (closes, indices, horizon, cost, and
+    # the [start, end) slice into the pooled X_test/y_test) so predictions
+    # from a single pooled model.predict(X_test) call can be sliced back out
+    # per symbol afterwards to simulate net P&L against that symbol's own
+    # closes/horizon/cost.
+    per_symbol_test: list[dict] = []
     for d in datasets:
         split = split_point(len(d["X"]), args.test_fraction)
         sym_X_train, sym_y_train, sym_idx_train = d["X"][:split], d["y"][:split], d["indices"][:split]
         sym_X_test, sym_y_test, sym_idx_test = d["X"][split:], d["y"][split:], d["indices"][split:]
         X_train.extend(sym_X_train)
         y_train.extend(sym_y_train)
+        test_start = len(X_test)
         X_test.extend(sym_X_test)
         y_test.extend(sym_y_test)
+        per_symbol_test.append({
+            "symbol": d["symbol"],
+            "closes": d["closes"],
+            "horizon": d["horizon"],
+            "round_trip_cost": d["round_trip_cost"],
+            "idx_test": sym_idx_test,
+            "start": test_start,
+            "end": len(X_test),
+        })
 
         correct, total = persistence_correct_and_total(d["closes"], sym_idx_test, d["horizon"])
         persistence_correct += correct
@@ -638,6 +720,47 @@ def main() -> None:
     baseline_accuracy = majority_class_accuracy(y_train, y_test)
     persistence_baseline = persistence_correct / persistence_total if persistence_total else 0.0
 
+    # Simulated net P&L: the model's predictions on the pooled test set,
+    # sliced back per symbol so each trade's return is computed against
+    # that symbol's own closes/horizon/round_trip_cost, then aggregated —
+    # see net_pnl()/simulate_net_pnl() and the module docstring.
+    model_predictions = list(model.predict(X_test))
+    majority_class = 1 if sum(y_train) >= len(y_train) / 2 else 0
+
+    model_pnl_total, model_pnl_count = 0.0, 0
+    majority_pnl_total, majority_pnl_count = 0.0, 0
+    persistence_pnl_total, persistence_pnl_count = 0.0, 0
+    for entry in per_symbol_test:
+        sym_predictions = model_predictions[entry["start"] : entry["end"]]
+        total, count = simulate_net_pnl(
+            entry["closes"], entry["idx_test"], entry["horizon"], sym_predictions, entry["round_trip_cost"]
+        )
+        model_pnl_total += total
+        model_pnl_count += count
+
+        majority_predictions = [majority_class] * len(entry["idx_test"])
+        total, count = simulate_net_pnl(
+            entry["closes"], entry["idx_test"], entry["horizon"], majority_predictions, entry["round_trip_cost"]
+        )
+        majority_pnl_total += total
+        majority_pnl_count += count
+
+        persistence_predictions = [
+            1 if entry["closes"][i] > entry["closes"][i - entry["horizon"]] else 0
+            for i in entry["idx_test"]
+            if i - entry["horizon"] >= 0
+        ]
+        persistence_indices = [i for i in entry["idx_test"] if i - entry["horizon"] >= 0]
+        total, count = simulate_net_pnl(
+            entry["closes"], persistence_indices, entry["horizon"], persistence_predictions, entry["round_trip_cost"]
+        )
+        persistence_pnl_total += total
+        persistence_pnl_count += count
+
+    model_mean_pnl = model_pnl_total / model_pnl_count if model_pnl_count else 0.0
+    majority_mean_pnl = majority_pnl_total / majority_pnl_count if majority_pnl_count else 0.0
+    persistence_mean_pnl = persistence_pnl_total / persistence_pnl_count if persistence_pnl_count else 0.0
+
     if args.model_out:
         model_out = args.model_out
     elif pooling:
@@ -653,12 +776,23 @@ def main() -> None:
     print(f"  model accuracy:              {model_accuracy:.3f}", file=sys.stderr)
     print(f"  majority-class baseline:     {baseline_accuracy:.3f}", file=sys.stderr)
     print(f"  persistence baseline:        {persistence_baseline:.3f}", file=sys.stderr)
+    print(f"  --- simulated net P&L per trade (after round-trip cost) ---", file=sys.stderr)
+    print(f"  model:                       {model_mean_pnl:+.4f} ({model_pnl_count} trades, total {model_pnl_total:+.4f})", file=sys.stderr)
+    print(f"  majority-class baseline:     {majority_mean_pnl:+.4f} ({majority_pnl_count} trades, total {majority_pnl_total:+.4f})", file=sys.stderr)
+    print(f"  persistence baseline:        {persistence_mean_pnl:+.4f} ({persistence_pnl_count} trades, total {persistence_pnl_total:+.4f})", file=sys.stderr)
     print(f"  saved model to:              {model_out}", file=sys.stderr)
     print(f"  feature_order for strategy_config.toml: {FEATURE_ORDER}", file=sys.stderr)
     if model_accuracy <= max(baseline_accuracy, persistence_baseline):
         print(
             "  WARNING: model did not beat both naive baselines on this test split — "
             "do not treat this as a validated trading model. See docs/model-training.md.",
+            file=sys.stderr,
+        )
+    if model_mean_pnl <= max(majority_mean_pnl, persistence_mean_pnl):
+        print(
+            "  WARNING: model did not beat both naive baselines' simulated net P&L — "
+            "a model can have higher accuracy and still make less money per trade. "
+            "See docs/model-training.md.",
             file=sys.stderr,
         )
 

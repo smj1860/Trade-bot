@@ -397,6 +397,80 @@ A few other well-known technical indicators, and why they're not here:
   indicators; skipped for now since nothing built here needs that level of
   sophistication yet, and simpler indicators haven't shown signal.
 
+### Net P&L / simulated paper-trade label (2026-09-26)
+
+The horizon+threshold round above sized the label's magnitude threshold at
+a flat, chosen number (4.5%, "cover the round-trip cost plus a profit").
+The natural next question — "what about running training on paper trades?"
+— split into two different things:
+
+1. **Live/forward paper trading**: extend `engine.py`'s `dry_run_only`
+   path to simulate fills and accumulate real P&L over weeks/months. Real,
+   but slow, and only reflects whatever policy generates the trades.
+2. **Offline net-P&L label refinement** (this round): keep using existing
+   historical OHLC data, but stop treating "--min-move" as an arbitrary
+   number and instead **derive it directly from Kraken's real trading
+   costs**, and evaluate models on **simulated net P&L** (what an actual
+   paper trade would have made after real round-trip costs), not just
+   classification accuracy. No waiting required — this is computed
+   directly over history that already exists.
+
+Concretely, in `scripts/train_model.py`:
+
+- `--taker-fee` (default 0.008 = Kraken's entry-tier 0.80% taker fee) and
+  `--profit-margin` (default 0.0) combine into a round-trip cost
+  (`2 * taker_fee + profit_margin`), which is now `--min-move`'s **default**
+  whenever `--min-move` is omitted (its new default is `None`, meaning
+  "derive it," rather than an arbitrary flat number like the 4.5% used
+  above). An explicit `--min-move` still overrides this.
+- `net_pnl(closes, i, horizon, predicted_up, round_trip_cost)` computes one
+  simulated trade's net return: the actual directional move (inverted if
+  the call was "down"/short) minus the round-trip cost.
+  `simulate_net_pnl(...)` aggregates this across a set of (index,
+  prediction) pairs, returning `(total, count)` so results can be summed
+  across pooled symbols before dividing into a mean.
+- `main()` now prints simulated net P&L per trade (and the total over the
+  test period) for the trained model, the majority-class baseline, and the
+  persistence baseline — not just their classification accuracy — because
+  a model can have higher accuracy than a baseline and still lose more
+  money per trade if its correct calls are on smaller moves and its wrong
+  calls are on larger ones.
+
+**Ran it for real**, against the same pooled 13-symbol dataset (723 hourly
+candles/symbol), at the fee-derived default threshold (1.6% = 2×0.8%
+taker fee, no profit margin) and a couple of variations, for comparison:
+
+| | 12h, fee-derived (1.6%) | 12h, fee-derived + 1% margin (2.6%) | 24h, fee-derived (1.6%) | 12h, flat 4.5% (prior round) |
+|---|---|---|---|---|
+| test rows | 842 | 542 | 1,127 | 245 |
+| model accuracy | 0.552 | 0.576 | 0.618 | 0.624 |
+| majority-class accuracy | 0.637 | 0.625 | 0.643 | 0.637 |
+| **model net P&L/trade** | -0.0155 | -0.0096 | -0.0030 | +0.0045 |
+| **majority net P&L/trade** | -0.0043 | -0.0021 | **+0.0036** | +0.0066 |
+| **persistence net P&L/trade** | -0.0166 | -0.0194 | -0.0197 | -0.0248 |
+
+**Honest read: net P&L is a harsher, more informative test than accuracy,
+and by that test nothing here is tradeable yet.** At the fee-derived
+1.6%/2.6% thresholds, *every* strategy — model and both baselines — loses
+money per trade on average, because most rows just barely clear the
+threshold (a move a little over 1.6% still routinely reverses or gives
+back the edge within the horizon) — moving the threshold up to 24h/1.6%
+gets the majority-class baseline barely net-positive (+0.0036/trade), and
+only the previously-tried, much stricter 4.5% flat threshold (which throws
+away most of the data down to 245 test rows) got the model itself
+net-positive, and even there the majority-class baseline still edges it
+out. This confirms two things at once: the net-P&L metric is doing its
+job (accuracy alone was hiding real economics — a model with 0.552-0.624
+accuracy can still lose money after costs), and the underlying problem
+from every round so far persists — one month of mostly-one-direction data
+isn't enough to find a threshold/horizon combination where a *trained*
+model actually beats naive baselines on real money, not just direction
+calls. The fee-derived default is still the economically correct place to
+start (a threshold below real costs was always going to produce
+unprofitable "correct" calls by definition), but validating this
+approach for real needs the same thing every prior round has been
+missing: more history spanning more than one trend regime.
+
 ### Not yet done / natural next steps
 
 - More history: 723 hourly candles is thin for training; either let the

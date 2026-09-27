@@ -23,9 +23,11 @@ from scripts.train_model import (
     list_available_symbols,
     load_symbol_dataset,
     move,
+    net_pnl,
     per_symbol_move_threshold,
     persistence_correct_and_total,
     resolve_symbols,
+    simulate_net_pnl,
     split_point,
     time_ordered_split,
 )
@@ -118,7 +120,11 @@ def test_load_symbol_dataset_builds_when_enough_history(monkeypatch):
     midpoints = [(h + l) / 2.0 for h, l in zip(highs, lows)]
     monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: (closes, midpoints, highs, lows))
 
-    result = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=_make_window_args())
+    # min_move=0.0 explicitly: this test is about the warmup-skip behavior,
+    # not about the fee-derived default threshold (net-P&L labeling is
+    # covered separately below) — the synthetic closes here move ~0.1%/bar,
+    # far below the default derived threshold, which would filter every row.
+    result = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=_make_window_args(min_move=0.0))
     assert result is not None
     assert result["symbol"] == "BTC-USD"
     assert len(result["X"]) == len(result["y"])
@@ -248,3 +254,93 @@ def test_split_point_keeps_at_least_one_row_each_side():
     assert split_point(10, 0.2) == 8
     assert split_point(2, 0.5) == 1
     assert split_point(1, 0.5) == 1
+
+
+def test_net_pnl_long_call_subtracts_round_trip_cost():
+    closes = [100.0, 105.0]  # +5% move
+    # Called "up" (long) and it went up: raw return is the move itself,
+    # minus the round-trip cost.
+    assert net_pnl(closes, 0, 1, predicted_up=True, round_trip_cost=0.016) == pytest.approx(0.05 - 0.016)
+
+
+def test_net_pnl_short_call_inverts_the_move():
+    closes = [100.0, 105.0]  # +5% move
+    # Called "down" (short) but it went up: the trade loses the move's
+    # magnitude, then still pays the round-trip cost.
+    assert net_pnl(closes, 0, 1, predicted_up=False, round_trip_cost=0.016) == pytest.approx(-0.05 - 0.016)
+
+
+def test_net_pnl_short_call_correct_direction_is_profitable_after_cost():
+    closes = [100.0, 90.0]  # -10% move
+    assert net_pnl(closes, 0, 1, predicted_up=False, round_trip_cost=0.016) == pytest.approx(0.10 - 0.016)
+
+
+def test_simulate_net_pnl_aggregates_total_and_count_across_rows():
+    closes = [100.0, 105.0, 110.0, 90.0]
+    # i=0: move=+5%, predicted up (1) -> 0.05 - cost
+    # i=1: move=+4.76...%, predicted down (0) -> -(that move) - cost
+    # i=2: move=(90-110)/110=-18.18...%, predicted down (0) -> +0.1818... - cost
+    indices = [0, 1, 2]
+    predictions = [1, 0, 0]
+    cost = 0.01
+    total, count = simulate_net_pnl(closes, indices, 1, predictions, cost)
+    expected_total = (
+        net_pnl(closes, 0, 1, predicted_up=True, round_trip_cost=cost)
+        + net_pnl(closes, 1, 1, predicted_up=False, round_trip_cost=cost)
+        + net_pnl(closes, 2, 1, predicted_up=False, round_trip_cost=cost)
+    )
+    assert count == 3
+    assert total == pytest.approx(expected_total)
+
+
+def test_simulate_net_pnl_empty_indices_returns_zero_count():
+    total, count = simulate_net_pnl([100.0, 101.0], [], 1, [], 0.01)
+    assert total == 0.0
+    assert count == 0
+
+
+def test_load_symbol_dataset_derives_min_move_from_fees_by_default(monkeypatch):
+    """With --min-move omitted (None, the default), the effective threshold
+    should be 2x taker_fee + profit_margin, not 0.0 — this is the "simulated
+    paper trading" behavior: a move that doesn't clear real round-trip costs
+    isn't a trade worth labeling, even if a smaller move would have been
+    a fine label under the old flat-threshold-free default."""
+    import scripts.train_model as train_model
+
+    n = 80
+    # Alternate small (~0.1%) and large (~5%) moves so filtering actually
+    # changes which rows survive.
+    closes = []
+    price = 100.0
+    for i in range(n):
+        price *= 1.05 if i % 5 == 0 else 1.001
+        closes.append(price)
+    highs = [c + 1.0 for c in closes]
+    lows = [c - 1.0 for c in closes]
+    midpoints = [(h + l) / 2.0 for h, l in zip(highs, lows)]
+    monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: (closes, midpoints, highs, lows))
+
+    unfiltered = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=_make_window_args(min_move=0.0))
+    derived = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=_make_window_args(taker_fee=0.008, profit_margin=0.0))
+
+    assert derived is not None and unfiltered is not None
+    assert derived["min_move_threshold"] == pytest.approx(0.016)
+    assert derived["round_trip_cost"] == pytest.approx(0.016)
+    assert len(derived["X"]) < len(unfiltered["X"])
+    for i in derived["indices"]:
+        assert abs(move(closes, i, 1)) >= 0.016
+
+
+def test_load_symbol_dataset_explicit_min_move_overrides_fee_derivation(monkeypatch):
+    import scripts.train_model as train_model
+
+    n = 80
+    closes = [100.0 + i * 0.1 for i in range(n)]
+    highs = [c + 1.0 for c in closes]
+    lows = [c - 1.0 for c in closes]
+    midpoints = [(h + l) / 2.0 for h, l in zip(highs, lows)]
+    monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: (closes, midpoints, highs, lows))
+
+    result = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=_make_window_args(min_move=0.0, taker_fee=0.008))
+    assert result is not None
+    assert result["min_move_threshold"] == pytest.approx(0.0)
