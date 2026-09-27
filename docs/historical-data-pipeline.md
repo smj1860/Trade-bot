@@ -246,6 +246,73 @@ explicitly rather than assuming a resolution. Not yet tested against a
 real multi-megabyte Kraken dump file end-to-end (only synthetic
 few-row CSVs so far).
 
+**Update (2026-09-27)**: this is the harder path in practice. Kraken's
+downloadable OHLCVT dumps are several multi-gigabyte zip files, and
+Stephen ran into a real-world snag getting them usable at all — Windows
+downloaded them with a `.txt` extension instead of `.zip` (a
+browser/server content-type quirk on large files), and OneDrive's sync
+churn on multi-GB files in a synced folder made the problem harder to
+diagnose (duplicate-named entries, stale "Type" column). Fixable (rename
+to `.zip`, move out of a synced folder, extract with 7-Zip), but fiddly
+enough that the trades-based approach below is the recommended path now.
+
+## Deep OHLC backfill from trade history (historical-data/backfill_ohlc_from_trades.py)
+
+An alternative to the CSV import above that needs no file download at
+all. Kraken's own support docs confirm the OHLC REST endpoint's ~1-month
+retention isn't going anywhere, but point at the fix directly: "For
+applications that require additional OHLC or tick data, it is possible
+to retrieve the entire trading history of our markets ... via the REST
+API Trades endpoint. The OHLC for any time frame and any interval can
+then be created from the historical time and sales data." The Trades
+endpoint has no meaningful retention limit — `since=0` pages through a
+pair's entire trade history.
+
+`historical-data/ohlc_from_trades.py` is the pure aggregation logic
+(`aggregate_trades_to_candles`): buckets a time-ordered trade stream into
+OHLCVT candles at any interval, streaming (never holds the whole history
+in memory) so it can run directly over `kraken_client.py`'s existing
+paginated `fetch_trades_window()`. `historical-data/backfill_ohlc_from_trades.py`
+drives it end-to-end for one symbol and upserts into the same
+`ohlc_candles` table as `backfill_ohlc.py`/`import_csv.py` (same
+`(exchange, symbol, interval, ts)` key), so it's safe to run alongside
+either.
+
+**Real measured throughput** (from actually calling Kraken's live API,
+not estimated): the Trades endpoint returns at most 1,000 trades per
+page, so pull time scales with each pair's trade volume, not with how
+much history is requested:
+
+| Symbol | Trades/day (measured) | Estimated time for 180 days |
+|---|---|---|
+| BTC-USD | ~57,000 | ~4.3 hours |
+| SOL-USD | ~32,400 | ~2.4 hours |
+| ETH-USD | ~25,300 | ~1.9 hours |
+| PENDLE-USD | ~3,000 | ~14 minutes |
+
+Majors are the slow ones; most of the altcoin universe here backfills in
+well under half an hour. Run per-symbol, not all 13 at once.
+
+**Verified**: `ohlc_from_trades.py`'s bucketing logic (bucket-boundary
+alignment to unix-epoch interval boundaries, OHLC/volume/trade-count
+aggregation, volume-weighted vwap, multi-bucket streaming, the
+zero-volume vwap guard) — 8 tests, all passing, against hand-built trade
+fixtures. The throughput numbers above are from real calls against
+Kraken's live Trades endpoint for BTC-USD, ETH-USD, SOL-USD, and
+PENDLE-USD (short windows, timed directly) — not the full 180-day pull
+itself, which hasn't been run end-to-end into Supabase yet (needs
+`SUPABASE_DB_URL`, which isn't set in this environment).
+
+**Running it**: `.github/workflows/historical-backfill-trades.yml` runs
+this on GitHub's own servers via manual dispatch (Actions tab -> "Run
+workflow" -> fill in symbol/interval/since_days) — no laptop needed, and
+it can run unattended for the hours a major pair takes. GitHub-hosted
+runners cap a single job at 6 hours regardless of `timeout-minutes`, so
+BTC-USD at 180 days is close to that ceiling; a smaller `--since-days` or
+running it locally (no such cap) are the fallbacks if a run times out
+partway through — a partial run is not wasted, since it upserts
+candles as it goes rather than only at the end.
+
 ## Not yet done
 
 - No feature-engineering or training-set-assembly layer yet — this

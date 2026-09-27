@@ -1,0 +1,58 @@
+name: Deep OHLC backfill from trade history
+
+# Runs historical-data/backfill_ohlc_from_trades.py on GitHub's own
+# servers, on demand — a one-off deep backfill (see that script's module
+# docstring), not a schedule. Kraken's OHLC REST endpoint only keeps ~1
+# month of history; this pulls from the Trades endpoint instead (no
+# meaningful retention limit) and aggregates it into OHLC candles itself.
+# This is slow for high-volume pairs (BTC-USD, ETH-USD can take a few
+# hours; low-volume altcoins take minutes) — see
+# docs/historical-data-pipeline.md for real measured rates. Run this once
+# per symbol from the Actions tab ("Run workflow"), not on a schedule.
+#
+# GitHub-hosted runners cap a single job at 6 hours regardless of
+# timeout-minutes — if a symbol's pull doesn't finish in that window
+# (BTC-USD at --since-days 180 is close to that limit), re-run with a
+# smaller --since-days, or run multiple shorter windows and let them
+# upsert into the same rows.
+#
+# Requires the same SUPABASE_DB_URL repository secret as
+# historical-backfill.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "Normalized symbol (e.g. BTC-USD) — one at a time, not a list"
+        required: true
+      interval:
+        description: "Candle resolution in minutes"
+        required: false
+        default: "60"
+      since_days:
+        description: "How far back to pull trade history from now"
+        required: false
+        default: "180"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355  # stay under GitHub-hosted runners' hard 6-hour job cap
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r historical-data/requirements.txt
+
+      - name: Run deep OHLC backfill from trades
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          python historical-data/backfill_ohlc_from_trades.py \
+            --symbol "${{ github.event.inputs.symbol }}" \
+            --interval "${{ github.event.inputs.interval }}" \
+            --since-days "${{ github.event.inputs.since_days }}"
