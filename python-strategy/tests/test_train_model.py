@@ -26,10 +26,15 @@ from scripts.train_model import (
     net_pnl,
     per_symbol_move_threshold,
     persistence_correct_and_total,
+    persistence_correct_and_total_from_labels,
     resolve_symbols,
     simulate_net_pnl,
+    simulate_triple_barrier_net_pnl,
     split_point,
     time_ordered_split,
+    triple_barrier_label,
+    triple_barrier_net_pnl,
+    triple_barrier_touch,
     walk_forward_splits,
 )
 
@@ -322,14 +327,15 @@ def test_load_symbol_dataset_derives_min_move_from_fees_by_default(monkeypatch):
     monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: (closes, midpoints, highs, lows))
 
     unfiltered = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=_make_window_args(min_move=0.0))
-    derived = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=_make_window_args(taker_fee=0.008, profit_margin=0.0))
+    derived = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=_make_window_args(taker_fee=0.008, slippage=0.0005, profit_margin=0.0))
 
     assert derived is not None and unfiltered is not None
-    assert derived["min_move_threshold"] == pytest.approx(0.016)
-    assert derived["round_trip_cost"] == pytest.approx(0.016)
+    # 2 * (taker_fee + slippage) = 2 * (0.008 + 0.0005) = 0.017
+    assert derived["min_move_threshold"] == pytest.approx(0.017)
+    assert derived["round_trip_cost"] == pytest.approx(0.017)
     assert len(derived["X"]) < len(unfiltered["X"])
     for i in derived["indices"]:
-        assert abs(move(closes, i, 1)) >= 0.016
+        assert abs(move(closes, i, 1)) >= 0.017
 
 
 def test_load_symbol_dataset_explicit_min_move_overrides_fee_derivation(monkeypatch):
@@ -408,3 +414,197 @@ def test_walk_forward_splits_remainder_absorbed_into_final_test_block():
     assert len(folds[0][3]) == 3          # first fold's test block: exactly one block
     assert len(folds[1][3]) == 11 - 3 - 3  # second (last) fold's test block absorbs the remainder
     assert sum(len(f[3]) for f in folds) + len(folds[0][0]) == 11  # every row accounted for
+
+
+def test_triple_barrier_touch_upper_touched_via_high_not_close():
+    # Bar 2 spikes above the upper barrier intrabar (high=106) even though
+    # its close (102) never gets there — the touch must be detected from
+    # the real high, not the close.
+    closes = [100.0, 101.0, 102.0, 999.0, 999.0]
+    highs = [100.0, 101.0, 106.0, 999.0, 999.0]
+    lows = [100.0, 99.0, 100.0, 999.0, 999.0]
+    touch, ret = triple_barrier_touch(highs, lows, closes, i=0, max_hold=4, barrier_pct=0.05)
+    assert touch == "upper"
+    assert ret == pytest.approx(0.05)
+
+
+def test_triple_barrier_touch_lower_touched_via_low_not_close():
+    closes = [100.0, 101.0, 96.0, 999.0, 999.0]
+    highs = [100.0, 101.0, 102.0, 999.0, 999.0]
+    lows = [100.0, 99.0, 94.0, 999.0, 999.0]
+    touch, ret = triple_barrier_touch(highs, lows, closes, i=0, max_hold=4, barrier_pct=0.05)
+    assert touch == "lower"
+    assert ret == pytest.approx(-0.05)
+
+
+def test_triple_barrier_touch_earlier_bar_wins_even_if_later_bar_touches_other_side():
+    # Bar 1 already touches the lower barrier; bar 2 touching the upper
+    # barrier afterward must not matter — the first touch along the path wins.
+    closes = [100.0, 94.0, 106.0, 999.0]
+    highs = [100.0, 95.0, 106.0, 999.0]
+    lows = [100.0, 94.0, 105.0, 999.0]
+    touch, ret = triple_barrier_touch(highs, lows, closes, i=0, max_hold=3, barrier_pct=0.05)
+    assert touch == "lower"
+    assert ret == pytest.approx(-0.05)
+
+
+def test_triple_barrier_touch_ambiguous_same_bar_returns_none():
+    # A single bar's high and low both cross their respective barriers —
+    # real OHLC data can't say which the price reached first intrabar.
+    closes = [100.0, 100.0]
+    highs = [100.0, 106.0]
+    lows = [100.0, 94.0]
+    touch, ret = triple_barrier_touch(highs, lows, closes, i=0, max_hold=1, barrier_pct=0.05)
+    assert touch is None
+    assert ret is None
+
+
+def test_triple_barrier_touch_timeout_marks_at_final_close():
+    # Neither barrier is touched within max_hold bars — mark at the
+    # vertical barrier's close instead.
+    closes = [100.0, 101.0, 102.0, 103.0, 104.0]
+    highs = [100.0, 101.0, 102.0, 103.0, 104.0]
+    lows = [100.0, 100.0, 101.0, 102.0, 103.0]
+    touch, ret = triple_barrier_touch(highs, lows, closes, i=0, max_hold=4, barrier_pct=0.05)
+    assert touch == "timeout"
+    assert ret == pytest.approx(0.04)
+
+
+def test_triple_barrier_touch_insufficient_history_returns_none():
+    closes = [100.0, 101.0, 102.0]
+    highs = closes[:]
+    lows = closes[:]
+    touch, ret = triple_barrier_touch(highs, lows, closes, i=0, max_hold=5, barrier_pct=0.05)
+    assert touch is None
+    assert ret is None
+
+
+def test_triple_barrier_touch_zero_entry_price_returns_none():
+    closes = [0.0, 1.0, 2.0]
+    highs = closes[:]
+    lows = closes[:]
+    touch, ret = triple_barrier_touch(highs, lows, closes, i=0, max_hold=2, barrier_pct=0.05)
+    assert touch is None
+    assert ret is None
+
+
+def test_triple_barrier_label_matches_touch_side():
+    closes = [100.0, 101.0, 102.0, 999.0]
+    highs_up = [100.0, 101.0, 106.0, 999.0]
+    lows_up = [100.0, 99.0, 100.0, 999.0]
+    assert triple_barrier_label(highs_up, lows_up, closes, i=0, max_hold=3, barrier_pct=0.05) == 1
+
+    highs_down = [100.0, 101.0, 102.0, 999.0]
+    lows_down = [100.0, 99.0, 94.0, 999.0]
+    assert triple_barrier_label(highs_down, lows_down, closes, i=0, max_hold=3, barrier_pct=0.05) == 0
+
+
+def test_triple_barrier_label_none_on_timeout_or_ambiguous():
+    closes = [100.0, 101.0, 102.0, 103.0]
+    flat_highs = [100.0, 101.0, 102.0, 103.0]
+    flat_lows = [100.0, 100.0, 101.0, 102.0]
+    assert triple_barrier_label(flat_highs, flat_lows, closes, i=0, max_hold=3, barrier_pct=0.05) is None
+
+    ambiguous_highs = [100.0, 106.0]
+    ambiguous_lows = [100.0, 94.0]
+    assert triple_barrier_label(ambiguous_highs, ambiguous_lows, [100.0, 100.0], i=0, max_hold=1, barrier_pct=0.05) is None
+
+
+def test_triple_barrier_net_pnl_long_call_on_upper_touch_subtracts_cost():
+    closes = [100.0, 101.0, 106.0, 999.0]
+    highs = [100.0, 101.0, 106.0, 999.0]
+    lows = [100.0, 99.0, 100.0, 999.0]
+    pnl = triple_barrier_net_pnl(highs, lows, closes, i=0, max_hold=3, barrier_pct=0.05, predicted_up=True, round_trip_cost=0.017)
+    assert pnl == pytest.approx(0.05 - 0.017)
+
+
+def test_triple_barrier_net_pnl_short_call_on_upper_touch_loses_the_move():
+    # Called "down" (short) but price touched the upper barrier first: the
+    # trade loses the barrier's magnitude, then still pays round-trip cost.
+    closes = [100.0, 101.0, 106.0, 999.0]
+    highs = [100.0, 101.0, 106.0, 999.0]
+    lows = [100.0, 99.0, 100.0, 999.0]
+    pnl = triple_barrier_net_pnl(highs, lows, closes, i=0, max_hold=3, barrier_pct=0.05, predicted_up=False, round_trip_cost=0.017)
+    assert pnl == pytest.approx(-0.05 - 0.017)
+
+
+def test_triple_barrier_net_pnl_none_when_touch_unresolved():
+    closes = [100.0, 101.0, 102.0]
+    highs = closes[:]
+    lows = closes[:]
+    assert triple_barrier_net_pnl(highs, lows, closes, i=0, max_hold=5, barrier_pct=0.05, predicted_up=True, round_trip_cost=0.017) is None
+
+
+def test_simulate_triple_barrier_net_pnl_aggregates_and_skips_unresolved():
+    # 7 bars so both index 0 and index 3 have a full max_hold=3 window to
+    # walk forward over.
+    closes = [100.0, 101.0, 106.0, 101.0, 96.0, 999.0, 999.0]
+    highs = [100.0, 101.0, 106.0, 101.0, 102.0, 999.0, 999.0]
+    lows = [100.0, 99.0, 100.0, 99.0, 95.0, 999.0, 999.0]
+    # index 0: entry 100, upper barrier 105 touched at bar 2 (high=106) ->
+    #   predicted up (correct) -> +0.05 - cost
+    # index 3: entry 101, lower barrier 95.95 touched at bar 4 (low=95) ->
+    #   predicted up (wrong) -> -0.05 - cost
+    total, count = simulate_triple_barrier_net_pnl(
+        highs, lows, closes, indices=[0, 3], horizon=3, barrier_pct=0.05, predictions=[1, 1], round_trip_cost=0.017
+    )
+    assert count == 2
+    assert total == pytest.approx((0.05 - 0.017) + (-0.05 - 0.017))
+
+
+def test_persistence_correct_and_total_from_labels_scores_against_given_labels():
+    closes = [100.0, 90.0, 110.0, 95.0, 120.0]
+    # horizon=1: predicted_up at i uses closes[i] vs closes[i-1].
+    # i=2: closes[2]=110 > closes[1]=90 -> predicted up (True)
+    # i=3: closes[3]=95 < closes[2]=110 -> predicted up (False)
+    indices = [2, 3]
+    y = [1, 0]  # matches predictions exactly -> both correct
+    correct, total = persistence_correct_and_total_from_labels(closes, indices, y, horizon=1)
+    assert (correct, total) == (2, 2)
+
+    y_wrong = [0, 1]  # both wrong relative to persistence's prediction
+    correct, total = persistence_correct_and_total_from_labels(closes, indices, y_wrong, horizon=1)
+    assert (correct, total) == (0, 2)
+
+
+def test_persistence_correct_and_total_from_labels_skips_out_of_range_index():
+    closes = [100.0, 101.0]
+    correct, total = persistence_correct_and_total_from_labels(closes, indices=[0], y=[1], horizon=1)
+    assert (correct, total) == (0, 0)  # i - horizon < 0, skipped
+
+
+def test_build_dataset_triple_barrier_scheme_drops_timeouts_and_labels_by_touch(monkeypatch):
+    # A long enough synthetic series with a clear upper-touch bar and a
+    # clear "nothing much happens" (timeout) stretch, to confirm
+    # build_dataset's triple-barrier branch labels the former and drops the
+    # latter, using highs/lows rather than move()'s close-only endpoint.
+    import scripts.train_model as train_model
+
+    n = 60
+    closes = [100.0 + (i % 3) * 0.01 for i in range(n)]  # nearly flat -> mostly timeouts
+    highs = list(closes)
+    lows = list(closes)
+    # Engineer one clear upper-barrier touch a few bars after warmup ends.
+    touch_i = 40
+    highs[touch_i + 2] = closes[touch_i] * 1.10  # well past a 5% barrier
+    lows[touch_i + 2] = closes[touch_i] * 1.09
+
+    warmup = train_model.dataset_warmup(
+        sma_window=5, ema_window=5, rsi_window=5, vol_window=5, bar_momentum_window=5,
+        bollinger_window=5, ao_slow_window=5, macd_slow_window=5, macd_signal_window=3,
+        cci_window=5, williams_r_window=5,
+    )
+    midpoints = [(h + l) / 2.0 for h, l in zip(highs, lows)]
+
+    X, y, indices = build_dataset(
+        closes, midpoints, highs, lows,
+        sma_window=5, ema_window=5, rsi_window=5, vol_window=5, bar_momentum_window=5,
+        bollinger_window=5, bollinger_num_std=2.0, ao_fast_window=3, ao_slow_window=5,
+        macd_fast_window=3, macd_slow_window=5, macd_signal_window=3, cci_window=5, williams_r_window=5,
+        horizon=4, min_move_threshold=0.05, label_scheme="triple-barrier",
+    )
+    assert touch_i in indices  # the engineered upper-touch bar survived filtering
+    assert y[indices.index(touch_i)] == 1
+    # Most of the flat stretch should have timed out and been dropped —
+    # far fewer surviving rows than warmup-to-end candidate bars.
+    assert len(X) < (n - warmup - 4)

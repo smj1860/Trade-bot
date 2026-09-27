@@ -56,28 +56,63 @@ factor. Two knobs loosen it, and can be combined:
 
   --taker-fee X     Kraken's spot taker fee as a fraction (default 0.008 =
                      0.80%, the entry 30-day-volume tier — see Kraken's fee
-                     schedule for higher tiers). Used, doubled for a round
-                     trip (enter + exit), to derive --min-move's default
-                     when --min-move isn't given explicitly: a label that
-                     doesn't clear real trading costs isn't a trade worth
-                     labeling "correct" even if the price direction call
-                     was right.
+                     schedule for higher tiers). Doubled for a round trip
+                     (enter + exit), and combined with --slippage, to
+                     derive --min-move's default when --min-move isn't
+                     given explicitly: a label that doesn't clear real
+                     trading costs isn't a trade worth labeling "correct"
+                     even if the price direction call was right.
+
+  --slippage X      Expected slippage per leg as a fraction (default
+                     0.0005 = 0.05%) — real spot execution rarely fills at
+                     the exact last-traded price, so this is folded into
+                     the same round-trip cost --taker-fee is, doubled the
+                     same way, before deriving --min-move's default. A
+                     label or a simulated trade that only subtracted fees
+                     would still be optimistic about what a live order
+                     actually nets.
 
   --profit-margin X Required edge *above* breakeven (a fraction, default
                      0.0), added to the round-trip cost when deriving
                      --min-move's default. E.g. --profit-margin 0.01 with
-                     the default 0.008 taker fee requires a move worth at
-                     least 1.6% (round-trip cost) + 1% (margin) = 2.6%
-                     before a row counts as a labeled trade.
+                     the default 0.008 taker fee and 0.0005 slippage
+                     requires a move worth at least 1.7% (round-trip fee +
+                     slippage) + 1% (margin) = 2.7% before a row counts as
+                     a labeled trade.
+
+  --label-scheme S  "fixed-horizon" (default, described above): labels by
+                     the sign of the *endpoint* move at bar i+horizon only.
+                     "triple-barrier": walks forward from bar i using each
+                     subsequent bar's real high/low (not just its close),
+                     and labels 1/0 by whichever of an upper (profit) or
+                     lower (stop) barrier — both sized from the same
+                     fee-derived --min-move threshold — is touched *first*
+                     within --horizon bars. A bar that never touches either
+                     barrier in time, or touches both within the same bar
+                     (real OHLC can't say which came first intrabar), is
+                     dropped rather than guessed. This is a materially
+                     different (and more realistic) label than
+                     fixed-horizon: it can drop a bar whose endpoint close
+                     *would* have cleared --min-move, if price touched the
+                     stop-loss barrier somewhere along the way and never
+                     recovered — exactly what a live stop-loss order would
+                     have closed out for a loss, which fixed-horizon has no
+                     way to see since it only checks where price ended up.
+                     See triple_barrier_label / triple_barrier_net_pnl.
 
 This turns the label into something closer to "simulated paper trading":
 instead of asking "did price go up or down" (or even "did it move a lot"),
 every row that survives filtering represents a hypothetical round-trip
-trade that would have cleared real transaction costs. The script goes a
-step further and simulates the actual money each evaluated strategy would
-have made on the held-out test period — see "Evaluated against" below —
-using historical data now rather than waiting weeks/months for a live
-paper-trading feed to accumulate the same information forward.
+trade that would have cleared real transaction costs (fees + slippage).
+The script goes a step further and simulates the actual money each
+evaluated strategy would have made on the held-out test period — see
+"Evaluated against" below — using historical data now rather than waiting
+weeks/months for a live paper-trading feed to accumulate the same
+information forward. With --label-scheme triple-barrier, that simulation
+also exits each trade at whichever barrier is touched first (or, on
+timeout, at the vertical barrier's close) instead of always holding to a
+fixed bar count, which is what a live stop-loss/take-profit order would
+actually do.
 
 Evaluated against two baselines so a small accuracy edge doesn't get
 oversold, on both classification accuracy AND simulated net P&L (mean
@@ -121,6 +156,11 @@ Usage:
     # whether a configuration holds up across multiple time periods before
     # committing to it with a normal (--folds 1, the default) run.
     python3 scripts/train_model.py --symbol all --horizon 12 --folds 5
+
+    # Triple-barrier labels instead of a fixed-horizon endpoint check —
+    # labels/evaluates against upper (profit) and lower (stop) barriers
+    # touched along the path, not just where price ends up 12 bars later:
+    python3 scripts/train_model.py --symbol all --horizon 12 --label-scheme triple-barrier
 
 Pooling ("--symbol" given a comma-separated list, or the literal "all")
 computes each symbol's features independently over its own close/high/low
@@ -399,6 +439,162 @@ def simulate_net_pnl(closes: list[float], indices: list[int], horizon: int, pred
     return total, len(indices)
 
 
+def triple_barrier_touch(
+    highs: list[float], lows: list[float], closes: list[float], i: int, max_hold: int, barrier_pct: float
+) -> tuple[str | None, float | None]:
+    """The core of triple-barrier labeling (--label-scheme triple-barrier):
+    from a hypothetical LONG entered at closes[i], walks forward bar by bar
+    (up to max_hold bars — the "vertical barrier") checking each bar's
+    *real* high/low, not just its close, for whichever of two barriers is
+    touched first: the upper barrier at closes[i] * (1 + barrier_pct) (a
+    profit target) or the lower barrier at closes[i] * (1 - barrier_pct) (a
+    stop-loss). barrier_pct is expected to already have real trading costs
+    baked in (round-trip fee + slippage + any required margin — the same
+    quantity --min-move derives by default for the fixed-horizon label —
+    see round_trip_cost), so a touch represents an actual executable,
+    cost-clearing move, not just "the price moved."
+
+    Checking every bar's high/low along the path (rather than only the
+    price at i+horizon, as the fixed-horizon label does) is what makes this
+    "triple-barrier": a real stop-loss or take-profit order fires the
+    moment price crosses it, not at a fixed bar count later regardless of
+    what happened in between — a bar can end back above its stop-loss level
+    at i+horizon and still have been legitimately stopped out along the
+    way, which the fixed-horizon label has no way to see.
+
+    Returns a (touch, long_return) pair:
+      ("upper", barrier_pct)   — the profit target was touched first.
+      ("lower", -barrier_pct)  — the stop-loss was touched first.
+      ("timeout", final_return) — neither barrier was touched within
+                                   max_hold bars; marked at bar i+max_hold's
+                                   close (final_return may be any sign or
+                                   magnitude smaller than barrier_pct).
+      (None, None)              — not enough remaining history to look
+                                   max_hold bars ahead, entry price is 0, or
+                                   a bar's high AND low both cross their
+                                   barrier in the same bar — real intrabar
+                                   OHLC data can't say which one price
+                                   actually reached first, so rather than
+                                   guess, this is left unresolved for the
+                                   caller to drop.
+
+    A short position's return over the same window is exactly the negative
+    of `long_return` — the exit trigger (which barrier, or the timeout) is
+    identical either way, since both barriers sit at symmetric distances
+    from entry."""
+    if i + max_hold >= len(closes):
+        return None, None
+    entry = closes[i]
+    if entry == 0:
+        return None, None
+    upper = entry * (1.0 + barrier_pct)
+    lower = entry * (1.0 - barrier_pct)
+    for j in range(i + 1, i + max_hold + 1):
+        hit_upper = highs[j] >= upper
+        hit_lower = lows[j] <= lower
+        if hit_upper and hit_lower:
+            return None, None  # ambiguous same-bar touch
+        if hit_upper:
+            return "upper", barrier_pct
+        if hit_lower:
+            return "lower", -barrier_pct
+    return "timeout", (closes[i + max_hold] - entry) / entry
+
+
+def triple_barrier_label(
+    highs: list[float], lows: list[float], closes: list[float], i: int, max_hold: int, barrier_pct: float
+) -> int | None:
+    """1 if the upper (profit) barrier is touched before the lower (stop)
+    barrier within max_hold bars, 0 if the lower is touched first, or None
+    if the position times out without touching either — no cost-clearing
+    move happened along the path, which build_dataset drops the row for,
+    the triple-barrier analogue of --min-move dropping a too-small endpoint
+    move — or the touch is ambiguous (see triple_barrier_touch)."""
+    touch, _ = triple_barrier_touch(highs, lows, closes, i, max_hold, barrier_pct)
+    if touch == "upper":
+        return 1
+    if touch == "lower":
+        return 0
+    return None  # "timeout" or unresolved
+
+
+def triple_barrier_net_pnl(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    i: int,
+    max_hold: int,
+    barrier_pct: float,
+    predicted_up: bool,
+    round_trip_cost: float,
+) -> float | None:
+    """The net_pnl() analogue for --label-scheme triple-barrier: the
+    simulated net return of one paper trade — long if predicted_up, short
+    otherwise — exited at whichever barrier is touched first (or, on
+    timeout, at the vertical barrier's close), rather than always at a
+    fixed bar count later. This is a more realistic P&L simulation for a
+    strategy that actually runs stop-loss/take-profit orders live. Returns
+    None on the same conditions triple_barrier_touch does (insufficient
+    history, zero entry price, or an ambiguous same-bar touch)."""
+    touch, long_return = triple_barrier_touch(highs, lows, closes, i, max_hold, barrier_pct)
+    if touch is None:
+        return None
+    directional_return = long_return if predicted_up else -long_return
+    return directional_return - round_trip_cost
+
+
+def simulate_triple_barrier_net_pnl(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    indices: list[int],
+    horizon: int,
+    barrier_pct: float,
+    predictions: list[int],
+    round_trip_cost: float,
+) -> tuple[float, int]:
+    """Same aggregation as simulate_net_pnl, but exits each simulated trade
+    via triple_barrier_net_pnl (whichever barrier is touched first, or the
+    vertical barrier's close) instead of always at bar i+horizon. Rows
+    where the touch is unresolved are skipped rather than guessed — this
+    should be rare here in practice (these are the same indices a
+    triple-barrier dataset already filtered to have a resolvable touch),
+    but the check is kept defensive since a caller could pass indices from
+    elsewhere."""
+    total = 0.0
+    count = 0
+    for i, pred in zip(indices, predictions):
+        pnl = triple_barrier_net_pnl(highs, lows, closes, i, horizon, barrier_pct, predicted_up=bool(pred), round_trip_cost=round_trip_cost)
+        if pnl is None:
+            continue
+        total += pnl
+        count += 1
+    return total, count
+
+
+def persistence_correct_and_total_from_labels(
+    closes: list[float], indices: list[int], y: list[int], horizon: int
+) -> tuple[int, int]:
+    """Same "predict the same direction as the most recent completed
+    horizon-length move" persistence baseline as
+    persistence_correct_and_total, but scored against the dataset's actual
+    labels `y` (aligned 1:1 with `indices`) instead of recomputing "actual
+    up" from closes[i+horizon] > closes[i]. Needed for --label-scheme
+    triple-barrier, where the label is which barrier was touched along the
+    path, not simply the sign of the endpoint move — for the fixed-horizon
+    label the two are equivalent, which is why persistence_correct_and_total
+    (kept as-is, unchanged) is still what the fixed-horizon path uses."""
+    correct = 0
+    total = 0
+    for i, actual in zip(indices, y):
+        if i - horizon < 0:
+            continue
+        predicted_up = closes[i] > closes[i - horizon]
+        correct += int(predicted_up == bool(actual))
+        total += 1
+    return correct, total
+
+
 def build_dataset(
     closes: list[float],
     midpoints: list[float],
@@ -420,17 +616,31 @@ def build_dataset(
     williams_r_window: int,
     horizon: int = 1,
     min_move_threshold: float = 0.0,
+    label_scheme: str = "fixed-horizon",
 ) -> tuple[list[list[float]], list[int], list[int]]:
-    """Builds (X, y, indices) — X rows in FEATURE_ORDER, y = 1 if the bar
-    `horizon` bars after the features were computed closed higher, else 0,
-    and `indices` is the bar index `i` each row was computed as-of (needed
-    by callers to score a matching persistence baseline on exactly the
-    same rows). Skips the warmup period before the largest window has a
+    """Builds (X, y, indices) — X rows in FEATURE_ORDER, `indices` is the
+    bar index `i` each row was computed as-of (needed by callers to score a
+    matching persistence baseline on exactly the same rows), and y depends
+    on `label_scheme`:
+
+      "fixed-horizon" (default): y = 1 if the bar `horizon` bars after the
+        features were computed closed higher, else 0. Skips any bar whose
+        |move| over the horizon doesn't clear min_move_threshold — see the
+        module docstring for --min-move / --top-fraction.
+
+      "triple-barrier": y = 1 if a hypothetical long entered at bar i would
+        touch an upper (profit) barrier at min_move_threshold above entry
+        before a lower (stop) barrier the same distance below it, within
+        `horizon` bars — 0 if the lower barrier is touched first. Checks
+        every bar's real high/low along the path (see triple_barrier_label),
+        not just the endpoint, so it reflects what a live stop-loss/
+        take-profit order would actually experience. Skips any bar whose
+        path times out without touching either barrier, or whose touch is
+        ambiguous (ends up None — see triple_barrier_label).
+
+    Either way, skips the warmup period before the largest window has a
     full history, so training isn't dominated by the neutral 0.0 values
-    indicators.py returns before there's enough history. When
-    min_move_threshold > 0, also skips any bar whose |move| over the
-    horizon doesn't clear it — see the module docstring for --min-move /
-    --top-fraction."""
+    indicators.py returns before there's enough history."""
     warmup = dataset_warmup(
         sma_window, ema_window, rsi_window, vol_window, bar_momentum_window,
         bollinger_window, ao_slow_window, macd_slow_window, macd_signal_window,
@@ -439,11 +649,18 @@ def build_dataset(
     X: list[list[float]] = []
     y: list[int] = []
     indices: list[int] = []
-    # i is the bar the features are computed as-of; i+horizon is the label bar.
+    # i is the bar the features are computed as-of; i+horizon is the label bar
+    # (fixed-horizon) or the vertical barrier (triple-barrier).
     for i in range(warmup - 1, len(closes) - horizon):
-        bar_move = move(closes, i, horizon)
-        if abs(bar_move) < min_move_threshold:
-            continue
+        if label_scheme == "triple-barrier":
+            label = triple_barrier_label(highs, lows, closes, i, horizon, min_move_threshold)
+            if label is None:
+                continue
+        else:
+            bar_move = move(closes, i, horizon)
+            if abs(bar_move) < min_move_threshold:
+                continue
+            label = 1 if bar_move > 0 else 0
         feats = features_at(
             closes,
             midpoints,
@@ -466,7 +683,7 @@ def build_dataset(
             williams_r_window,
         )
         X.append([feats[name] for name in FEATURE_ORDER])
-        y.append(1 if bar_move > 0 else 0)
+        y.append(label)
         indices.append(i)
     return X, y, indices
 
@@ -551,21 +768,29 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
     gap.
 
     `window_args` is expected to carry (in addition to the indicator
-    window params) `horizon`, `min_move`, `top_fraction`, `taker_fee`, and
-    `profit_margin` — see the module docstring for what those do. When
-    `min_move` is None (the default), it's derived from real trading costs
-    (2x taker_fee, for a round trip) plus profit_margin, rather than an
-    arbitrary number. The effective per-symbol move threshold is then the
-    *larger* of that (or the explicit --min-move override) and the
-    --top-fraction cutoff computed from this symbol's own move
-    distribution, so both constraints hold when both apply."""
+    window params) `horizon`, `min_move`, `top_fraction`, `taker_fee`,
+    `profit_margin`, and `label_scheme` — see the module docstring for what
+    those do. When `min_move` is None (the default), it's derived from real
+    trading costs (2x taker_fee, for a round trip) plus profit_margin,
+    rather than an arbitrary number. The effective per-symbol move
+    threshold — used as --label-scheme fixed-horizon's endpoint-move
+    threshold, or as triple-barrier's barrier width, either way the same
+    fee-derived quantity — is then the *larger* of that (or the explicit
+    --min-move override) and the --top-fraction cutoff computed from this
+    symbol's own move distribution, so both constraints hold when both
+    apply."""
     closes, midpoints, highs, lows = load_ohlc(conn, symbol, interval_minutes)
 
     horizon = getattr(window_args, "horizon", 1)
     top_fraction = getattr(window_args, "top_fraction", 1.0)
     taker_fee = getattr(window_args, "taker_fee", 0.008)
+    slippage = getattr(window_args, "slippage", 0.0005)
     profit_margin = getattr(window_args, "profit_margin", 0.0)
-    round_trip_cost = 2.0 * taker_fee
+    label_scheme = getattr(window_args, "label_scheme", "fixed-horizon")
+    # Both legs' fee + slippage — a label or a simulated trade that only
+    # subtracted fees would be optimistic about what a live order actually
+    # fills at (see --slippage's help text).
+    round_trip_cost = 2.0 * (taker_fee + slippage)
     explicit_min_move = getattr(window_args, "min_move", None)
     min_move = explicit_min_move if explicit_min_move is not None else (round_trip_cost + profit_margin)
 
@@ -616,13 +841,18 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
         window_args.williams_r_window,
         horizon=horizon,
         min_move_threshold=min_move_threshold,
+        label_scheme=label_scheme,
     )
     return {
         "symbol": symbol,
         "closes": closes,
+        "highs": highs,
+        "lows": lows,
         "warmup": warmup,
         "horizon": horizon,
         "min_move_threshold": min_move_threshold,
+        "barrier_pct": min_move_threshold,  # same fee-derived quantity, used as the barrier width in triple-barrier mode
+        "label_scheme": label_scheme,
         "round_trip_cost": round_trip_cost,
         "X": X,
         "y": y,
@@ -660,12 +890,16 @@ def _train_and_evaluate(
     the held-out (X_test, y_test) plus the majority-class and persistence
     baselines. `per_symbol_test` carries, per pooled symbol, the (closes,
     horizon, round_trip_cost, idx_test, start, end) needed to slice pooled
-    predictions back out per symbol for net-P&L simulation (see
-    simulate_net_pnl). This is the one evaluation implementation shared by
-    the single-split path and every walk-forward fold, so both call one
-    tested codepath rather than risk two copies quietly drifting apart.
-    Returns a metrics dict; does not save the model — the caller decides
-    whether and where to persist it."""
+    predictions back out per symbol for net-P&L simulation, plus — only
+    when that symbol's `label_scheme` is "triple-barrier" — `highs`,
+    `lows`, and `barrier_pct`, needed to simulate P&L via the same
+    barrier-touch exit logic the labels themselves were built from (see
+    simulate_triple_barrier_net_pnl) rather than the fixed-horizon exit
+    (see simulate_net_pnl). This is the one evaluation implementation
+    shared by the single-split path and every walk-forward fold, so both
+    call one tested codepath rather than risk two copies quietly drifting
+    apart. Returns a metrics dict; does not save the model — the caller
+    decides whether and where to persist it."""
     if kind == "logistic":
         from sklearn.linear_model import LogisticRegression
 
@@ -686,17 +920,23 @@ def _train_and_evaluate(
     model_pnl_total = majority_pnl_total = persistence_pnl_total = 0.0
     model_pnl_count = majority_pnl_count = persistence_pnl_count = 0
     for entry in per_symbol_test:
+        triple_barrier = entry.get("label_scheme") == "triple-barrier"
+
+        def _simulate(indices: list[int], predictions: list[int]) -> tuple[float, int]:
+            if triple_barrier:
+                return simulate_triple_barrier_net_pnl(
+                    entry["highs"], entry["lows"], entry["closes"], indices, entry["horizon"],
+                    entry["barrier_pct"], predictions, entry["round_trip_cost"],
+                )
+            return simulate_net_pnl(entry["closes"], indices, entry["horizon"], predictions, entry["round_trip_cost"])
+
         sym_predictions = model_predictions[entry["start"] : entry["end"]]
-        total, count = simulate_net_pnl(
-            entry["closes"], entry["idx_test"], entry["horizon"], sym_predictions, entry["round_trip_cost"]
-        )
+        total, count = _simulate(entry["idx_test"], sym_predictions)
         model_pnl_total += total
         model_pnl_count += count
 
         majority_predictions = [majority_class] * len(entry["idx_test"])
-        total, count = simulate_net_pnl(
-            entry["closes"], entry["idx_test"], entry["horizon"], majority_predictions, entry["round_trip_cost"]
-        )
+        total, count = _simulate(entry["idx_test"], majority_predictions)
         majority_pnl_total += total
         majority_pnl_count += count
 
@@ -706,9 +946,7 @@ def _train_and_evaluate(
             if i - entry["horizon"] >= 0
         ]
         persistence_indices = [i for i in entry["idx_test"] if i - entry["horizon"] >= 0]
-        total, count = simulate_net_pnl(
-            entry["closes"], persistence_indices, entry["horizon"], persistence_predictions, entry["round_trip_cost"]
-        )
+        total, count = _simulate(persistence_indices, persistence_predictions)
         persistence_pnl_total += total
         persistence_pnl_count += count
 
@@ -817,13 +1055,20 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
             per_symbol_test.append({
                 "symbol": d["symbol"],
                 "closes": d["closes"],
+                "highs": d["highs"],
+                "lows": d["lows"],
                 "horizon": d["horizon"],
                 "round_trip_cost": d["round_trip_cost"],
+                "barrier_pct": d["barrier_pct"],
+                "label_scheme": d["label_scheme"],
                 "idx_test": sym_idx_test,
                 "start": test_start,
                 "end": len(X_test),
             })
-            correct, total = persistence_correct_and_total(d["closes"], sym_idx_test, d["horizon"])
+            if d["label_scheme"] == "triple-barrier":
+                correct, total = persistence_correct_and_total_from_labels(d["closes"], sym_idx_test, sym_y_test, d["horizon"])
+            else:
+                correct, total = persistence_correct_and_total(d["closes"], sym_idx_test, d["horizon"])
             persistence_correct += correct
             persistence_total += total
 
@@ -872,9 +1117,10 @@ def main() -> None:
     parser.add_argument("--cci-window", type=int, default=20)
     parser.add_argument("--williams-r-window", type=int, default=14)
     parser.add_argument("--horizon", type=int, default=1, help="Label bar i by the direction of the move to bar i+horizon (default 1 = next-bar direction).")
-    parser.add_argument("--min-move", type=float, default=None, help="Drop rows whose |move| over --horizon is smaller than this fraction (e.g. 0.02 = 2%%). Default None = derive it from real trading costs (2x --taker-fee + --profit-margin) instead of an arbitrary number.")
+    parser.add_argument("--min-move", type=float, default=None, help="Drop rows whose |move| over --horizon is smaller than this fraction (e.g. 0.02 = 2%%) (--label-scheme fixed-horizon), or the triple-barrier width (--label-scheme triple-barrier). Default None = derive it from real trading costs (2x --taker-fee + --slippage + --profit-margin) instead of an arbitrary number.")
     parser.add_argument("--top-fraction", type=float, default=1.0, help="Keep only the most extreme fraction of each symbol's moves (e.g. 0.3 = top/bottom 30%%), computed per symbol. Default 1.0 = no filtering. Combined with --min-move (or its derived default) via max() when both are set.")
     parser.add_argument("--taker-fee", type=float, default=0.008, help="Kraken's spot taker fee as a fraction (default 0.008 = 0.80%%, the entry 30-day-volume tier). Doubled for a round trip, used to derive --min-move's default.")
+    parser.add_argument("--slippage", type=float, default=0.0005, help="Expected slippage per leg as a fraction (default 0.0005 = 0.05%%) — an allowance for the fill price differing from the quoted price, doubled for a round trip just like --taker-fee, and added into --min-move's derived default alongside it. Real spot execution rarely fills at the exact last-traded price, so a label that only subtracts fees is still optimistic about what a live order would net.")
     parser.add_argument("--profit-margin", type=float, default=0.0, help="Required edge above breakeven (a fraction, default 0.0), added to round-trip cost when deriving --min-move's default.")
     parser.add_argument("--test-fraction", type=float, default=0.2, help="Fraction of each symbol's (time-ordered) data held out for testing.")
     parser.add_argument(
@@ -886,6 +1132,22 @@ def main() -> None:
         "N folds, each training on all data before it and testing on a different, later block, so "
         "the evaluation isn't always scored on just the most recent slice. Validation only — no "
         "model is saved in this mode.",
+    )
+    parser.add_argument(
+        "--label-scheme",
+        choices=["fixed-horizon", "triple-barrier"],
+        default="fixed-horizon",
+        help='"fixed-horizon" (default): label by the sign of the move to bar i+horizon, filtered by '
+        "--min-move/--top-fraction on that endpoint move only (see the module docstring). "
+        '"triple-barrier": walk forward from bar i using each subsequent bar\'s real high/low (not '
+        "just its close), and label 1/0 by whichever of an upper (profit) or lower (stop) barrier is "
+        "touched *first* within --horizon bars — both barriers sized from the same fee-derived "
+        "--min-move threshold fixed-horizon uses as its endpoint-move cutoff. A bar whose path never "
+        "touches either barrier in time (a timeout), or that touches both within the same bar (real "
+        "OHLC data can't say which came first intrabar), is dropped rather than guessed. This tracks "
+        "what a live strategy running real stop-loss/take-profit orders would actually experience, "
+        "instead of only checking where price ended up at a fixed bar count later — see "
+        "triple_barrier_label/triple_barrier_net_pnl.",
     )
     parser.add_argument("--kind", choices=["logistic", "gboost"], default="logistic")
     parser.add_argument("--model-out", default=None, help="Defaults to models/<symbol>_<kind>.joblib, or models/pooled_<kind>.joblib when pooling more than one symbol.")
@@ -943,14 +1205,21 @@ def main() -> None:
         per_symbol_test.append({
             "symbol": d["symbol"],
             "closes": d["closes"],
+            "highs": d["highs"],
+            "lows": d["lows"],
             "horizon": d["horizon"],
             "round_trip_cost": d["round_trip_cost"],
+            "barrier_pct": d["barrier_pct"],
+            "label_scheme": d["label_scheme"],
             "idx_test": sym_idx_test,
             "start": test_start,
             "end": len(X_test),
         })
 
-        correct, total = persistence_correct_and_total(d["closes"], sym_idx_test, d["horizon"])
+        if d["label_scheme"] == "triple-barrier":
+            correct, total = persistence_correct_and_total_from_labels(d["closes"], sym_idx_test, sym_y_test, d["horizon"])
+        else:
+            correct, total = persistence_correct_and_total(d["closes"], sym_idx_test, d["horizon"])
         persistence_correct += correct
         persistence_total += total
 
