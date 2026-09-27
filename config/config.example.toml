@@ -110,6 +110,20 @@ enabled = true
   max_order_size = "8000"       # ~$781 at the price observed during verification
   max_order_notional_usd = "800"
 
+[[symbols]]
+symbol = "ADA-USD"
+exchange = "kraken"
+exchange_native_symbol = "ADA/USD"  # Kraken WS v2 pair format
+rest_native_symbol = "ADAUSD"       # Kraken REST AddOrder altname — verified live via AssetPairs (2026-09-27)
+tick_size = "0.000001"      # verified live via AssetPairs (2026-09-27)
+lot_size = "0.00000001"     # verified live via AssetPairs (2026-09-27; lot_decimals=8)
+enabled = true
+
+  [symbols.risk]
+  max_position_usd = "2000"
+  max_order_size = "3115"       # ~$800 at the price observed during verification ($0.2568)
+  max_order_notional_usd = "800"
+
 # --- High-Beta L1 Momentum ---------------------------------------------------
 # High-speed breakout continuation, volatility expansion, sharp pullback
 # entries — sized smaller per order than the macro pair above given the
