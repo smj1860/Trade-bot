@@ -15,11 +15,16 @@ both logged when they block a trade:
      reject anyway; it is NOT a substitute for that risk engine, which
      stays the actual enforcement point.
 
-Orders built here are always MARKET orders. A first version has to pick
-something, and market orders let the Rust risk engine price against the
-live book (already tested) rather than requiring this layer to also
-decide a sensible limit price — a real limit-order strategy is a
-reasonable future addition, not a hard requirement for a working v1.
+Institutional audit Phase 1.3: orders built here are LIMIT/post-only by
+default (see `use_limit_orders`), priced to rest at the current best
+bid (BUY) / best ask (SELL) rather than cross the book — a market order's
+~0.8% one-way taker fee against a signal that hasn't cleared coin-flip
+accuracy is a guaranteed loser regardless of model quality (see the
+institutional audit). `use_limit_orders=False` restores the original
+always-MARKET behavior. The actual place -> wait -> cancel/reprice ->
+fallback-to-market lifecycle for a resting order lives in
+strategy/engine.py's `_manage_resting_order`, not here — this layer only
+decides *what* to submit first, not how to manage it afterward.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ from typing import Literal, Optional
 from strategy.features import Features
 
 Side = Literal["BUY", "SELL"]
+OrderType = Literal["MARKET", "LIMIT"]
 
 
 @dataclass(frozen=True)
@@ -40,6 +46,14 @@ class OrderIntent:
     side: Side
     quantity: Decimal
     signal: float  # carried through purely for logging/audit, not re-used downstream
+    order_type: OrderType = "MARKET"
+    # Set iff order_type == "LIMIT": the post-only price this order should
+    # rest at (current best bid for a BUY, current best ask for a SELL) —
+    # see this module's docstring and engine.py's _manage_resting_order,
+    # which re-derives a fresh price at each reprice attempt rather than
+    # reusing this one, since the book has likely moved by then. This
+    # field is only ever the *initial* price.
+    limit_price: Optional[Decimal] = None
 
 
 class DecisionPolicy:
@@ -50,11 +64,13 @@ class DecisionPolicy:
         cooldown_seconds: float,
         order_quantity: dict[str, Decimal],
         max_position: dict[str, Decimal],
+        use_limit_orders: bool = True,
     ) -> None:
         self._signal_threshold = signal_threshold
         self._cooldown_seconds = cooldown_seconds
         self._order_quantity = order_quantity
         self._max_position = max_position
+        self._use_limit_orders = use_limit_orders
         self._last_order_time: dict[str, float] = {}
 
     def decide(
@@ -83,4 +99,33 @@ class DecisionPolicy:
             return None
 
         self._last_order_time[features.symbol] = now
-        return OrderIntent(symbol=features.symbol, side=side, quantity=quantity, signal=signal)
+
+        if not self._use_limit_orders:
+            return OrderIntent(symbol=features.symbol, side=side, quantity=quantity, signal=signal)
+
+        limit_price = post_only_price(side, features.mid_price, features.spread)
+        return OrderIntent(
+            symbol=features.symbol,
+            side=side,
+            quantity=quantity,
+            signal=signal,
+            order_type="LIMIT",
+            limit_price=limit_price,
+        )
+
+
+def post_only_price(side: Side, mid_price: Decimal, spread: Decimal) -> Decimal:
+    """The post-only (maker) price to rest at: the current best bid for a
+    BUY, the current best ask for a SELL. `Features` carries `mid_price`
+    and `spread` rather than raw best bid/ask (see features.py), but since
+    `spread = best_ask - best_bid` and `mid_price = (best_bid + best_ask)
+    / 2`, both are exact inverses of those two — `best_bid = mid_price -
+    spread / 2`, `best_ask = mid_price + spread / 2` — so nothing is lost
+    recomputing them here rather than threading raw book levels through
+    Features just for this. Joining the best price (rather than improving
+    on it by a tick) is deliberately the simplest correct choice for a
+    first version: it's guaranteed non-crossing (see risk.rs's
+    check_post_only_would_not_cross) without needing this layer to also
+    know each symbol's tick size."""
+    half_spread = spread / 2
+    return mid_price - half_spread if side == "BUY" else mid_price + half_spread

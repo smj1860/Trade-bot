@@ -177,6 +177,15 @@ pub struct AddOrderRequest {
     pub client_order_id: String,
     /// When true, Kraken validates the request without placing it.
     pub validate: bool,
+    /// Institutional audit Phase 1.3: requests Kraken's `oflags=post`
+    /// (post-only). Kraken rejects the order outright rather than filling
+    /// it as a taker if its price would cross the book at submission
+    /// time — this is the exchange-side backstop for the maker/limit
+    /// order path (see order.rs and risk.rs's guardrails, which apply
+    /// their own client-side non-crossing check before an order ever gets
+    /// here). Meaningless for a market order; only set for `order_type ==
+    /// "limit"`.
+    pub post_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -345,6 +354,9 @@ impl KrakenRestClient {
         if let Some(price) = &req.price {
             form.push(("price", price.clone()));
         }
+        if req.post_only {
+            form.push(("oflags", "post".to_string()));
+        }
         if req.validate {
             form.push(("validate", "true".to_string()));
         }
@@ -361,15 +373,12 @@ impl KrakenRestClient {
         Ok(AddOrderOutcome::Accepted { exchange_order_id })
     }
 
-    /// Cancels a single resting order by its Kraken transaction ID.
-    /// Currently unused by any live order flow — every order this project
-    /// places today is a MARKET order, which Kraken either fills or
-    /// rejects immediately, leaving nothing resting to cancel. This
-    /// exists for the dead-man's switch (`heartbeat.rs`), which needs
-    /// *something* to call if the strategy process goes dark while an
-    /// order is resting, and becomes load-bearing the moment a maker/
-    /// limit-order path (see the institutional audit's Phase 1.3) adds
-    /// orders that actually rest on the book.
+    /// Cancels a single resting order by its Kraken transaction ID. Used
+    /// by the dead-man's switch (`heartbeat.rs`) when a strategy process
+    /// goes dark while an order is resting, and — as of institutional
+    /// audit Phase 1.3 — by `OrderServiceImpl::cancel_order` (order.rs),
+    /// which Python calls directly to manage a maker/limit order's
+    /// cancel-and-reprice lifecycle.
     ///
     /// Kraken's `count` field in a successful response can be 0 even
     /// without an `error` — e.g. the order already filled or was already

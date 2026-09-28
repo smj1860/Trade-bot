@@ -30,7 +30,7 @@ use crate::config::Config;
 use crate::guardrails;
 use crate::orderbook::SharedBooks;
 use crate::persistence::{FillRecord, Store};
-use crate::proto::pb::{OrderRequest, OrderSide};
+use crate::proto::pb::{OrderRequest, OrderSide, OrderType};
 
 /// Baseline window used for both the spread guard's rolling average and
 /// the volatility breaker's baseline distribution — matches
@@ -504,6 +504,25 @@ impl RiskEngine {
     /// check in `evaluate` already has its own independent protection
     /// (order size, notional, position caps) that doesn't depend on this
     /// history existing.
+    ///
+    /// Institutional audit Phase 1.3: a LIMIT order doesn't take liquidity
+    /// at submission time the way a MARKET order does — it rests on the
+    /// book, waiting to be someone else's counterparty. Walking the book
+    /// with `simulate_fill_price` and rejecting on "expected slippage" for
+    /// a resting order was evaluating a fill that was never going to
+    /// happen at submission time; the fix isn't to loosen the check, it's
+    /// to not run a market-fill simulation against an order that isn't a
+    /// market fill. What a LIMIT order needs instead is a guarantee it
+    /// won't silently become a taker: `check_post_only_would_not_cross`
+    /// below rejects a limit price that would immediately match the
+    /// opposite side, independent of (and before) Kraken's own
+    /// `oflags=post` doing the same thing exchange-side (see
+    /// kraken_rest.rs's AddOrderRequest::post_only) — belt and suspenders,
+    /// since this check runs before an order is ever sent and gives a
+    /// specific, attributable rejection reason rather than a bare Kraken
+    /// error. The spread guard still applies to both order types: a
+    /// dislocated book is a reason for caution about resting an order in
+    /// it too, not just about paying more to cross it.
     async fn check_slippage_and_spread(
         &self,
         order: &OrderRequest,
@@ -522,38 +541,50 @@ impl RiskEngine {
             return None; // crossed/locked book — nothing sane to check against
         }
         let mid = (best_bid + best_ask) / Decimal::TWO;
+        let is_limit_order = matches!(OrderType::try_from(order.r#type), Ok(OrderType::Limit));
 
-        // Slippage: walk the side of the book this order would actually
-        // consume (asks for a buy, bids for a sell) — the top-of-book
-        // price alone understates cost for anything bigger than the best
-        // level's own quantity.
-        let levels = match side {
-            OrderSide::Buy => book.ask_levels(50),
-            OrderSide::Sell => book.bid_levels(50),
-            _ => Vec::new(),
-        };
-        if let Some(fill_price) = guardrails::simulate_fill_price(&levels, qty) {
-            let Ok(max_slippage) = Decimal::from_str(&self.config.risk.global.max_slippage_pct) else {
-                return Some("invalid config: max_slippage_pct".to_string());
+        if is_limit_order {
+            if let Some(reason) =
+                check_post_only_would_not_cross(&order.symbol, side, mid_or_limit_price, best_bid, best_ask)
+            {
+                return Some(reason);
+            }
+        } else {
+            // Slippage: walk the side of the book this order would
+            // actually consume (asks for a buy, bids for a sell) — the
+            // top-of-book price alone understates cost for anything
+            // bigger than the best level's own quantity. Only meaningful
+            // for a MARKET order, which really does consume this
+            // liquidity right now — see this method's docs.
+            let levels = match side {
+                OrderSide::Buy => book.ask_levels(50),
+                OrderSide::Sell => book.bid_levels(50),
+                _ => Vec::new(),
             };
-            let slippage = guardrails::slippage_fraction(mid, fill_price);
-            if slippage > max_slippage {
+            if let Some(fill_price) = guardrails::simulate_fill_price(&levels, qty) {
+                let Ok(max_slippage) = Decimal::from_str(&self.config.risk.global.max_slippage_pct) else {
+                    return Some("invalid config: max_slippage_pct".to_string());
+                };
+                let slippage = guardrails::slippage_fraction(mid, fill_price);
+                if slippage > max_slippage {
+                    return Some(format!(
+                        "expected slippage {slippage} (fill price {fill_price} vs mid {mid}) exceeds \
+                         max_slippage_pct {max_slippage} for {} — book is too thin for this order size",
+                        order.symbol
+                    ));
+                }
+            } else {
+                // Not enough depth on the relevant side to fill this order
+                // at all — a market order this large has no honest
+                // "expected fill price" to check, which is itself the
+                // liquidity-vacuum condition this guardrail exists to
+                // catch.
                 return Some(format!(
-                    "expected slippage {slippage} (fill price {fill_price} vs mid {mid}) exceeds \
-                     max_slippage_pct {max_slippage} for {} — book is too thin for this order size",
+                    "order book for {} does not have enough depth on the {side:?} side to fill a {qty} order \
+                     — refusing to estimate slippage against a book this thin",
                     order.symbol
                 ));
             }
-        } else {
-            // Not enough depth on the relevant side to fill this order at
-            // all — a market/limit order this large has no honest
-            // "expected fill price" to check, which is itself the
-            // liquidity-vacuum condition this guardrail exists to catch.
-            return Some(format!(
-                "order book for {} does not have enough depth on the {side:?} side to fill a {qty} order \
-                 — refusing to estimate slippage against a book this thin",
-                order.symbol
-            ));
         }
 
         // Spread: current spread vs. this book's own rolling average,
@@ -708,6 +739,35 @@ impl RiskEngine {
     }
 }
 
+/// Institutional audit Phase 1.3's client-side post-only guarantee: a
+/// limit order that would already cross the book at submission time isn't
+/// a resting maker order, it's a market order wearing a limit price. A
+/// buy crosses once its price reaches the best ask (it would match, not
+/// rest, at that price and anything better); a sell crosses once its
+/// price reaches the best bid, symmetrically. Pure and synchronous so
+/// it's directly unit-testable without spinning up a book/engine — see
+/// `check_slippage_and_spread`'s docs for why this replaces the
+/// market-fill slippage simulation for a LIMIT order.
+fn check_post_only_would_not_cross(
+    symbol: &str,
+    side: OrderSide,
+    limit_price: Decimal,
+    best_bid: Decimal,
+    best_ask: Decimal,
+) -> Option<String> {
+    match side {
+        OrderSide::Buy if limit_price >= best_ask => Some(format!(
+            "limit price {limit_price} would cross the book (best ask {best_ask}) for {symbol} — \
+             a post-only/maker order must rest below the best ask, not take it"
+        )),
+        OrderSide::Sell if limit_price <= best_bid => Some(format!(
+            "limit price {limit_price} would cross the book (best bid {best_bid}) for {symbol} — \
+             a post-only/maker order must rest above the best bid, not take it"
+        )),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,6 +831,7 @@ mod tests {
             quantity: Some(PbDecimal { value: qty.into() }),
             limit_price: limit_price.map(|p| PbDecimal { value: p.into() }),
             strategy_id: "test-strategy".into(),
+            post_only: false,
         }
     }
 
@@ -784,6 +845,7 @@ mod tests {
             quantity: Some(PbDecimal { value: qty.into() }),
             limit_price: limit_price.map(|p| PbDecimal { value: p.into() }),
             strategy_id: "test-strategy".into(),
+            post_only: false,
         }
     }
 
@@ -1117,6 +1179,91 @@ mod tests {
         assert_eq!(engine.evaluate(&order).await, RiskVerdict::Approved);
     }
 
+    // --- Institutional audit Phase 1.3: LIMIT orders skip the market-fill
+    // slippage simulation and instead get a post-only non-crossing check
+    // (check_post_only_would_not_cross) ---
+
+    #[test]
+    fn post_only_check_approves_a_buy_that_rests_below_the_best_ask() {
+        let d = |s: &str| Decimal::from_str(s).unwrap();
+        assert_eq!(
+            check_post_only_would_not_cross("BTC-USD", OrderSide::Buy, d("29999"), d("29999"), d("30001")),
+            None
+        );
+    }
+
+    #[test]
+    fn post_only_check_rejects_a_buy_priced_at_or_through_the_best_ask() {
+        let d = |s: &str| Decimal::from_str(s).unwrap();
+        assert!(check_post_only_would_not_cross("BTC-USD", OrderSide::Buy, d("30001"), d("29999"), d("30001"))
+            .is_some());
+        assert!(check_post_only_would_not_cross("BTC-USD", OrderSide::Buy, d("30500"), d("29999"), d("30001"))
+            .is_some());
+    }
+
+    #[test]
+    fn post_only_check_approves_a_sell_that_rests_above_the_best_bid() {
+        let d = |s: &str| Decimal::from_str(s).unwrap();
+        assert_eq!(
+            check_post_only_would_not_cross("BTC-USD", OrderSide::Sell, d("30001"), d("29999"), d("30001")),
+            None
+        );
+    }
+
+    #[test]
+    fn post_only_check_rejects_a_sell_priced_at_or_through_the_best_bid() {
+        let d = |s: &str| Decimal::from_str(s).unwrap();
+        assert!(check_post_only_would_not_cross("BTC-USD", OrderSide::Sell, d("29999"), d("29999"), d("30001"))
+            .is_some());
+        assert!(check_post_only_would_not_cross("BTC-USD", OrderSide::Sell, d("29500"), d("29999"), d("30001"))
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn a_limit_order_far_too_large_for_the_book_to_fill_as_a_market_order_is_still_approved() {
+        // The whole point of this phase's fix: a resting LIMIT order isn't
+        // taking this liquidity, so the "book too thin to simulate a fill"
+        // rejection (see rejects_order_when_book_too_thin_to_estimate_slippage
+        // above, which covers the MARKET-order case) must NOT apply here.
+        let books = new_shared_books();
+        {
+            let mut guard = books.lock().await;
+            let mut book = OrderBook::new("BTC-USD");
+            book.apply_snapshot(
+                vec![(Decimal::from_str("29999").unwrap(), Decimal::from_str("1").unwrap())],
+                vec![(Decimal::from_str("30001").unwrap(), Decimal::from_str("0.01").unwrap())],
+            );
+            guard.insert("BTC-USD".to_string(), book);
+        }
+        let engine = RiskEngine::new(Arc::new(test_config()), books);
+        // Resting well below the best ask, so it doesn't cross — but wants
+        // more size (0.05, test_config's max_order_size) than the 0.01
+        // resting at the best ask, which would have failed the old
+        // market-fill-simulation check.
+        let order = buy_order("BTC-USD", "0.05", Some("29999"));
+        assert_eq!(engine.evaluate(&order).await, RiskVerdict::Approved);
+    }
+
+    #[tokio::test]
+    async fn a_limit_order_priced_through_the_book_is_rejected_as_not_actually_maker() {
+        let books = new_shared_books();
+        {
+            let mut guard = books.lock().await;
+            let mut book = OrderBook::new("BTC-USD");
+            book.apply_snapshot(
+                vec![(Decimal::from_str("29999").unwrap(), Decimal::from_str("1").unwrap())],
+                vec![(Decimal::from_str("30001").unwrap(), Decimal::from_str("1").unwrap())],
+            );
+            guard.insert("BTC-USD".to_string(), book);
+        }
+        let engine = RiskEngine::new(Arc::new(test_config()), books);
+        // A "limit" buy priced above the best ask would just be a
+        // disguised market order — the risk engine should catch this even
+        // before it reaches Kraken's own oflags=post rejection.
+        let order = buy_order("BTC-USD", "0.01", Some("31000"));
+        assert!(matches!(engine.evaluate(&order).await, RiskVerdict::Rejected(_)));
+    }
+
     /// Builds a book whose history contains a calm baseline (5 separate
     /// 1-second-apart clusters, each with 2 ticks so `window_parkinson_vol`
     /// has a real range to compute — see `MIN_BASELINE_BUCKETS`) older
@@ -1213,12 +1360,15 @@ mod tests {
         assert!(matches!(engine.evaluate(&growing_order).await, RiskVerdict::Rejected(_)));
 
         // A sell that only shrinks the existing long (never flips it) is
-        // still approved while frozen.
-        let reducing_order = sell_order("BTC-USD", "0.005", Some("100"));
+        // still approved while frozen. Priced above the book's best bid
+        // (110, per spiky_vol_book) so it doesn't trip the post-only
+        // non-crossing check (institutional audit Phase 1.3) — this test
+        // is about the volatility breaker, not post-only pricing.
+        let reducing_order = sell_order("BTC-USD", "0.005", Some("111"));
         assert_eq!(engine.evaluate(&reducing_order).await, RiskVerdict::Approved);
 
         // But a sell large enough to flip the position to short is not.
-        let flipping_order = sell_order("BTC-USD", "0.02", Some("100"));
+        let flipping_order = sell_order("BTC-USD", "0.02", Some("111"));
         assert!(matches!(engine.evaluate(&flipping_order).await, RiskVerdict::Rejected(_)));
     }
 

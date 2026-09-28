@@ -10,11 +10,13 @@ use tonic::{Request, Response, Status};
 
 use crate::config::Config;
 use crate::heartbeat::HeartbeatMonitor;
-use crate::kraken_rest::{AddOrderOutcome, AddOrderRequest, KrakenRestClient, OrderSide as KrakenSide};
+use crate::kraken_rest::{
+    AddOrderOutcome, AddOrderRequest, CancelOrderOutcome, KrakenRestClient, OrderSide as KrakenSide,
+};
 use crate::persistence::{order_status_label, OrderRecord, Store};
 use crate::proto::pb::{
-    order_service_server::OrderService, Heartbeat, HeartbeatAck, OrderRequest, OrderSide, OrderStatus, OrderType,
-    OrderUpdate, StreamOrderUpdatesRequest,
+    order_service_server::OrderService, CancelOrderRequest, CancelOrderResponse, CancelOutcome, Heartbeat,
+    HeartbeatAck, OrderRequest, OrderSide, OrderStatus, OrderType, OrderUpdate, StreamOrderUpdatesRequest,
 };
 use crate::risk::{RiskEngine, RiskVerdict};
 
@@ -267,6 +269,12 @@ impl OrderServiceImpl {
             price,
             client_order_id: order.client_order_id.clone(),
             validate: self.config.execution.dry_run,
+            // Only meaningful (and only requested) for a limit order — see
+            // AddOrderRequest's docs. `order.post_only` is Python's own
+            // request, but it's ignored outright for a market order rather
+            // than trusted blindly, since Kraken has no maker-only concept
+            // for an order type that's a taker by definition.
+            post_only: order_type == "limit" && order.post_only,
         };
 
         tracing::info!(
@@ -361,6 +369,84 @@ impl OrderService for OrderServiceImpl {
         Ok(Response::new(HeartbeatAck {
             heartbeat_timeout_secs: self.config.dead_man_switch.heartbeat_timeout_secs as i64,
         }))
+    }
+
+    /// Institutional audit Phase 1.3: lets Python actively manage a
+    /// resting limit order's lifecycle (see trading.proto's
+    /// CancelOrderRequest docs). Resolves `client_order_id` to Kraken's
+    /// own `exchange_order_id` via the persistence store — the same
+    /// lookup the dead-man's switch's own cancel path
+    /// (`heartbeat.rs::cancel_open_orders_for_strategy`) would need if it
+    /// operated on a single order rather than a whole strategy's worth.
+    /// A `Status::Err` here means a genuine plumbing failure (no
+    /// persistence store, no execution client); every legitimate business
+    /// outcome — unknown order, already closed, Kraken rejected the
+    /// cancel — is a normal `Ok(CancelOrderResponse)`, mirroring how
+    /// `submit_order`/`submit_internal` treat a risk/exchange rejection as
+    /// a successful RPC response, not a transport error.
+    async fn cancel_order(
+        &self,
+        request: Request<CancelOrderRequest>,
+    ) -> Result<Response<CancelOrderResponse>, Status> {
+        let client_order_id = request.into_inner().client_order_id;
+        if client_order_id.is_empty() {
+            return Err(Status::invalid_argument("client_order_id must not be empty"));
+        }
+
+        let Some(store) = &self.store else {
+            return Err(Status::failed_precondition(
+                "no persistence store configured — cannot resolve client_order_id to an exchange order id",
+            ));
+        };
+        let record = store.get_order(&client_order_id).map_err(|e| {
+            Status::internal(format!("failed to look up order {client_order_id}: {e}"))
+        })?;
+        let Some(record) = record else {
+            return Ok(Response::new(CancelOrderResponse {
+                outcome: CancelOutcome::UnknownOrder as i32,
+                detail: String::new(),
+            }));
+        };
+        if record.exchange_order_id.is_empty() {
+            // Risk-rejected, or a plumbing failure before Kraken ever
+            // assigned an id — nothing to cancel on the exchange, and
+            // "already closed" is the accurate framing (there was never
+            // anything resting).
+            return Ok(Response::new(CancelOrderResponse {
+                outcome: CancelOutcome::AlreadyClosed as i32,
+                detail: String::new(),
+            }));
+        }
+
+        let Some(client) = self.execution_clients.get(&record.exchange) else {
+            return Err(Status::failed_precondition(format!(
+                "no execution client configured for exchange '{}'",
+                record.exchange
+            )));
+        };
+
+        let outcome = client
+            .cancel_order(&record.exchange_order_id)
+            .await
+            .map_err(|e| Status::unavailable(format!("failed to reach Kraken: {e}")))?;
+
+        let response = match outcome {
+            CancelOrderOutcome::Canceled => {
+                store
+                    .update_order_status(&client_order_id, &record.exchange_order_id, "CANCELED", "", now_ns())
+                    .unwrap_or_else(|e| {
+                        tracing::error!(%client_order_id, error = %e, "failed to persist CANCELED status");
+                    });
+                CancelOrderResponse { outcome: CancelOutcome::Canceled as i32, detail: String::new() }
+            }
+            CancelOrderOutcome::AlreadyClosed => {
+                CancelOrderResponse { outcome: CancelOutcome::AlreadyClosed as i32, detail: String::new() }
+            }
+            CancelOrderOutcome::KrakenRejected { messages } => {
+                CancelOrderResponse { outcome: CancelOutcome::Rejected as i32, detail: messages.join("; ") }
+            }
+        };
+        Ok(Response::new(response))
     }
 
     async fn stream_order_updates(

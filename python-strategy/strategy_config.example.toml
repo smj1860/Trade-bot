@@ -107,3 +107,31 @@ level = "INFO"
 # and even then, the Rust core's own execution.dry_run still gates whether
 # Kraken actually places anything.
 dry_run_only = true
+
+# Institutional audit Phase 1.3: maker/limit order execution (see
+# strategy/policy.py and strategy/engine.py's _manage_resting_order). A
+# market order's ~0.8% one-way taker fee against a signal that hasn't
+# cleared coin-flip accuracy is a guaranteed loser regardless of model
+# quality — this is what makes the strategy layer worth trusting with real
+# money at all, independent of which model ends up live.
+#
+# When true, DecisionPolicy builds post-only LIMIT orders priced at the
+# current best bid (BUY) / best ask (SELL) instead of MARKET orders.
+use_limit_orders = true
+# How long to let a resting limit order sit before canceling and
+# repricing (or giving up). Keep this well under the Rust side's
+# dead_man_switch.heartbeat_timeout_secs (config/config.example.toml,
+# default 30s) — this strategy's heartbeat loop (see
+# connection.heartbeat_interval_secs above) keeps running independently
+# while an order rests, but a very long timeout here is still an easy way
+# to lose track of how stale a resting order's price has gotten.
+limit_order_timeout_secs = 5.0
+# How many times to cancel-and-reprice at the (possibly moved) best
+# bid/ask before giving up on the maker path for this order. 0 = place
+# once, cancel on timeout, never reprice.
+limit_reprice_attempts = 2
+# If still unfilled after exhausting limit_reprice_attempts, submit a
+# MARKET order for whatever quantity never filled (paying the taker fee
+# on just the leftover, rather than never completing the intended trade
+# at all). false abandons the remaining quantity instead.
+fallback_to_market = true

@@ -53,6 +53,7 @@ class ImbalanceMomentumStrategy(Strategy):
             cooldown_seconds=config.strategy.cooldown_seconds,
             order_quantity=config.strategy.order_quantity,
             max_position=config.portfolio.max_position,
+            use_limit_orders=config.execution.use_limit_orders,
         )
 
     def on_order_book_update(

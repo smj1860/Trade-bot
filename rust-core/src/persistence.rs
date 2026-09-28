@@ -418,6 +418,42 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Looks up a single order by its `client_order_id` — used by
+    /// institutional audit Phase 1.3's `CancelOrder` RPC to resolve the
+    /// `exchange_order_id` Kraken's `CancelOrder` REST endpoint actually
+    /// needs (Python only knows the client-generated id it submitted
+    /// with). `None` for an id this store never saw a submission for.
+    pub fn get_order(&self, client_order_id: &str) -> anyhow::Result<Option<OrderRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT client_order_id, exchange_order_id, symbol, exchange, side, order_type,
+                    quantity, limit_price, strategy_id, status, reject_reason, created_at_ns, updated_at_ns
+             FROM orders
+             WHERE client_order_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![client_order_id], |row| {
+            Ok(OrderRecord {
+                client_order_id: row.get(0)?,
+                exchange_order_id: row.get(1)?,
+                symbol: row.get(2)?,
+                exchange: row.get(3)?,
+                side: row.get(4)?,
+                order_type: row.get(5)?,
+                quantity: row.get(6)?,
+                limit_price: row.get(7)?,
+                strategy_id: row.get(8)?,
+                status: row.get(9)?,
+                reject_reason: row.get(10)?,
+                created_at_ns: row.get(11)?,
+                updated_at_ns: row.get(12)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -561,5 +597,36 @@ mod tests {
         // Should not error even though "co-unknown" was never inserted.
         store.update_order_status("co-unknown", "", "FILLED", "", 1).unwrap();
         assert!(store.load_open_orders().unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_order_finds_an_inserted_order_by_client_order_id() {
+        let store = Store::open_in_memory().unwrap();
+        let order = OrderRecord {
+            client_order_id: "co-2".to_string(),
+            exchange_order_id: "OK4GJX".to_string(),
+            symbol: "ETH-USD".to_string(),
+            exchange: "kraken".to_string(),
+            side: "SELL".to_string(),
+            order_type: "LIMIT".to_string(),
+            quantity: "0.5".to_string(),
+            limit_price: Some("2500".to_string()),
+            strategy_id: "test-strategy".to_string(),
+            status: "ACCEPTED".to_string(),
+            reject_reason: String::new(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+        };
+        store.upsert_order(&order).unwrap();
+
+        let found = store.get_order("co-2").unwrap().expect("should find the order just inserted");
+        assert_eq!(found.exchange_order_id, "OK4GJX");
+        assert_eq!(found.symbol, "ETH-USD");
+    }
+
+    #[test]
+    fn get_order_returns_none_for_an_unknown_client_order_id() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.get_order("co-unknown").unwrap().is_none());
     }
 }

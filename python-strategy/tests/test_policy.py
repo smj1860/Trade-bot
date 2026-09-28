@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from strategy.features import Features
-from strategy.policy import DecisionPolicy
+from strategy.policy import DecisionPolicy, post_only_price
 
 
 def make_features(symbol: str = "BTC-USD") -> Features:
@@ -86,3 +86,39 @@ def test_no_max_position_configured_for_symbol_means_no_soft_limit():
     policy = make_policy(order_quantity={"BTC-USD": Decimal("0.01")}, max_position={})
     intent = policy.decide(make_features(), signal=0.5, current_position=Decimal("1000"), now=0.0)
     assert intent is not None
+
+
+# --- Institutional audit Phase 1.3: maker/limit order intents ---
+
+
+def test_post_only_price_buy_is_the_best_bid():
+    # mid=100, spread=0.5 -> best_bid=99.75, best_ask=100.25
+    assert post_only_price("BUY", Decimal(100), Decimal("0.5")) == Decimal("99.75")
+
+
+def test_post_only_price_sell_is_the_best_ask():
+    assert post_only_price("SELL", Decimal(100), Decimal("0.5")) == Decimal("100.25")
+
+
+def test_default_policy_builds_a_limit_order_priced_at_the_best_bid_for_a_buy():
+    policy = make_policy()  # use_limit_orders defaults to True
+    intent = policy.decide(make_features(), signal=0.5, current_position=Decimal(0), now=0.0)
+    assert intent is not None
+    assert intent.order_type == "LIMIT"
+    assert intent.limit_price == Decimal("99.75")
+
+
+def test_default_policy_builds_a_limit_order_priced_at_the_best_ask_for_a_sell():
+    policy = make_policy()
+    intent = policy.decide(make_features(), signal=-0.5, current_position=Decimal(0), now=0.0)
+    assert intent is not None
+    assert intent.order_type == "LIMIT"
+    assert intent.limit_price == Decimal("100.25")
+
+
+def test_use_limit_orders_false_restores_plain_market_orders():
+    policy = make_policy(use_limit_orders=False)
+    intent = policy.decide(make_features(), signal=0.5, current_position=Decimal(0), now=0.0)
+    assert intent is not None
+    assert intent.order_type == "MARKET"
+    assert intent.limit_price is None

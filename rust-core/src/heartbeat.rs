@@ -192,6 +192,10 @@ async fn flatten_all_positions(config: &Config, order_service: &OrderServiceImpl
             quantity: Some(PbDecimal { value: quantity.to_string() }),
             limit_price: None,
             strategy_id: WATCHDOG_STRATEGY_ID.to_string(),
+            // A flatten order needs to actually execute now, not rest —
+            // post-only is meaningless (and would be ignored/rejected by
+            // Kraken) on a MARKET order anyway.
+            post_only: false,
         };
 
         tracing::warn!(

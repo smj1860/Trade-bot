@@ -89,6 +89,16 @@ message OrderRequest {
   Decimal quantity = 6;
   Decimal limit_price = 7;     // unset for market orders
   string strategy_id = 8;      // which strategy/model generated this
+  // Institutional audit Phase 1.3: only meaningful for ORDER_TYPE_LIMIT.
+  // Requests Kraken's post-only flag (oflags=post) — the exchange itself
+  // rejects the order rather than filling it as a taker if the price
+  // would cross the book at submission time. This is what makes a
+  // "maker/limit order" actually maker-only rather than just a limit
+  // order that happens not to cross today; see policy.py and
+  // guardrails.rs for the client-side half of this (skipping the
+  // market-fill slippage simulation for a resting order, and rejecting a
+  // limit price that would cross before it ever reaches Kraken).
+  bool post_only = 9;
 }
 
 // --- Order lifecycle: Rust -> Python ----------------------------------------
@@ -151,6 +161,30 @@ message HeartbeatAck {
   int64 heartbeat_timeout_secs = 1;
 }
 
+// Institutional audit Phase 1.3: lets Python actively manage a resting
+// limit order's lifecycle (cancel-after-timeout, cancel-and-reprice) rather
+// than only ever placing one and waiting passively. Identifies the order by
+// the same client_order_id Python generated at submission time — Rust
+// resolves that to Kraken's exchange_order_id itself (see
+// persistence.rs's Store::get_order) since Python never sees that id
+// directly for anything but logging.
+message CancelOrderRequest {
+  string client_order_id = 1;
+}
+
+enum CancelOutcome {
+  CANCEL_OUTCOME_UNSPECIFIED = 0;
+  CANCEL_OUTCOME_CANCELED = 1;
+  CANCEL_OUTCOME_ALREADY_CLOSED = 2; // already filled/canceled before this request landed — not an error
+  CANCEL_OUTCOME_UNKNOWN_ORDER = 3;  // this process has no record of client_order_id
+  CANCEL_OUTCOME_REJECTED = 4;       // Kraken rejected the cancel request itself
+}
+
+message CancelOrderResponse {
+  CancelOutcome outcome = 1;
+  string detail = 2; // Kraken's own message(s) on REJECTED; empty otherwise
+}
+
 service OrderService {
   // Python submits a decision; Rust runs risk checks and forwards to the
   // exchange if it passes.
@@ -163,4 +197,7 @@ service OrderService {
   // Called on an interval by a live strategy process — see the
   // dead-man's-switch docs above.
   rpc SendHeartbeat(Heartbeat) returns (HeartbeatAck);
+
+  // Institutional audit Phase 1.3 — see CancelOrderRequest's docs above.
+  rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
 }

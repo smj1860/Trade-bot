@@ -95,6 +95,32 @@ class LoggingConfig:
 @dataclass(frozen=True)
 class ExecutionConfig:
     dry_run_only: bool = True
+    # Institutional audit Phase 1.3: maker/limit order execution. See
+    # strategy/policy.py (which builds the post-only price) and
+    # strategy/engine.py's _manage_resting_order (which runs the
+    # place -> wait -> cancel/reprice -> fallback state machine).
+    #
+    # When True, DecisionPolicy builds LIMIT/post-only orders instead of
+    # MARKET orders. False keeps the original always-MARKET behavior —
+    # useful for isolating whether a regression is in the maker-order path
+    # itself vs. something else.
+    use_limit_orders: bool = True
+    # How long to let a resting limit order sit before canceling and
+    # repricing (or giving up). Kept well under the Rust side's dead-man's
+    # switch heartbeat_timeout_secs default (30s) so a strategy managing
+    # one slow-to-fill order for a while doesn't itself look dead.
+    limit_order_timeout_secs: float = 5.0
+    # How many times to cancel-and-reprice at the (possibly moved) best
+    # bid/ask before giving up on the maker path for this order. 0 means
+    # "place once, cancel on timeout, never reprice."
+    limit_reprice_attempts: int = 2
+    # If still unfilled after exhausting limit_reprice_attempts, submit a
+    # MARKET order for whatever quantity never filled. False means the
+    # remaining quantity is simply abandoned — the strategy tried to be a
+    # maker and, failing that, does nothing rather than pay taker fees
+    # anyway, which defeats the point of this phase for a
+    # fee-sensitivity-conscious deployment.
+    fallback_to_market: bool = True
 
 
 @dataclass(frozen=True)
