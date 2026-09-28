@@ -3,9 +3,17 @@
 Trains a baseline classifier on the OHLC-derived bar features
 (strategy/indicators.py: sma_ratio, ema_ratio, rsi, realized_vol,
 bar_momentum, bollinger_percent_b, bollinger_bandwidth, awesome_oscillator,
-macd_histogram, cci, williams_percent_r) using real historical Kraken
-candles from Supabase, and saves it via joblib for use as
-strategy.model.kind = "sklearn" (see strategy_config.example.toml).
+macd_histogram, cci, williams_percent_r, volume_ratio, parkinson_vol —
+see FEATURE_ORDER) using real historical Kraken candles from Supabase,
+and saves it via joblib for use as strategy.model.kind = "sklearn" (see
+strategy_config.example.toml). Every feature is already a dimensionless
+ratio (a fraction of price, of the feature's own recent average, or of a
+[-1, 1]-rescaled range) rather than a raw price or volume — deliberately,
+so pooling symbols at wildly different price/volume levels (--symbol all,
+or a manually chosen subset, e.g. "BTC-USD,ETH-USD" for a majors-only
+pool vs. the rest for a mid-cap-alt pool — no separate cluster-model
+machinery needed, this is just --symbol with a different comma list)
+never lets one symbol's absolute scale dominate what the model learns.
 
 This is the other half of the feature-parity work described in
 docs/model-training.md: strategy/features.py's FeatureEngine computes
@@ -99,6 +107,23 @@ factor. Two knobs loosen it, and can be combined:
                      have closed out for a loss, which fixed-horizon has no
                      way to see since it only checks where price ended up.
                      See triple_barrier_label / triple_barrier_net_pnl.
+
+  --embargo N       Purges/embargoes N bars at each train/test boundary —
+                     applies to both --folds 1 (the single split that's
+                     actually trained and saved) and --folds > 1
+                     (walk-forward validation). Default None = use
+                     --horizon (the label's maximum forward reach, and the
+                     minimum embargo that rules out literal label overlap
+                     between train and test — see walk_forward_splits'
+                     docstring for the purge-then-embargo mechanics). A
+                     label at bar i isn't just a function of bar i: a
+                     fixed-horizon label looks all the way to bar
+                     i+horizon, and triple-barrier can touch a barrier
+                     anywhere in i+1..i+horizon, so without this, a
+                     training row near the boundary can have a label
+                     computed from data that falls inside the test set —
+                     training on information that peeks into its own
+                     evaluation.
 
 This turns the label into something closer to "simulated paper trading":
 instead of asking "did price go up or down" (or even "did it move a lot"),
@@ -202,9 +227,11 @@ from strategy.indicators import (
     cci,
     ema_ratio,
     macd_histogram,
+    parkinson_vol,
     realized_vol,
     rsi,
     sma_ratio,
+    volume_ratio,
     williams_percent_r,
 )
 
@@ -220,6 +247,13 @@ FEATURE_ORDER = [
     "macd_histogram",
     "cci",
     "williams_percent_r",
+    # Volume-derived features (see strategy/indicators.py) — appended
+    # rather than interleaved so an existing feature_order in
+    # strategy_config.toml pointing at the first 11 stays meaningful (a
+    # model trained before these existed just never saw them, not a
+    # silent reordering of what it did see).
+    "volume_ratio",
+    "parkinson_vol",
 ]
 
 
@@ -244,22 +278,27 @@ def connect():
     return psycopg2.connect(dsn)
 
 
-def load_ohlc(conn, symbol: str, interval_minutes: int) -> tuple[list[float], list[float], list[float], list[float]]:
-    """Returns (closes, midpoints, highs, lows) — midpoints = (high + low)
-    / 2 per candle, straight from Kraken's own recorded high/low (real
-    traded range), which is what awesome_oscillator is fed; highs/lows are
-    the same real recorded values, needed unaveraged for cci (typical
-    price = (high+low+close)/3) and williams_percent_r (highest-high/
-    lowest-low over a window). This is actually a truer high/low series
-    than the live engine gets (strategy/bars.py can only approximate
-    high/low from mid-price ticks seen within a bucket, since there's no
-    live trade feed wired up yet — see bars.py's module docstring), a
-    known, documented asymmetry, not a mismatch that breaks parity on the
-    close-based features."""
+def load_ohlc(
+    conn, symbol: str, interval_minutes: int
+) -> tuple[list[float], list[float], list[float], list[float], list[float]]:
+    """Returns (closes, midpoints, highs, lows, volumes) — midpoints =
+    (high + low) / 2 per candle, straight from Kraken's own recorded
+    high/low (real traded range), which is what awesome_oscillator is fed;
+    highs/lows are the same real recorded values, needed unaveraged for
+    cci (typical price = (high+low+close)/3) and williams_percent_r
+    (highest-high/lowest-low over a window). This is actually a truer
+    high/low series than the live engine gets by default (strategy/bars.py
+    can only approximate high/low from mid-price ticks seen within a
+    bucket unless a live trade feed is wired up via on_trade() — see
+    bars.py's module docstring), a known, documented asymmetry, not a
+    mismatch that breaks parity on the close-based features. volumes is
+    the real per-candle traded volume Kraken's Trades endpoint reports
+    (same quantity strategy/bars.py's on_trade() accumulates live), fed to
+    volume_ratio — 0.0 for a bar with no recorded volume."""
     with conn.cursor() as cur:
         cur.execute(
             """
-            select close, high, low
+            select close, high, low, volume
             from ohlc_candles
             where exchange = %s and symbol = %s and interval_minutes = %s
             order by ts asc
@@ -270,8 +309,9 @@ def load_ohlc(conn, symbol: str, interval_minutes: int) -> tuple[list[float], li
     closes = [float(r[0]) for r in rows]
     highs = [float(r[1]) for r in rows]
     lows = [float(r[2]) for r in rows]
+    volumes = [float(r[3]) if r[3] is not None else 0.0 for r in rows]
     midpoints = [(h + l) / 2.0 for h, l in zip(highs, lows)]
-    return closes, midpoints, highs, lows
+    return closes, midpoints, highs, lows, volumes
 
 
 def list_available_symbols(conn, interval_minutes: int) -> list[str]:
@@ -298,6 +338,7 @@ def features_at(
     midpoints: list[float],
     highs: list[float],
     lows: list[float],
+    volumes: list[float],
     i: int,
     sma_window: int,
     ema_window: int,
@@ -336,6 +377,12 @@ def features_at(
     wr_closes = closes[wr_start : i + 1]
     wr_highs = highs[wr_start : i + 1]
     wr_lows = lows[wr_start : i + 1]
+    # Same window as realized_vol (vol_win/vol_window) — see
+    # strategy/features.py's FeatureEngine, which reuses its own
+    # _vol_window for these two rather than adding a separate parameter.
+    volume_win = volumes[max(0, i - vol_window + 1) : i + 1]
+    parkinson_highs = highs[max(0, i - vol_window + 1) : i + 1]
+    parkinson_lows = lows[max(0, i - vol_window + 1) : i + 1]
     return {
         "sma_ratio": sma_ratio(sma_win),
         "ema_ratio": ema_ratio(ema_win),
@@ -348,6 +395,8 @@ def features_at(
         "macd_histogram": macd_histogram(macd_win, macd_fast_window, macd_slow_window, macd_signal_window),
         "cci": cci(typical_prices),
         "williams_percent_r": williams_percent_r(wr_closes, wr_highs, wr_lows),
+        "volume_ratio": volume_ratio(volume_win),
+        "parkinson_vol": parkinson_vol(parkinson_highs, parkinson_lows),
     }
 
 
@@ -600,6 +649,7 @@ def build_dataset(
     midpoints: list[float],
     highs: list[float],
     lows: list[float],
+    volumes: list[float],
     sma_window: int,
     ema_window: int,
     rsi_window: int,
@@ -666,6 +716,7 @@ def build_dataset(
             midpoints,
             highs,
             lows,
+            volumes,
             i,
             sma_window,
             ema_window,
@@ -700,7 +751,34 @@ def time_ordered_split(X: list, y: list, test_fraction: float):
     return X[:split], y[:split], X[split:], y[split:]
 
 
-def walk_forward_splits(X: list, y: list, indices: list, n_folds: int):
+def _purge_train_end(indices: list[int], train_end: int, test_start_bar: int, embargo: int) -> int:
+    """The largest train_end' <= train_end such that no row in
+    indices[:train_end'] has index + embargo >= test_start_bar — i.e. no
+    surviving training row's label lookahead (up to `embargo` bars ahead)
+    reaches into the test block. Shared by walk_forward_splits (per fold
+    boundary) and main()'s single time-ordered split (per symbol's own
+    train/test boundary) so both apply the identical purge, rather than
+    the walk-forward evaluation path being leakage-free while the actual
+    production training path (--folds 1) silently isn't."""
+    purged = train_end
+    while purged > 0 and indices[purged - 1] + embargo >= test_start_bar:
+        purged -= 1
+    return purged
+
+
+def _embargo_test_start(indices: list[int], test_start: int, test_end: int, test_start_bar: int, embargo: int) -> int:
+    """The smallest index >= test_start such that indices[that index] >=
+    test_start_bar + embargo — drops leading test rows within `embargo`
+    bars of the boundary as a buffer against serial correlation across it,
+    the test-side half of purge-then-embargo. See _purge_train_end for the
+    train-side half."""
+    start = test_start
+    while start < test_end and indices[start] < test_start_bar + embargo:
+        start += 1
+    return start
+
+
+def walk_forward_splits(X: list, y: list, indices: list, n_folds: int, embargo: int = 0):
     """Yields n_folds (X_train, y_train, idx_train, X_test, y_test, idx_test)
     tuples using an expanding-window time series split: the data is cut
     into n_folds+1 contiguous, chronologically-ordered blocks; fold k's
@@ -714,8 +792,36 @@ def walk_forward_splits(X: list, y: list, indices: list, n_folds: int):
     is always whatever the most recent ~20% happens to be (right now, one
     all-up month), so the evaluation itself is still one-directional.
 
+    `embargo` (in bars) applies purged walk-forward cross-validation
+    (Lopez de Prado) at each fold boundary, needed because a label at bar
+    i isn't just a function of bar i — a fixed-horizon label looks all the
+    way to bar i+horizon, and a triple-barrier label can touch a barrier
+    anywhere in i+1..i+max_hold. Without an embargo, a training row near
+    the boundary can have a label computed from bars that fall inside the
+    test block: the model would be trained on information that peeks into
+    its own evaluation period. Two purges apply, both measured in `indices`
+    (real bar-index space, not row-count space, since filtering can leave
+    gaps between kept rows):
+
+    - Purge (train side): drop any trailing training row whose label
+      lookahead (index + embargo) reaches at or past the first test bar's
+      index, so no training label overlaps the test block at all.
+    - Embargo (test side): drop any leading test row within `embargo` bars
+      of the boundary, as an additional buffer against serial correlation
+      across the boundary (a test bar immediately adjacent to training
+      data is highly autocorrelated with it even without literal label
+      overlap) — the same idea applied symmetrically, per the standard
+      purge-then-embargo recipe.
+
+    Pass `embargo=0` (the default) to disable this and get the plain
+    expanding-window split — e.g. when scoring a label scheme with no
+    forward lookahead of its own. In practice, callers here always pass
+    the same `horizon`/`max_hold` used to build the labels, since that's
+    the exact maximum forward reach a label can have.
+
     Yields nothing if there isn't enough data for at least one non-empty
-    train and test block (n_folds+1 blocks of at least 1 row each)."""
+    train and test block (n_folds+1 blocks of at least 1 row each) after
+    purging/embargo is applied."""
     n = len(X)
     block_size = n // (n_folds + 1)
     if block_size < 1:
@@ -725,8 +831,16 @@ def walk_forward_splits(X: list, y: list, indices: list, n_folds: int):
     for k in range(1, n_folds + 1):
         train_end = boundaries[k]
         test_end = boundaries[k + 1]
-        X_train, y_train, idx_train = X[:train_end], y[:train_end], indices[:train_end]
-        X_test, y_test, idx_test = X[train_end:test_end], y[train_end:test_end], indices[train_end:test_end]
+        if train_end >= len(indices) or test_end <= train_end:
+            continue
+        test_start_bar = indices[train_end]
+        purged_train_end = _purge_train_end(indices, train_end, test_start_bar, embargo)
+        embargoed_test_start = _embargo_test_start(indices, train_end, test_end, test_start_bar, embargo)
+
+        X_train, y_train, idx_train = X[:purged_train_end], y[:purged_train_end], indices[:purged_train_end]
+        X_test = X[embargoed_test_start:test_end]
+        y_test = y[embargoed_test_start:test_end]
+        idx_test = indices[embargoed_test_start:test_end]
         if not X_train or not X_test:
             continue
         yield X_train, y_train, idx_train, X_test, y_test, idx_test
@@ -779,7 +893,7 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
     --min-move override) and the --top-fraction cutoff computed from this
     symbol's own move distribution, so both constraints hold when both
     apply."""
-    closes, midpoints, highs, lows = load_ohlc(conn, symbol, interval_minutes)
+    closes, midpoints, highs, lows, volumes = load_ohlc(conn, symbol, interval_minutes)
 
     horizon = getattr(window_args, "horizon", 1)
     top_fraction = getattr(window_args, "top_fraction", 1.0)
@@ -825,6 +939,7 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
         midpoints,
         highs,
         lows,
+        volumes,
         window_args.sma_window,
         window_args.ema_window,
         window_args.rsi_window,
@@ -1024,7 +1139,13 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
     across whichever folds actually produced a usable split."""
     per_symbol_folds = []
     for d in datasets:
-        folds = list(walk_forward_splits(d["X"], d["y"], d["indices"], args.folds))
+        # --embargo defaults to this symbol's own horizon (the label's
+        # maximum forward reach — see walk_forward_splits' docstring for
+        # why that's the right minimum), letting an explicit --embargo
+        # only ever add *extra* margin, never less than what's needed to
+        # rule out literal label overlap across the fold boundary.
+        embargo = args.embargo if args.embargo is not None else d["horizon"]
+        folds = list(walk_forward_splits(d["X"], d["y"], d["indices"], args.folds, embargo=embargo))
         if not folds:
             print(
                 f"warning: {d['symbol']} has too little data for {args.folds} walk-forward folds — "
@@ -1134,6 +1255,19 @@ def main() -> None:
         "model is saved in this mode.",
     )
     parser.add_argument(
+        "--embargo",
+        type=int,
+        default=None,
+        help="Bars purged/embargoed at each train/test boundary to prevent label leakage across it — "
+        "applies to both --folds 1 (the split that's actually trained and saved) and --folds > 1 "
+        "(walk-forward validation); see walk_forward_splits' docstring for the purge-then-embargo "
+        "mechanics. Default None = use each symbol's own --horizon (the label's maximum forward "
+        "reach, and the minimum embargo that rules out literal label overlap between train and "
+        "test). Pass an explicit value only to widen the buffer further (e.g. for extra margin "
+        "against serial correlation across the boundary); passing something smaller than --horizon "
+        "reopens the leakage this option exists to close, so there's rarely a reason to.",
+    )
+    parser.add_argument(
         "--label-scheme",
         choices=["fixed-horizon", "triple-barrier"],
         default="fixed-horizon",
@@ -1180,7 +1314,12 @@ def main() -> None:
     # from one symbol never trains on an earlier held-out bar from that
     # same symbol, and one symbol's split boundary never leaks into
     # another's), then concatenate every symbol's train rows together and
-    # every symbol's test rows together into one pooled dataset.
+    # every symbol's test rows together into one pooled dataset. Purged +
+    # embargoed exactly like walk_forward_splits (see _purge_train_end/
+    # _embargo_test_start) — this is the path that actually trains and
+    # saves the production model, so it gets the identical leakage
+    # protection walk-forward validation does, not just the evaluation
+    # tool.
     X_train: list[list[float]] = []
     y_train: list[int] = []
     X_test: list[list[float]] = []
@@ -1195,8 +1334,17 @@ def main() -> None:
     per_symbol_test: list[dict] = []
     for d in datasets:
         split = split_point(len(d["X"]), args.test_fraction)
-        sym_X_train, sym_y_train, sym_idx_train = d["X"][:split], d["y"][:split], d["indices"][:split]
-        sym_X_test, sym_y_test, sym_idx_test = d["X"][split:], d["y"][split:], d["indices"][split:]
+        embargo = args.embargo if args.embargo is not None else d["horizon"]
+        if 0 < split < len(d["indices"]):
+            test_start_bar = d["indices"][split]
+            train_end = _purge_train_end(d["indices"], split, test_start_bar, embargo)
+            sym_test_start = _embargo_test_start(d["indices"], split, len(d["indices"]), test_start_bar, embargo)
+        else:
+            train_end = sym_test_start = split
+        sym_X_train, sym_y_train, sym_idx_train = d["X"][:train_end], d["y"][:train_end], d["indices"][:train_end]
+        sym_X_test, sym_y_test, sym_idx_test = (
+            d["X"][sym_test_start:], d["y"][sym_test_start:], d["indices"][sym_test_start:]
+        )
         X_train.extend(sym_X_train)
         y_train.extend(sym_y_train)
         test_start = len(X_test)
@@ -1229,6 +1377,14 @@ def main() -> None:
 
     if len(set(y_train)) < 2:
         print("error: training labels are all one class — can't train a classifier on this window.", file=sys.stderr)
+        sys.exit(1)
+    if not X_test:
+        print(
+            "error: no test rows survived the train/test split's purge+embargo — --test-fraction is too small "
+            "relative to --embargo (or its --horizon-derived default) for this much data. Increase "
+            "--test-fraction or lower --embargo.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # Same evaluation every walk-forward fold uses (see _train_and_evaluate) —

@@ -88,6 +88,8 @@ def test_bar_derived_features_default_to_neutral_with_no_bar_history():
     assert features.macd_histogram == 0.0
     assert features.cci == 0.0
     assert features.williams_percent_r == 0.0
+    assert features.volume_ratio == 0.0
+    assert features.parkinson_vol == 0.0
 
 
 def test_bar_derived_features_populate_once_bars_complete():
@@ -137,6 +139,43 @@ def test_awesome_oscillator_populates_once_slow_window_completes():
         )
     assert features is not None
     assert features.awesome_oscillator > 0
+
+
+def test_volume_features_stay_neutral_without_a_trade_feed():
+    # on_order_book_update alone (no on_trade calls) only ever feeds
+    # bars.py's on_tick fallback, which never accumulates real volume —
+    # volume_ratio/parkinson_vol should still populate (parkinson_vol from
+    # the tick-derived high/low range) or stay neutral (volume_ratio,
+    # since real volume is always 0 without a trade feed), never raise.
+    engine = FeatureEngine(momentum_window=5, bar_interval_seconds=60, vol_window=2)
+    for i in range(4):
+        features = engine.on_order_book_update(
+            "BTC-USD", Decimal(100 + i), Decimal(1), Decimal(102 + i), Decimal(1), timestamp=float(i * 60)
+        )
+    assert features is not None
+    assert features.volume_ratio == 0.0  # no real trade volume ever reported
+
+
+def test_volume_ratio_populates_once_a_trade_feed_is_wired_up():
+    engine = FeatureEngine(momentum_window=5, bar_interval_seconds=60, vol_window=2)
+    # Three quiet-volume bars, then one high-volume bar -> volume_ratio > 0
+    # for the next order-book update (which reads the now-completed bars).
+    engine.on_trade("BTC-USD", price=Decimal(100), volume=Decimal(10), timestamp=0.0)
+    engine.on_trade("BTC-USD", price=Decimal(101), volume=Decimal(10), timestamp=60.0)
+    engine.on_trade("BTC-USD", price=Decimal(102), volume=Decimal(10), timestamp=120.0)
+    engine.on_trade("BTC-USD", price=Decimal(103), volume=Decimal(100), timestamp=180.0)
+    features = engine.on_order_book_update(
+        "BTC-USD", Decimal(103), Decimal(1), Decimal(105), Decimal(1), timestamp=240.0
+    )
+    assert features is not None
+    assert features.volume_ratio > 0
+    assert features.parkinson_vol >= 0.0
+
+
+def test_on_trade_symbol_not_yet_seen_by_order_book_update_does_not_raise():
+    engine = FeatureEngine(momentum_window=5)
+    # on_trade shouldn't require on_order_book_update to have run first.
+    engine.on_trade("BTC-USD", price=Decimal(100), volume=Decimal(5), timestamp=0.0)
 
 
 def test_macd_populates_once_windows_complete():

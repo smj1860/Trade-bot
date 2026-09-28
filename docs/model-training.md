@@ -562,3 +562,103 @@ Natural next steps, in the order they'd actually move the needle:
    symbol — pooling assumes one feature/threshold combination generalizes
    across very different coins, which hasn't been checked against the
    deep-history data yet.
+
+### Cross-asset pooling review, volume features, and purged walk-forward CV (2026-09-27)
+
+Stephen proposed three ML-engineering improvements aimed at making
+cross-asset pooling sound: (1) train a single pooled model, or 2-3
+cluster models (majors vs. mid-cap alts), instead of 14 independent
+per-pair models; (2) normalize every feature so raw prices/volumes never
+enter the model, since 14 pairs span very different price/volume levels;
+(3) purge/embargo walk-forward CV fold boundaries so overlapping
+triple-barrier label windows can't leak between train and test.
+
+Went through each honestly rather than assuming they all needed new code:
+
+1. **Pooling/clustering — already free, no code needed.** `--symbol`
+   already accepts a comma-separated list or `all`
+   (`resolve_symbols()`), so a "majors" cluster and an "alts" cluster are
+   just two different `--symbol` values to the existing script (e.g.
+   `--symbol BTC-USD,ETH-USD` vs. every other symbol) — not a feature
+   that needed building. Worth running as an experiment, but it's a
+   sweep parameter, not an engineering gap.
+
+2. **Normalization — already true, checked rather than assumed.** Read
+   every function in `strategy/indicators.py`: `sma_ratio`/`ema_ratio`
+   (ratio to own average), `rsi`/`williams_percent_r` ([-1, 1]-rescaled),
+   `realized_vol` (std of *log* returns, already scale-free),
+   `bollinger_percent_b`/`bollinger_bandwidth` (normalized by std/middle
+   band), `macd_histogram` (explicitly divided by the current close),
+   `cci` (normalized by mean absolute deviation), `awesome_oscillator`
+   (normalized by the slow SMA) — every one is already a dimensionless
+   ratio, never a raw price. This was good news, not a gap: the concern
+   was legitimate in general (pooling raw prices across BTC and a
+   sub-$1 altcoin would be a real bug), it just turned out to already be
+   handled.
+
+   What genuinely *was* missing: **no volume-derived feature existed at
+   all**, despite `ohlc_candles.volume` being recorded all along and
+   `strategy/bars.py`'s `BarAggregator` already tracking real per-bar
+   volume (from this session's earlier trade-tick-ingestion work).
+   Added two new ratio-based indicators to `strategy/indicators.py`:
+   - `volume_ratio(volumes)`: (most recent bar's volume / SMA of the
+     window) - 1 — the same self-relative-ratio idiom as
+     `sma_ratio`/`ema_ratio`, applied to volume instead of price, so a
+     low-cap altcoin trading 3x its own average and BTC trading 3x its
+     own (much larger) average read identically.
+   - `parkinson_vol(highs, lows)`: Parkinson's (1980) high-low range
+     volatility estimator — `sqrt(mean(ln(high/low)^2) / (4 ln 2))` — a
+     second, independent volatility read alongside `realized_vol`'s
+     close-to-close estimate; a bar that spiked hard in both directions
+     before closing flat looks calm to `realized_vol` but clearly
+     volatile here. Already scale-free (a ratio of prices), same as
+     `realized_vol`.
+
+   Both wired into `strategy/features.py`'s `FeatureEngine` (reusing its
+   existing `vol_window`, no new constructor parameter) and appended to
+   `scripts/train_model.py`'s `FEATURE_ORDER` (appended, not interleaved,
+   so an existing `feature_order` in `strategy_config.toml` pointing at
+   the first 11 features stays meaningful rather than silently
+   reordered). `load_ohlc()` now selects `volume` from `ohlc_candles`
+   alongside close/high/low. Both features correctly read as neutral
+   (0.0 / near-0.0) for a symbol whose live bars are only ever fed via
+   `on_tick()` (no real trade feed wired up yet for that symbol) — same
+   "no opinion" convention every other indicator already follows.
+
+3. **Purged + embargoed walk-forward CV — a real, fixed gap, in *two*
+   places.** `walk_forward_splits()` had no purging: a training row near
+   a fold boundary could have a label computed from bars that fall
+   inside that fold's test block (a fixed-horizon label looks to bar
+   `i+horizon`; a triple-barrier label can touch a barrier anywhere in
+   `i+1..i+horizon`), which is literal label leakage across the
+   boundary — exactly the risk Stephen flagged. Implemented the standard
+   purge-then-embargo recipe (Lopez de Prado): at each fold boundary,
+   purge trailing training rows whose label lookahead reaches into the
+   test block, and embargo leading test rows within the same buffer of
+   the boundary (protects against serial correlation across it, not just
+   literal overlap). New `--embargo N` CLI arg, defaulting to `None` =
+   each symbol's own `--horizon` (the tightest correct minimum — the
+   label's actual maximum forward reach).
+
+   **The same leakage existed in `main()`'s single time-ordered split
+   too** — the path that actually trains and saves the production
+   model, not just the walk-forward validation tool. It's the identical
+   bug, just less obviously connected to "CV fold boundaries." Fixed it
+   with the same shared `_purge_train_end`/`_embargo_test_start` helper
+   functions rather than leaving the evaluation path leakage-free while
+   the production training path silently wasn't — an inconsistency that
+   would have been worse than not fixing either.
+
+   Purging is computed in real bar-index space (via each row's `indices`
+   entry), not row-count space, since `--min-move`/triple-barrier
+   filtering already leaves gaps between kept rows — a fixed row-count
+   purge would under- or over-purge depending on how much filtering
+   happened to remove near a given boundary.
+
+185 Python tests total (up from 165), 60 Rust tests, all passing.
+Nothing here changes the sweep verdict above (no model saved yet) — this
+was tightening the training pipeline's correctness ahead of the next
+real sweep, not a new sweep result. The next sweep (profit-margin, or a
+re-run of the horizon sweep now that leakage is closed and volume
+features exist) should be run against this corrected pipeline, not the
+prior one.

@@ -19,6 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.train_model import (
     FEATURE_ORDER,
+    _embargo_test_start,
+    _purge_train_end,
     build_dataset,
     list_available_symbols,
     load_symbol_dataset,
@@ -111,7 +113,7 @@ def test_load_symbol_dataset_skips_thin_history(monkeypatch):
     import scripts.train_model as train_model
 
     # Only 10 candles — nowhere near enough for ao_slow_window=34's warmup.
-    monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: ([100.0] * 10, [100.0] * 10, [101.0] * 10, [99.0] * 10))
+    monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: ([100.0] * 10, [100.0] * 10, [101.0] * 10, [99.0] * 10, [1.0] * 10))
     result = load_symbol_dataset(conn=None, symbol="THIN-USD", interval_minutes=60, window_args=_make_window_args())
     assert result is None
 
@@ -124,7 +126,8 @@ def test_load_symbol_dataset_builds_when_enough_history(monkeypatch):
     highs = [c + 1.0 for c in closes]
     lows = [c - 1.0 for c in closes]
     midpoints = [(h + l) / 2.0 for h, l in zip(highs, lows)]
-    monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: (closes, midpoints, highs, lows))
+    volumes = [1.0] * len(closes)
+    monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: (closes, midpoints, highs, lows, volumes))
 
     # min_move=0.0 explicitly: this test is about the warmup-skip behavior,
     # not about the fee-derived default threshold (net-P&L labeling is
@@ -159,8 +162,10 @@ def test_pooling_concatenates_per_symbol_splits_without_cross_contamination():
         bollinger_window=5, bollinger_num_std=2.0, ao_fast_window=2, ao_slow_window=5,
         macd_fast_window=2, macd_slow_window=5, macd_signal_window=2, cci_window=5, williams_r_window=5,
     )
-    X_a, y_a, _ = build_dataset(closes_a, midpoints_a, highs_a, lows_a, **kwargs)
-    X_b, y_b, _ = build_dataset(closes_b, midpoints_b, highs_b, lows_b, **kwargs)
+    volumes_a = [1.0] * len(closes_a)
+    volumes_b = [1.0] * len(closes_b)
+    X_a, y_a, _ = build_dataset(closes_a, midpoints_a, highs_a, lows_a, volumes_a, **kwargs)
+    X_b, y_b, _ = build_dataset(closes_b, midpoints_b, highs_b, lows_b, volumes_b, **kwargs)
 
     a_train_X, a_train_y, a_test_X, a_test_y = time_ordered_split(X_a, y_a, 0.2)
     b_train_X, b_train_y, b_test_X, b_test_y = time_ordered_split(X_b, y_b, 0.2)
@@ -200,8 +205,9 @@ def test_build_dataset_horizon_labels_further_ahead_bar():
         bollinger_window=2, bollinger_num_std=2.0, ao_fast_window=1, ao_slow_window=2,
         macd_fast_window=1, macd_slow_window=2, macd_signal_window=1, cci_window=2, williams_r_window=2,
     )
-    X1, y1, idx1 = build_dataset(closes, midpoints, highs, lows, horizon=1, **kwargs)
-    X3, y3, idx3 = build_dataset(closes, midpoints, highs, lows, horizon=3, **kwargs)
+    volumes = [1.0] * len(closes)
+    X1, y1, idx1 = build_dataset(closes, midpoints, highs, lows, volumes, horizon=1, **kwargs)
+    X3, y3, idx3 = build_dataset(closes, midpoints, highs, lows, volumes, horizon=3, **kwargs)
     # bar index 4: 1-bar-ahead is down (99 < 100), 3-bar-ahead is up (200 > 100)
     assert y1[idx1.index(4)] == 0
     assert y3[idx3.index(4)] == 1
@@ -217,8 +223,9 @@ def test_build_dataset_min_move_threshold_drops_small_moves():
         bollinger_window=2, bollinger_num_std=2.0, ao_fast_window=1, ao_slow_window=2,
         macd_fast_window=1, macd_slow_window=2, macd_signal_window=1, cci_window=2, williams_r_window=2,
     )
-    X_unfiltered, y_unfiltered, idx_unfiltered = build_dataset(closes, midpoints, highs, lows, horizon=1, min_move_threshold=0.0, **kwargs)
-    X_filtered, y_filtered, idx_filtered = build_dataset(closes, midpoints, highs, lows, horizon=1, min_move_threshold=0.05, **kwargs)
+    volumes = [1.0] * len(closes)
+    X_unfiltered, y_unfiltered, idx_unfiltered = build_dataset(closes, midpoints, highs, lows, volumes, horizon=1, min_move_threshold=0.0, **kwargs)
+    X_filtered, y_filtered, idx_filtered = build_dataset(closes, midpoints, highs, lows, volumes, horizon=1, min_move_threshold=0.05, **kwargs)
     assert len(X_filtered) < len(X_unfiltered)
     for i in idx_filtered:
         assert abs(move(closes, i, 1)) >= 0.05
@@ -324,7 +331,8 @@ def test_load_symbol_dataset_derives_min_move_from_fees_by_default(monkeypatch):
     highs = [c + 1.0 for c in closes]
     lows = [c - 1.0 for c in closes]
     midpoints = [(h + l) / 2.0 for h, l in zip(highs, lows)]
-    monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: (closes, midpoints, highs, lows))
+    volumes = [1.0] * len(closes)
+    monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: (closes, midpoints, highs, lows, volumes))
 
     unfiltered = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=_make_window_args(min_move=0.0))
     derived = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=_make_window_args(taker_fee=0.008, slippage=0.0005, profit_margin=0.0))
@@ -346,7 +354,8 @@ def test_load_symbol_dataset_explicit_min_move_overrides_fee_derivation(monkeypa
     highs = [c + 1.0 for c in closes]
     lows = [c - 1.0 for c in closes]
     midpoints = [(h + l) / 2.0 for h, l in zip(highs, lows)]
-    monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: (closes, midpoints, highs, lows))
+    volumes = [1.0] * len(closes)
+    monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: (closes, midpoints, highs, lows, volumes))
 
     result = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=_make_window_args(min_move=0.0, taker_fee=0.008))
     assert result is not None
@@ -414,6 +423,131 @@ def test_walk_forward_splits_remainder_absorbed_into_final_test_block():
     assert len(folds[0][3]) == 3          # first fold's test block: exactly one block
     assert len(folds[1][3]) == 11 - 3 - 3  # second (last) fold's test block absorbs the remainder
     assert sum(len(f[3]) for f in folds) + len(folds[0][0]) == 11  # every row accounted for
+
+
+def test_purge_train_end_no_embargo_is_a_no_op():
+    indices = list(range(10))
+    assert _purge_train_end(indices, train_end=6, test_start_bar=6, embargo=0) == 6
+
+
+def test_purge_train_end_drops_rows_reaching_the_boundary():
+    indices = list(range(10))
+    # Rows 4 and 5 both have index + 2 >= 6 (test_start_bar); row 3 (3+2=5 < 6) survives.
+    assert _purge_train_end(indices, train_end=6, test_start_bar=6, embargo=2) == 4
+
+
+def test_purge_train_end_can_empty_the_train_set():
+    indices = list(range(10))
+    assert _purge_train_end(indices, train_end=6, test_start_bar=6, embargo=100) == 0
+
+
+def test_embargo_test_start_no_embargo_is_a_no_op():
+    indices = list(range(10))
+    assert _embargo_test_start(indices, test_start=6, test_end=10, test_start_bar=6, embargo=0) == 6
+
+
+def test_embargo_test_start_drops_leading_rows_near_the_boundary():
+    indices = list(range(10))
+    # Rows 6 and 7 are within 2 of the boundary (6); row 8 (8 >= 6+2) survives.
+    assert _embargo_test_start(indices, test_start=6, test_end=10, test_start_bar=6, embargo=2) == 8
+
+
+def test_embargo_test_start_can_empty_the_test_set():
+    indices = list(range(10))
+    assert _embargo_test_start(indices, test_start=6, test_end=10, test_start_bar=6, embargo=100) == 10
+
+
+def test_walk_forward_splits_embargo_zero_matches_no_embargo_behavior():
+    # Default embargo=0 must reproduce the exact pre-embargo behavior —
+    # backward compatibility for every existing call site/test above.
+    X = [[float(i)] for i in range(10)]
+    y = [i % 2 for i in range(10)]
+    indices = list(range(10))
+    assert list(walk_forward_splits(X, y, indices, n_folds=4)) == list(
+        walk_forward_splits(X, y, indices, n_folds=4, embargo=0)
+    )
+
+
+def test_walk_forward_splits_embargo_purges_trailing_train_rows_near_boundary():
+    # A training row's label can look up to `embargo` bars ahead — any
+    # training row whose index + embargo reaches at or past the first test
+    # bar must be purged, since its label could have been computed from
+    # data inside the test block. Use a later fold (more accumulated
+    # train rows) so purging a couple of trailing ones still leaves a
+    # non-empty train set.
+    X = [[float(i)] for i in range(30)]
+    y = [i % 2 for i in range(30)]
+    indices = list(range(30))
+
+    no_embargo_fold = list(walk_forward_splits(X, y, indices, n_folds=4))[-1]
+    with_embargo_fold = list(walk_forward_splits(X, y, indices, n_folds=4, embargo=2))[-1]
+    assert len(with_embargo_fold[2]) < len(no_embargo_fold[2])  # idx_train shrank
+    test_start_bar = with_embargo_fold[5][0]
+    for i in with_embargo_fold[2]:
+        assert i + 2 < test_start_bar
+
+
+def test_walk_forward_splits_embargo_leaves_no_train_label_overlapping_test():
+    # The property embargo exists to guarantee, checked directly: for
+    # every purged fold, no surviving training row's label window
+    # (index..index+embargo) reaches into the test block's first index.
+    X = [[float(i)] for i in range(30)]
+    y = [i % 2 for i in range(30)]
+    indices = list(range(30))
+    embargo = 3
+
+    for X_train, y_train, idx_train, X_test, y_test, idx_test in walk_forward_splits(
+        X, y, indices, n_folds=4, embargo=embargo
+    ):
+        if not idx_test:
+            continue
+        test_start_bar = idx_test[0]
+        for i in idx_train:
+            assert i + embargo < test_start_bar
+
+
+def test_walk_forward_splits_embargo_purges_leading_test_rows_near_boundary():
+    # The test-side half of purge+embargo: test rows within `embargo` bars
+    # of the boundary are dropped too, as a buffer against serial
+    # correlation across it (not just literal label overlap).
+    X = [[float(i)] for i in range(10)]
+    y = [i % 2 for i in range(10)]
+    indices = list(range(10))
+
+    no_embargo = list(walk_forward_splits(X, y, indices, n_folds=4))[0]
+    with_embargo = list(walk_forward_splits(X, y, indices, n_folds=4, embargo=1))[0]
+    assert len(with_embargo[3]) <= len(no_embargo[3])  # X_test shrank or stayed the same
+    assert min(with_embargo[5]) >= min(no_embargo[5]) + 1
+
+
+def test_walk_forward_splits_large_embargo_can_starve_a_fold():
+    # An embargo that consumes an entire block should just drop that fold
+    # (empty train or test) rather than yield a degenerate split.
+    X = [[float(i)] for i in range(10)]
+    y = [i % 2 for i in range(10)]
+    indices = list(range(10))
+    # Block size is 2; an embargo of 100 purges every training row in
+    # every fold's would-be train set.
+    assert list(walk_forward_splits(X, y, indices, n_folds=4, embargo=100)) == []
+
+
+def test_walk_forward_splits_embargo_respects_gaps_in_filtered_indices():
+    # indices need not be contiguous (min-move/triple-barrier filtering
+    # leaves gaps) — embargo must compare real bar-index distance, not
+    # row-count distance, so a gap right at the boundary is handled
+    # correctly rather than under- or over-purging.
+    X = [[float(i)] for i in range(8)]
+    y = [i % 2 for i in range(8)]
+    # A gap: bar 10 immediately follows bar 3 (bars 4-9 were filtered out
+    # upstream) — row-count spacing would suggest embargo=2 purges only
+    # the last row, but the real bar-index gap is much larger.
+    indices = [0, 1, 2, 3, 10, 11, 12, 13]
+
+    folds = list(walk_forward_splits(X, y, indices, n_folds=3, embargo=2))
+    for X_train, y_train, idx_train, X_test, y_test, idx_test in folds:
+        if not idx_test or not idx_train:
+            continue
+        assert max(idx_train) + 2 < idx_test[0]
 
 
 def test_triple_barrier_touch_upper_touched_via_high_not_close():
@@ -595,9 +729,10 @@ def test_build_dataset_triple_barrier_scheme_drops_timeouts_and_labels_by_touch(
         cci_window=5, williams_r_window=5,
     )
     midpoints = [(h + l) / 2.0 for h, l in zip(highs, lows)]
+    volumes = [1.0] * n
 
     X, y, indices = build_dataset(
-        closes, midpoints, highs, lows,
+        closes, midpoints, highs, lows, volumes,
         sma_window=5, ema_window=5, rsi_window=5, vol_window=5, bar_momentum_window=5,
         bollinger_window=5, bollinger_num_std=2.0, ao_fast_window=3, ao_slow_window=5,
         macd_fast_window=3, macd_slow_window=5, macd_signal_window=3, cci_window=5, williams_r_window=5,

@@ -265,6 +265,57 @@ def williams_percent_r(closes: Sequence[float], highs: Sequence[float], lows: Se
     return (raw + 50.0) / 50.0
 
 
+def volume_ratio(volumes: Sequence[float]) -> float:
+    """(most recent bar's traded volume / SMA of the window) - 1 — the
+    same ratio-to-its-own-average idiom as sma_ratio()/ema_ratio(),
+    applied to real traded volume (strategy/bars.py's `volumes` — 0.0 for
+    a bar that only ever saw on_tick() book-snapshot ticks, never a real
+    trade) instead of price. Positive means this bar traded more than its
+    recent average (volume expansion — often accompanies a genuine
+    breakout rather than noise); negative means below-average
+    (exhaustion/quiet). Dimensionless by construction, exactly like
+    sma_ratio(), so it's directly comparable across symbols with very
+    different absolute volume — a low-cap altcoin's 10,000-unit bar and
+    BTC's 500-unit bar can both read as "3x their own recent average."
+    Needs at least one value; returns 0.0 otherwise, or when the window's
+    average volume is 0 (e.g. no real trade feed wired up yet for this
+    symbol — see BarAggregator.on_trade())."""
+    if not volumes:
+        return 0.0
+    average = sma(volumes)
+    if average == 0:
+        return 0.0
+    return (volumes[-1] / average) - 1.0
+
+
+def parkinson_vol(highs: Sequence[float], lows: Sequence[float]) -> float:
+    """Parkinson's high-low range volatility estimator: sqrt(mean(ln(high_i
+    / low_i)^2) / (4 * ln 2)) over the window — a second, independent
+    volatility read alongside realized_vol()'s close-to-close log-return
+    standard deviation. Where realized_vol only sees where each bar
+    *ended*, this sees how far price actually *traveled* intrabar (a bar
+    that spiked hard in both directions before closing flat looks calm to
+    realized_vol but clearly volatile here) — Parkinson (1980) showed this
+    range-based estimator is markedly more statistically efficient than
+    close-to-close for the same sample size, precisely because it uses
+    information realized_vol discards. Like realized_vol, this is a ratio
+    of prices (ln(high/low)), so it's already scale-free/dimensionless
+    and directly comparable across symbols at very different price
+    levels — no separate normalization needed. `highs` and `lows` must be
+    the same window, aligned bar-for-bar. Needs at least 1 bar; returns
+    0.0 otherwise, on mismatched lengths, or if any bar has a non-positive
+    high or low (shouldn't happen with real price data)."""
+    if not highs or not lows or len(highs) != len(lows):
+        return 0.0
+    squared_log_ranges = []
+    for h, l in zip(highs, lows):
+        if h <= 0 or l <= 0:
+            return 0.0
+        squared_log_ranges.append(math.log(h / l) ** 2)
+    mean_squared = sum(squared_log_ranges) / len(squared_log_ranges)
+    return math.sqrt(mean_squared / (4.0 * math.log(2.0)))
+
+
 def awesome_oscillator(midpoints: Sequence[float], fast_window: int = 5, slow_window: int = 34) -> float:
     """Bill Williams' Awesome Oscillator: SMA(fast_window) of bar
     midpoints ((high + low) / 2, see strategy/bars.py) minus

@@ -12,10 +12,12 @@ from strategy.indicators import (
     ema,
     ema_ratio,
     macd_histogram,
+    parkinson_vol,
     realized_vol,
     rsi,
     sma,
     sma_ratio,
+    volume_ratio,
     williams_percent_r,
 )
 
@@ -281,3 +283,74 @@ def test_williams_r_at_the_low_is_min():
     lows = [104.0, 100.0, 100.0]
     # most recent close (100) equals the window's lowest low (100)
     assert williams_percent_r(closes, highs, lows) == pytest.approx(-1.0)
+
+
+def test_volume_ratio_empty_is_zero():
+    assert volume_ratio([]) == 0.0
+
+
+def test_volume_ratio_zero_average_is_zero():
+    assert volume_ratio([0.0, 0.0, 0.0]) == 0.0
+
+
+def test_volume_ratio_above_average_is_positive():
+    volumes = [10.0, 10.0, 10.0, 40.0]
+    expected = (40.0 / (sum(volumes) / len(volumes))) - 1.0
+    assert volume_ratio(volumes) == pytest.approx(expected)
+    assert volume_ratio(volumes) > 0
+
+
+def test_volume_ratio_below_average_is_negative():
+    volumes = [10.0, 10.0, 10.0, 2.0]
+    assert volume_ratio(volumes) < 0
+
+
+def test_volume_ratio_scale_invariant_across_symbols():
+    # A low-cap altcoin trading 3x its own recent average and BTC trading
+    # 3x its own (much larger) recent average should read identically —
+    # that's the whole point of a ratio-to-self rather than a raw volume
+    # feature.
+    altcoin_volumes = [1_000.0, 1_000.0, 1_000.0, 3_000.0]
+    btc_volumes = [500_000.0, 500_000.0, 500_000.0, 1_500_000.0]
+    assert volume_ratio(altcoin_volumes) == pytest.approx(volume_ratio(btc_volumes))
+
+
+def test_parkinson_vol_empty_or_mismatched_is_zero():
+    assert parkinson_vol([], []) == 0.0
+    assert parkinson_vol([100.0], []) == 0.0
+    assert parkinson_vol([100.0, 101.0], [99.0]) == 0.0
+
+
+def test_parkinson_vol_non_positive_price_is_zero():
+    assert parkinson_vol([100.0, 0.0], [99.0, 98.0]) == 0.0
+    assert parkinson_vol([100.0, 101.0], [99.0, -1.0]) == 0.0
+
+
+def test_parkinson_vol_zero_range_is_zero():
+    # high == low every bar -> ln(1) == 0 every bar -> 0.0, not a division
+    # error or NaN.
+    assert parkinson_vol([100.0, 100.0], [100.0, 100.0]) == 0.0
+
+
+def test_parkinson_vol_matches_hand_computed_value():
+    highs = [102.0, 105.0]
+    lows = [98.0, 100.0]
+    expected = math.sqrt(
+        ((math.log(102.0 / 98.0) ** 2) + (math.log(105.0 / 100.0) ** 2)) / 2.0 / (4.0 * math.log(2.0))
+    )
+    assert parkinson_vol(highs, lows) == pytest.approx(expected)
+
+
+def test_parkinson_vol_wider_range_is_more_volatile():
+    calm_highs, calm_lows = [101.0, 101.0], [99.0, 99.0]
+    wild_highs, wild_lows = [120.0, 120.0], [80.0, 80.0]
+    assert parkinson_vol(wild_highs, wild_lows) > parkinson_vol(calm_highs, calm_lows)
+
+
+def test_parkinson_vol_scale_invariant_across_price_levels():
+    # Same proportional high-low range at very different absolute price
+    # levels should read identically — this is a ratio-based estimator,
+    # not a raw-price one.
+    altcoin_highs, altcoin_lows = [1.02, 1.02], [0.98, 0.98]
+    btc_highs, btc_lows = [61_200.0, 61_200.0], [58_800.0, 58_800.0]
+    assert parkinson_vol(altcoin_highs, altcoin_lows) == pytest.approx(parkinson_vol(btc_highs, btc_lows), rel=1e-3)

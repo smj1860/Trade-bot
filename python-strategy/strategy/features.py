@@ -37,9 +37,11 @@ from strategy.indicators import (
     cci,
     ema_ratio,
     macd_histogram,
+    parkinson_vol,
     realized_vol,
     rsi,
     sma_ratio,
+    volume_ratio,
     williams_percent_r,
 )
 
@@ -66,6 +68,14 @@ class Features:
     macd_histogram: float = 0.0
     cci: float = 0.0
     williams_percent_r: float = 0.0
+    # Volume-derived features (see strategy/indicators.py's volume_ratio/
+    # parkinson_vol module docs). Both need strategy/bars.py's BarAggregator
+    # to have real traded volume for this symbol (via on_trade()) to read
+    # as anything but a flat 0.0/near-0.0 — a symbol only ever fed on_tick
+    # book-snapshot ticks has no real volume history to compute these from,
+    # same "no opinion" convention as every other not-enough-history case.
+    volume_ratio: float = 0.0
+    parkinson_vol: float = 0.0
 
 
 class _SymbolState:
@@ -219,6 +229,11 @@ class FeatureEngine:
                 self._bars.window(symbol, self._williams_r_window),
                 self._bars.high_window(symbol, self._williams_r_window),
                 self._bars.low_window(symbol, self._williams_r_window),
+            ),
+            volume_ratio=volume_ratio(self._bars.volume_window(symbol, self._vol_window)),
+            parkinson_vol=parkinson_vol(
+                self._bars.high_window(symbol, self._vol_window),
+                self._bars.low_window(symbol, self._vol_window),
             ),
         )
 
