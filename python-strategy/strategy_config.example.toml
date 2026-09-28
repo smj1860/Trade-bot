@@ -6,6 +6,12 @@
 
 [connection]
 rust_core_addr = "localhost:50051"
+# Dead-man's switch heartbeat interval (see strategy/engine.py's
+# _heartbeat_loop and rust-core/src/heartbeat.rs). Keep this comfortably
+# under the Rust side's dead_man_switch.heartbeat_timeout_secs
+# (config.example.toml, default 30s) — the default here gives six
+# heartbeats per timeout window.
+heartbeat_interval_secs = 5.0
 
 [strategy]
 name = "imbalance_momentum"

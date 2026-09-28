@@ -67,7 +67,42 @@ class Engine:
             await asyncio.gather(
                 self._market_data_loop(market_stub, order_stub),
                 self._order_update_loop(order_stub),
+                self._heartbeat_loop(order_stub),
             )
+
+    async def _heartbeat_loop(self, order_stub) -> None:
+        # Institutional audit Phase 1.1: the Rust side's dead-man's switch
+        # (rust-core/src/heartbeat.rs) treats this strategy as dead — and
+        # cancels its resting orders and/or flattens its positions,
+        # depending on config — once it stops seeing these calls for
+        # dead_man_switch.heartbeat_timeout_secs. This loop is the other
+        # half of that: it must keep running independently of whether the
+        # strategy is actually generating signals right now (a quiet
+        # market is not a dead process), which is why it's its own
+        # asyncio.gather task rather than piggybacked on the market-data
+        # loop.
+        interval = self.config.connection.heartbeat_interval_secs
+        heartbeat = trading_pb2.Heartbeat(strategy_id=self.strategy.strategy_id)
+        while True:
+            try:
+                ack = await order_stub.SendHeartbeat(heartbeat)
+                if ack.heartbeat_timeout_secs and interval * 2 > ack.heartbeat_timeout_secs:
+                    self.log.log(
+                        "heartbeat_interval_too_close_to_timeout",
+                        interval_secs=interval,
+                        rust_timeout_secs=ack.heartbeat_timeout_secs,
+                        note="this process's heartbeat interval is not comfortably under Rust's configured "
+                        "dead_man_switch.heartbeat_timeout_secs — a single slow/missed call could trip it",
+                    )
+            except grpc.aio.AioRpcError as e:
+                # A single failed heartbeat isn't fatal — it just means
+                # this tick didn't reset Rust's staleness clock. Logged so
+                # sustained failures are visible, not raised, since a
+                # transient network hiccup here shouldn't crash the whole
+                # strategy process (that would be a self-inflicted version
+                # of exactly what this loop exists to detect).
+                self.log.log("heartbeat_error", detail=str(e))
+            await asyncio.sleep(interval)
 
     async def _market_data_loop(self, market_stub, order_stub) -> None:
         request = trading_pb2.SubscribeRequest(symbols=list(self.config.strategy.symbols))

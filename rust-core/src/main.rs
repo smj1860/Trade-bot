@@ -1,6 +1,7 @@
 mod alerting;
 mod config;
 mod guardrails;
+mod heartbeat;
 mod kraken;
 mod kraken_private_ws;
 mod kraken_rest;
@@ -20,6 +21,7 @@ use tonic::transport::Server;
 
 use alerting::{possible_missed_fills_message, AlertSink};
 use config::Config;
+use heartbeat::HeartbeatMonitor;
 use kraken_rest::{KrakenCredentials, KrakenRestClient};
 use market_data::MarketDataServiceImpl;
 use order::OrderServiceImpl;
@@ -228,19 +230,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let execution_clients = Arc::new(execution_clients);
 
+    // Institutional audit Phase 1.1: dead-man's switch. `heartbeat_monitor`
+    // is shared between the gRPC service (which records a heartbeat on
+    // every SendHeartbeat call) and the watchdog task below (which reads
+    // it); `order_service` itself is shared the same way so the watchdog
+    // can submit a synthetic flatten order through the exact same
+    // risk-evaluation path a real order takes. See heartbeat.rs.
+    let heartbeat_monitor = Arc::new(HeartbeatMonitor::new());
+    let order_service = OrderServiceImpl::new(
+        risk_engine.clone(),
+        config.clone(),
+        execution_clients.clone(),
+        order_updates_tx,
+        strategy_registry,
+        store.clone(),
+        heartbeat_monitor.clone(),
+    );
+    tokio::spawn(heartbeat::run_watchdog(
+        heartbeat_monitor,
+        config.clone(),
+        order_service.clone(),
+        execution_clients,
+        store,
+        risk_engine,
+        alert_sink,
+    ));
+
     let addr = "0.0.0.0:50051".parse()?;
     tracing::info!(%addr, "trading-core gRPC server starting");
 
     Server::builder()
         .add_service(MarketDataServiceServer::new(MarketDataServiceImpl::new(tx)))
-        .add_service(OrderServiceServer::new(OrderServiceImpl::new(
-            risk_engine,
-            config,
-            execution_clients,
-            order_updates_tx,
-            strategy_registry,
-            store,
-        )))
+        .add_service(OrderServiceServer::new(order_service))
         .serve(addr)
         .await?;
 

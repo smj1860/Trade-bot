@@ -225,6 +225,71 @@ impl Default for PersistenceConfig {
     }
 }
 
+fn default_heartbeat_timeout_secs() -> u64 {
+    30
+}
+
+fn default_watchdog_check_interval_secs() -> u64 {
+    5
+}
+
+fn default_auto_cancel_orders() -> bool {
+    true
+}
+
+/// Institutional audit Phase 1.1: if a strategy process stops sending
+/// heartbeats (see heartbeat.rs, trading.proto's SendHeartbeat), this
+/// process notices and reacts rather than leaving open orders/positions
+/// unattended. Defaults to enabled with cancel-only behavior — canceling
+/// resting orders is the lower-risk reaction, so it's on by default;
+/// automatically flattening positions is a stronger, opt-in action (see
+/// `auto_flatten_positions`'s own docs).
+#[derive(Debug, Deserialize, Clone)]
+pub struct DeadManSwitchConfig {
+    #[serde(default = "default_dead_man_switch_enabled")]
+    pub enabled: bool,
+    /// How long a strategy_id can go without a heartbeat before it's
+    /// treated as dead. Should be comfortably longer than whatever
+    /// interval the Python side actually heartbeats at.
+    #[serde(default = "default_heartbeat_timeout_secs")]
+    pub heartbeat_timeout_secs: u64,
+    /// How often the watchdog task checks for stale strategies.
+    #[serde(default = "default_watchdog_check_interval_secs")]
+    pub check_interval_secs: u64,
+    /// Cancel that strategy's resting orders once it's declared dead. On
+    /// by default. Note: with today's market-order-only execution path
+    /// (see the institutional audit's Phase 1.3), there is rarely
+    /// anything resting to cancel — a market order fills or is rejected
+    /// immediately. This becomes load-bearing once a maker/limit-order
+    /// path lands.
+    #[serde(default = "default_auto_cancel_orders")]
+    pub auto_cancel_orders: bool,
+    /// Submit a reduce-to-flat order for every symbol with a nonzero
+    /// tracked position once a strategy is declared dead. Off by default
+    /// — this is the stronger action (it changes what's held, not just
+    /// what's resting), and today's flat-quantity-only order sizing means
+    /// a flatten order could itself be a large, un-vol-scaled trade. Turn
+    /// this on deliberately, with eyes open, not as a default.
+    #[serde(default)]
+    pub auto_flatten_positions: bool,
+}
+
+fn default_dead_man_switch_enabled() -> bool {
+    true
+}
+
+impl Default for DeadManSwitchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_dead_man_switch_enabled(),
+            heartbeat_timeout_secs: default_heartbeat_timeout_secs(),
+            check_interval_secs: default_watchdog_check_interval_secs(),
+            auto_cancel_orders: default_auto_cancel_orders(),
+            auto_flatten_positions: false,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub general: GeneralConfig,
@@ -235,6 +300,8 @@ pub struct Config {
     pub execution: ExecutionConfig,
     #[serde(default)]
     pub persistence: PersistenceConfig,
+    #[serde(default)]
+    pub dead_man_switch: DeadManSwitchConfig,
 }
 
 impl Config {

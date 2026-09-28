@@ -213,6 +213,34 @@ pub enum AddOrderOutcome {
     KrakenRejected { messages: Vec<String> },
 }
 
+/// Outcome of `KrakenRestClient::cancel_order`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CancelOrderOutcome {
+    /// Kraken canceled a resting order.
+    Canceled,
+    /// Kraken's `error` array was non-empty — a business-level rejection.
+    KrakenRejected { messages: Vec<String> },
+    /// No error, but `count` was 0 or missing — the order was already
+    /// filled, already canceled, or never existed. Treated the same as
+    /// success by callers that just want "make sure this isn't resting
+    /// anymore," since that's already true.
+    AlreadyClosed,
+}
+
+/// Maps a Kraken CancelOrder response's `error` array and `count` onto
+/// `CancelOrderOutcome`. Pure and synchronous so it's testable without a
+/// network call, the same split `reconcile.rs`'s `resolve_closed_status`
+/// uses for its own response-classification logic.
+fn classify_cancel_response(error: &[String], count: Option<u64>) -> CancelOrderOutcome {
+    if !error.is_empty() {
+        return CancelOrderOutcome::KrakenRejected { messages: error.to_vec() };
+    }
+    match count {
+        Some(c) if c > 0 => CancelOrderOutcome::Canceled,
+        _ => CancelOrderOutcome::AlreadyClosed,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum KrakenRestError {
     #[error("request to Kraken failed: {0}")]
@@ -234,6 +262,7 @@ const GET_WEBSOCKETS_TOKEN_PATH: &str = "/0/private/GetWebSocketsToken";
 const OPEN_ORDERS_PATH: &str = "/0/private/OpenOrders";
 const QUERY_ORDERS_PATH: &str = "/0/private/QueryOrders";
 const BALANCE_PATH: &str = "/0/private/Balance";
+const CANCEL_ORDER_PATH: &str = "/0/private/CancelOrder";
 /// Kraken's own documented cap on how many transaction IDs a single
 /// QueryOrders call accepts.
 const QUERY_ORDERS_MAX_TXIDS: usize = 50;
@@ -330,6 +359,36 @@ impl KrakenRestClient {
 
         let exchange_order_id = parsed.result.and_then(|r| r.txid.into_iter().next());
         Ok(AddOrderOutcome::Accepted { exchange_order_id })
+    }
+
+    /// Cancels a single resting order by its Kraken transaction ID.
+    /// Currently unused by any live order flow — every order this project
+    /// places today is a MARKET order, which Kraken either fills or
+    /// rejects immediately, leaving nothing resting to cancel. This
+    /// exists for the dead-man's switch (`heartbeat.rs`), which needs
+    /// *something* to call if the strategy process goes dark while an
+    /// order is resting, and becomes load-bearing the moment a maker/
+    /// limit-order path (see the institutional audit's Phase 1.3) adds
+    /// orders that actually rest on the book.
+    ///
+    /// Kraken's `count` field in a successful response can be 0 even
+    /// without an `error` — e.g. the order already filled or was already
+    /// canceled a moment earlier — so this is reported as `AlreadyClosed`
+    /// rather than treated as a hard failure; the caller almost never
+    /// wants to distinguish "nothing to cancel" from "network trouble."
+    pub async fn cancel_order(&self, txid: &str) -> Result<CancelOrderOutcome, KrakenRestError> {
+        #[derive(Debug, Deserialize)]
+        struct CancelOrderResult {
+            #[serde(default)]
+            count: u64,
+        }
+
+        let form = vec![("txid", txid.to_string())];
+        let text = self.signed_post(CANCEL_ORDER_PATH, form).await?;
+        let parsed: KrakenResponse<CancelOrderResult> = serde_json::from_str(&text)
+            .map_err(|e| KrakenRestError::Parse(format!("{e} — raw body: {text}")))?;
+
+        Ok(classify_cancel_response(&parsed.error, parsed.result.map(|r| r.count)))
     }
 
     /// Fetches a fresh token for the private WebSocket feed. This uses the
@@ -622,5 +681,26 @@ mod tests {
             serde_json::from_str(r#"{"error": [], "result": {"ZUSD": "1000.0000", "XXBT": "0.5000000000"}}"#).unwrap();
         let balances = parsed.result.unwrap();
         assert_eq!(balances.get("ZUSD").map(String::as_str), Some("1000.0000"));
+    }
+
+    #[test]
+    fn classify_cancel_response_reports_canceled_when_count_is_positive() {
+        assert_eq!(classify_cancel_response(&[], Some(1)), CancelOrderOutcome::Canceled);
+    }
+
+    #[test]
+    fn classify_cancel_response_reports_already_closed_on_zero_count() {
+        assert_eq!(classify_cancel_response(&[], Some(0)), CancelOrderOutcome::AlreadyClosed);
+    }
+
+    #[test]
+    fn classify_cancel_response_reports_already_closed_on_missing_count() {
+        assert_eq!(classify_cancel_response(&[], None), CancelOrderOutcome::AlreadyClosed);
+    }
+
+    #[test]
+    fn classify_cancel_response_prioritizes_a_kraken_error_over_count() {
+        let outcome = classify_cancel_response(&["EOrder:Unknown order".to_string()], Some(1));
+        assert_eq!(outcome, CancelOrderOutcome::KrakenRejected { messages: vec!["EOrder:Unknown order".to_string()] });
     }
 }

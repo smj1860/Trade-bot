@@ -127,6 +127,30 @@ message SubscribeRequest {
   repeated string symbols = 1;
 }
 
+message StreamOrderUpdatesRequest {
+  string strategy_id = 1; // empty = all strategies
+}
+
+// --- Dead-man's switch: Python -> Rust --------------------------------------
+//
+// The strategy process is expected to call Heartbeat on an interval well
+// under the Rust side's configured `dead_man_switch.heartbeat_timeout_secs`
+// (see config.rs). If Rust stops seeing heartbeats for a given strategy_id
+// past that timeout, it treats the strategy as dead: canceling that
+// strategy's resting orders and, if configured, flattening its open
+// positions. See rust-core/src/heartbeat.rs.
+message Heartbeat {
+  string strategy_id = 1;
+}
+
+message HeartbeatAck {
+  // Echoes back the timeout this strategy is being held to, so the Python
+  // side can log/alert if its own heartbeat interval isn't comfortably
+  // under it — cheap to expose, avoids two processes' configs silently
+  // drifting apart.
+  int64 heartbeat_timeout_secs = 1;
+}
+
 service OrderService {
   // Python submits a decision; Rust runs risk checks and forwards to the
   // exchange if it passes.
@@ -135,8 +159,8 @@ service OrderService {
   // Python subscribes to the full order lifecycle stream (acks, fills,
   // rejections) across all strategies.
   rpc StreamOrderUpdates(StreamOrderUpdatesRequest) returns (stream OrderUpdate);
-}
 
-message StreamOrderUpdatesRequest {
-  string strategy_id = 1; // empty = all strategies
+  // Called on an interval by a live strategy process — see the
+  // dead-man's-switch docs above.
+  rpc SendHeartbeat(Heartbeat) returns (HeartbeatAck);
 }

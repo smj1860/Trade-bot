@@ -9,11 +9,12 @@ use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
 use crate::config::Config;
+use crate::heartbeat::HeartbeatMonitor;
 use crate::kraken_rest::{AddOrderOutcome, AddOrderRequest, KrakenRestClient, OrderSide as KrakenSide};
 use crate::persistence::{order_status_label, OrderRecord, Store};
 use crate::proto::pb::{
-    order_service_server::OrderService, OrderRequest, OrderSide, OrderStatus, OrderType, OrderUpdate,
-    StreamOrderUpdatesRequest,
+    order_service_server::OrderService, Heartbeat, HeartbeatAck, OrderRequest, OrderSide, OrderStatus, OrderType,
+    OrderUpdate, StreamOrderUpdatesRequest,
 };
 use crate::risk::{RiskEngine, RiskVerdict};
 
@@ -36,6 +37,7 @@ pub type StrategyRegistry = Arc<Mutex<HashMap<String, String>>>;
 /// execution client is configured for the order's exchange (no API
 /// credentials were set at startup), that is reported honestly rather
 /// than silently dropped or faked as a success.
+#[derive(Clone)]
 pub struct OrderServiceImpl {
     risk: Arc<RiskEngine>,
     config: Arc<Config>,
@@ -46,6 +48,11 @@ pub struct OrderServiceImpl {
     /// open at startup) — order submissions still work, they just leave no
     /// record behind that survives a restart.
     store: Option<Arc<Store>>,
+    /// Institutional audit Phase 1.1's dead-man's switch bookkeeping — see
+    /// heartbeat.rs. `Clone`d (it's an `Arc` internally-shared type; see
+    /// heartbeat.rs) into the watchdog task spawned in main.rs, which reads
+    /// the same state this service's `send_heartbeat` writes to.
+    heartbeat_monitor: Arc<HeartbeatMonitor>,
 }
 
 impl OrderServiceImpl {
@@ -56,6 +63,7 @@ impl OrderServiceImpl {
         order_updates: broadcast::Sender<OrderUpdate>,
         strategy_registry: StrategyRegistry,
         store: Option<Arc<Store>>,
+        heartbeat_monitor: Arc<HeartbeatMonitor>,
     ) -> Self {
         Self {
             risk,
@@ -64,6 +72,50 @@ impl OrderServiceImpl {
             order_updates,
             strategy_registry,
             store,
+            heartbeat_monitor,
+        }
+    }
+
+    /// Shared by both the public `submit_order` RPC handler and the
+    /// dead-man's-switch watchdog task (main.rs), which needs to submit a
+    /// synthetic reduce-to-flat order internally — not over gRPC — when a
+    /// strategy is declared dead with `auto_flatten_positions` enabled.
+    /// Goes through the exact same risk-evaluation and execution path a
+    /// real Python-submitted order would; the watchdog is not a backdoor
+    /// around risk checks.
+    pub async fn submit_internal(&self, order: OrderRequest) -> Result<OrderUpdate, Status> {
+        match self.risk.evaluate(&order).await {
+            RiskVerdict::Rejected(reason) => {
+                tracing::warn!(
+                    client_order_id = %order.client_order_id,
+                    symbol = %order.symbol,
+                    reason = %reason,
+                    "order rejected by risk engine"
+                );
+                let update = OrderUpdate {
+                    client_order_id: order.client_order_id.clone(),
+                    exchange_order_id: String::new(),
+                    symbol: order.symbol.clone(),
+                    status: OrderStatus::Rejected as i32,
+                    reject_reason: reason,
+                    filled_quantity: None,
+                    remaining_quantity: None,
+                    avg_fill_price: None,
+                    timestamp_ns: now_ns(),
+                };
+                self.persist_order_record(&order, &update);
+                Ok(update)
+            }
+            RiskVerdict::Approved => match self.execute(&order).await {
+                Ok(update) => {
+                    self.persist_order_record(&order, &update);
+                    Ok(update)
+                }
+                Err(status) => {
+                    self.persist_order_error(&order, &status);
+                    Err(status)
+                }
+            },
         }
     }
 
@@ -297,40 +349,18 @@ impl OrderService for OrderServiceImpl {
         request: Request<OrderRequest>,
     ) -> Result<Response<OrderUpdate>, Status> {
         let order = request.into_inner();
+        self.submit_internal(order).await.map(Response::new)
+    }
 
-        match self.risk.evaluate(&order).await {
-            RiskVerdict::Rejected(reason) => {
-                tracing::warn!(
-                    client_order_id = %order.client_order_id,
-                    symbol = %order.symbol,
-                    reason = %reason,
-                    "order rejected by risk engine"
-                );
-                let update = OrderUpdate {
-                    client_order_id: order.client_order_id.clone(),
-                    exchange_order_id: String::new(),
-                    symbol: order.symbol.clone(),
-                    status: OrderStatus::Rejected as i32,
-                    reject_reason: reason,
-                    filled_quantity: None,
-                    remaining_quantity: None,
-                    avg_fill_price: None,
-                    timestamp_ns: now_ns(),
-                };
-                self.persist_order_record(&order, &update);
-                Ok(Response::new(update))
-            }
-            RiskVerdict::Approved => match self.execute(&order).await {
-                Ok(update) => {
-                    self.persist_order_record(&order, &update);
-                    Ok(Response::new(update))
-                }
-                Err(status) => {
-                    self.persist_order_error(&order, &status);
-                    Err(status)
-                }
-            },
+    async fn send_heartbeat(&self, request: Request<Heartbeat>) -> Result<Response<HeartbeatAck>, Status> {
+        let strategy_id = request.into_inner().strategy_id;
+        if strategy_id.is_empty() {
+            return Err(Status::invalid_argument("strategy_id must not be empty"));
         }
+        self.heartbeat_monitor.record(&strategy_id);
+        Ok(Response::new(HeartbeatAck {
+            heartbeat_timeout_secs: self.config.dead_man_switch.heartbeat_timeout_secs as i64,
+        }))
     }
 
     async fn stream_order_updates(

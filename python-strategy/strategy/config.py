@@ -17,6 +17,13 @@ from pathlib import Path
 @dataclass(frozen=True)
 class ConnectionConfig:
     rust_core_addr: str
+    # Institutional audit Phase 1.1's dead-man's switch: how often this
+    # process calls OrderService.SendHeartbeat. Should be comfortably under
+    # the Rust side's configured dead_man_switch.heartbeat_timeout_secs
+    # (default 30s there) — the default here (5s) gives six heartbeats per
+    # timeout window, tolerant of an occasional missed/slow call without
+    # tripping the switch. See rust-core/src/heartbeat.rs.
+    heartbeat_interval_secs: float = 5.0
 
 
 @dataclass(frozen=True)

@@ -757,6 +757,7 @@ mod tests {
                 rate_limit: crate::config::RateLimitConfig::default(),
             },
             persistence: crate::config::PersistenceConfig { database_path: ":memory:".to_string() },
+            dead_man_switch: crate::config::DeadManSwitchConfig::default(),
         }
     }
 

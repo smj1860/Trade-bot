@@ -354,3 +354,29 @@ max_wait_secs = 5.0       # a call needing to wait longer than this fails fast i
 # -----------------------------------------------------------------------------
 [persistence]
 database_path = "./data/trading-core.sqlite3"
+
+# -----------------------------------------------------------------------------
+# Dead-man's switch (institutional audit Phase 1.1, added 2026-09-28). A live
+# strategy process is expected to call OrderService.SendHeartbeat on an
+# interval well under heartbeat_timeout_secs. If this process stops seeing
+# heartbeats for a given strategy_id past that timeout, it treats the
+# strategy as dead and reacts — see rust-core/src/heartbeat.rs for the full
+# mechanics. Every field below has the built-in default shown here even if
+# this whole section is omitted, so an older config.toml keeps working.
+# -----------------------------------------------------------------------------
+[dead_man_switch]
+enabled = true
+heartbeat_timeout_secs = 30    # no heartbeat within this window = strategy declared dead
+check_interval_secs = 5        # how often the watchdog checks for staleness
+auto_cancel_orders = true      # cancel the dead strategy's resting orders
+                                # (today's market-order-only flow means there's
+                                # rarely anything resting to cancel yet — this
+                                # becomes load-bearing once maker/limit orders
+                                # land; see docs/institutional-audit-implementation-plan.md
+                                # in the project docs, Phase 1.3)
+auto_flatten_positions = false # submit a market order to zero out every open
+                                # position for the dead strategy. Off by default:
+                                # this is the stronger action, and today's flat
+                                # (non-vol-scaled) order sizing means a flatten
+                                # order could itself be a large, un-sized-for-the-
+                                # moment trade. Turn on deliberately.
