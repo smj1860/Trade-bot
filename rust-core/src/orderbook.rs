@@ -58,6 +58,13 @@ pub struct OrderBook {
     /// needed — a guardrail check at order-evaluation time just reads
     /// whatever history has already accumulated.
     history: VecDeque<PriceSample>,
+    /// The book's subscribed depth (Kraken's `book` channel `depth`
+    /// parameter), or `None` for an unbounded book (used by tests that
+    /// don't care about depth maintenance). When set, `apply_snapshot` and
+    /// `apply_update` trim each side back down to this many levels after
+    /// every change — see their docs for why this is required, not
+    /// optional, for a depth-limited Kraken subscription.
+    depth: Option<usize>,
 }
 
 impl OrderBook {
@@ -67,7 +74,15 @@ impl OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             history: VecDeque::new(),
+            depth: None,
         }
+    }
+
+    /// Like `new`, but maintains the book at a fixed depth on every
+    /// snapshot/update — what `kraken.rs` uses for a real Kraken
+    /// subscription (see `apply_update`'s docs).
+    pub fn with_depth(symbol: impl Into<String>, depth: usize) -> Self {
+        Self { depth: Some(depth), ..Self::new(symbol) }
     }
 
     /// Replaces the book entirely, as a Kraken "snapshot" message does.
@@ -80,11 +95,26 @@ impl OrderBook {
         for (price, qty) in asks {
             self.asks.insert(price, qty);
         }
+        self.trim_to_depth();
         self.record_history_sample();
     }
 
     /// Applies a delta, as a Kraken "update" message does. A zero quantity
     /// at a price level means that level is removed.
+    ///
+    /// For a depth-limited subscription (Kraken's `book` channel `depth`
+    /// parameter — this codebase always subscribes at `BOOK_DEPTH`), Kraken
+    /// does not reliably pair every new level that enters the window with
+    /// an explicit deletion of the level it displaces: per Kraken's own
+    /// docs, the *client* is responsible for trimming each side back down
+    /// to the subscribed depth after applying a delta, dropping the
+    /// worst-priced excess entries (lowest-price bids, highest-price
+    /// asks). Skipping this step is exactly the kind of bug that looks
+    /// harmless on paper (the book "still holds valid data") but produces
+    /// a checksum computed over the wrong top-10 window — confirmed via
+    /// live testing against Kraken's real feed, where every symbol
+    /// mismatched on its very first post-snapshot update despite the
+    /// applied deltas themselves being entirely correct.
     pub fn apply_update(&mut self, bids: Vec<(Decimal, Decimal)>, asks: Vec<(Decimal, Decimal)>) {
         for (price, qty) in bids {
             if qty.is_zero() {
@@ -100,7 +130,23 @@ impl OrderBook {
                 self.asks.insert(price, qty);
             }
         }
+        self.trim_to_depth();
         self.record_history_sample();
+    }
+
+    /// Drops the worst-priced excess levels on each side down to `depth`
+    /// (a no-op when `depth` is `None`, or already within it). Bids are
+    /// sorted ascending in the BTreeMap, so the worst bid is the lowest
+    /// price (`pop_first`); asks are sorted ascending too, so the worst
+    /// ask is the highest price (`pop_last`).
+    fn trim_to_depth(&mut self) {
+        let Some(depth) = self.depth else { return };
+        while self.bids.len() > depth {
+            self.bids.pop_first();
+        }
+        while self.asks.len() > depth {
+            self.asks.pop_last();
+        }
     }
 
     /// Appends a `PriceSample` from the book's current best bid/ask (a
@@ -203,6 +249,56 @@ mod tests {
         );
         book.apply_update(vec![(d("100.0"), d("0"))], vec![]);
         assert_eq!(book.best_bid(), Some((d("99.0"), d("2.0"))));
+    }
+
+    #[test]
+    fn unbounded_book_never_trims_when_no_depth_is_set() {
+        // OrderBook::new (no depth) is what most of this module's other
+        // tests use — confirms that path is unaffected by the trimming
+        // added for with_depth.
+        let mut book = OrderBook::new("BTC-USD");
+        book.apply_snapshot(
+            vec![(d("100.0"), d("1.0")), (d("99.0"), d("1.0")), (d("98.0"), d("1.0"))],
+            vec![],
+        );
+        assert_eq!(book.bid_levels(10).len(), 3);
+    }
+
+    #[test]
+    fn with_depth_trims_a_snapshot_that_arrives_oversized() {
+        let mut book = OrderBook::with_depth("BTC-USD", 2);
+        book.apply_snapshot(
+            vec![(d("100.0"), d("1.0")), (d("99.0"), d("1.0")), (d("98.0"), d("1.0"))],
+            vec![(d("101.0"), d("1.0")), (d("102.0"), d("1.0")), (d("103.0"), d("1.0"))],
+        );
+        // Worst bid (lowest price, 98.0) and worst ask (highest price,
+        // 103.0) are the ones dropped to get back to depth 2.
+        assert_eq!(book.bid_levels(10), vec![(d("100.0"), d("1.0")), (d("99.0"), d("1.0"))]);
+        assert_eq!(book.ask_levels(10), vec![(d("101.0"), d("1.0")), (d("102.0"), d("1.0"))]);
+    }
+
+    #[test]
+    fn with_depth_trims_the_worst_level_when_a_new_one_pushes_the_book_over_depth() {
+        // Reproduces the real bug this trimming fixes: a depth-limited
+        // Kraken subscription doesn't always pair a new level entering
+        // the top-N with an explicit deletion of the level it displaces —
+        // per Kraken's own docs, the client must trim back down to depth
+        // itself. Without this, live testing showed every symbol's book
+        // checksum mismatching on its very first post-snapshot update.
+        let mut book = OrderBook::with_depth("BTC-USD", 2);
+        book.apply_snapshot(
+            vec![],
+            vec![(d("100.0"), d("1.0")), (d("101.0"), d("1.0"))],
+        );
+        // A new, worse ask arrives with no accompanying deletion.
+        book.apply_update(vec![], vec![(d("99.5"), d("1.0"))]);
+
+        assert_eq!(
+            book.ask_levels(10),
+            vec![(d("99.5"), d("1.0")), (d("100.0"), d("1.0"))],
+            "the book should have trimmed the new worst level (101.0) to stay at depth 2, \
+             matching what a depth-limited Kraken subscription itself would show"
+        );
     }
 
     #[test]

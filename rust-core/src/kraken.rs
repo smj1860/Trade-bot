@@ -25,6 +25,7 @@ use rust_decimal::Decimal;
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::checksum::compute_book_checksum;
 use crate::config::{ExchangeConfig, SymbolConfig};
 use crate::orderbook::{OrderBook, SharedBooks};
 use crate::proto::pb::market_data_event::Event;
@@ -103,6 +104,14 @@ async fn connect_and_stream(
         .map(|s| (s.exchange_native_symbol.clone(), s.symbol.clone()))
         .collect();
 
+    // native symbol -> (price_decimals, qty_decimals), for padding checksum
+    // input to the pair's fixed precision (see checksum.rs's top-level
+    // docs for why this padding is required, not optional).
+    let checksum_decimals: HashMap<String, (u32, u32)> = symbols
+        .iter()
+        .map(|s| (s.exchange_native_symbol.clone(), (s.price_decimals(), s.qty_decimals())))
+        .collect();
+
     while let Some(msg) = read.next().await {
         let msg = msg?;
         let text = match msg {
@@ -138,7 +147,16 @@ async fn connect_and_stream(
         match channel {
             Some("book") => {
                 for entry in entries {
-                    handle_book_entry(entry, msg_type, exchange, &native_to_normalized, books, tx).await;
+                    handle_book_entry(
+                        entry,
+                        msg_type,
+                        exchange,
+                        &native_to_normalized,
+                        &checksum_decimals,
+                        books,
+                        tx,
+                    )
+                    .await?;
                 }
             }
             Some("trade") => {
@@ -153,45 +171,103 @@ async fn connect_and_stream(
     Ok(())
 }
 
+/// Applies one book entry to local state and publishes the resulting
+/// levels. Returns `Err` only for a checksum mismatch (see checksum.rs) —
+/// deliberately propagated up through `connect_and_stream` to force a full
+/// reconnect+resubscribe, which is the simplest way to guarantee every
+/// symbol's book gets a fresh, trustworthy snapshot again. A narrower
+/// per-symbol resubscribe was considered and rejected for a first version:
+/// it would need its own unsubscribe/subscribe round-trip whose behavior
+/// under Kraken's real v2 API has not been exercised here, whereas the
+/// full-reconnect path reuses `run()`'s existing, already-tested backoff
+/// loop. The cost is momentarily dropping every symbol's book on one
+/// symbol's desync, not just the affected one — an accepted trade-off for
+/// how rare a checksum mismatch should be in practice.
 async fn handle_book_entry(
     entry: &serde_json::Value,
     msg_type: &str,
     exchange: &ExchangeConfig,
     native_to_normalized: &HashMap<String, String>,
+    checksum_decimals: &HashMap<String, (u32, u32)>,
     books: &SharedBooks,
     tx: &broadcast::Sender<MarketDataEvent>,
-) {
+) -> anyhow::Result<()> {
     let Some(native_symbol) = entry.get("symbol").and_then(|s| s.as_str()) else {
-        return;
+        return Ok(());
     };
     let Some(normalized_symbol) = native_to_normalized.get(native_symbol) else {
         tracing::warn!(%native_symbol, "book update for a symbol we didn't subscribe to");
-        return;
+        return Ok(());
     };
+    // Defaults to (0, 0) — i.e. no padding — only if a symbol somehow has
+    // no decimals entry, which can't happen via connect_and_stream's
+    // construction (same `symbols` slice builds both maps) but would
+    // otherwise silently reintroduce the unpadded-checksum bug rather than
+    // failing loudly, so tests that build this map by hand must populate it.
+    let &(price_decimals, qty_decimals) = checksum_decimals.get(native_symbol).unwrap_or(&(0, 0));
 
     let bids = parse_levels(entry.get("bids"));
     let asks = parse_levels(entry.get("asks"));
+    // Kraken sends this as a JSON number; `arbitrary_precision` (see
+    // parse_levels' docs) doesn't affect integers, but `as_u64` handles it
+    // regardless of the exact JSON number representation.
+    let received_checksum = entry.get("checksum").and_then(|c| c.as_u64());
 
-    // Hold the lock only long enough to apply the delta and read back the
-    // levels we're about to publish — never across an await point, so a
-    // slow subscriber can't stall ingestion.
-    let (published_bids, published_asks) = {
+    // Hold the lock only long enough to apply the delta, validate the
+    // checksum, and read back the levels we're about to publish — never
+    // across an await point, so a slow subscriber can't stall ingestion.
+    let (published_bids, published_asks, checksum_mismatch) = {
         let mut guard = books.lock().await;
         let book = guard
             .entry(normalized_symbol.clone())
-            .or_insert_with(|| OrderBook::new(normalized_symbol.clone()));
+            .or_insert_with(|| OrderBook::with_depth(normalized_symbol.clone(), BOOK_DEPTH));
 
         match msg_type {
             "snapshot" => book.apply_snapshot(bids, asks),
             "update" => book.apply_update(bids, asks),
             other => {
                 tracing::debug!(msg_type = other, "unhandled book message type");
-                return;
+                return Ok(());
             }
         }
 
-        (book.bid_levels(PUBLISHED_LEVELS), book.ask_levels(PUBLISHED_LEVELS))
+        let computed_checksum =
+            compute_book_checksum(&book.ask_levels(10), &book.bid_levels(10), price_decimals, qty_decimals);
+        let mismatch = match received_checksum {
+            Some(expected) if u64::from(computed_checksum) != expected => {
+                tracing::error!(
+                    symbol = %normalized_symbol,
+                    msg_type,
+                    expected,
+                    computed = computed_checksum,
+                    top_asks = ?book.ask_levels(10),
+                    top_bids = ?book.bid_levels(10),
+                    raw_entry = %entry,
+                    "order book checksum mismatch — local book is desynced from Kraken's, \
+                     dropping local state and forcing a reconnect+resubscribe"
+                );
+                true
+            }
+            // No checksum field on this message (or one that already
+            // matches) — nothing wrong here.
+            _ => false,
+        };
+
+        let published_bids = book.bid_levels(PUBLISHED_LEVELS);
+        let published_asks = book.ask_levels(PUBLISHED_LEVELS);
+        // `book`'s borrow of `guard` ends with the reads above, so
+        // mutating `guard` directly below (still under the same lock
+        // hold) is fine.
+        if mismatch {
+            guard.remove(normalized_symbol);
+        }
+
+        (published_bids, published_asks, mismatch)
     };
+
+    if checksum_mismatch {
+        anyhow::bail!("order book checksum mismatch for {normalized_symbol}");
+    }
 
     let event = MarketDataEvent {
         event: Some(Event::OrderBookUpdate(OrderBookUpdate {
@@ -201,13 +277,14 @@ async fn handle_book_entry(
             received_timestamp_ns: now_ns(),
             bids: to_levels(published_bids),
             asks: to_levels(published_asks),
-            sequence: 0, // Kraken v2's checksum serves this role; not wired in yet
+            sequence: 0, // Kraken v2's own book checksum (validated above) serves this role instead
         })),
     };
 
     // No subscribers yet is not an error — the ingestion loop keeps the
     // book warm regardless of whether anyone's listening.
     let _ = tx.send(event);
+    Ok(())
 }
 
 fn handle_trade_entry(
@@ -391,5 +468,170 @@ mod tests {
     fn parse_trade_entry_unparseable_price_returns_none() {
         let entry = serde_json::json!({ "price": "not-a-number", "qty": 1.0 });
         assert!(parse_trade_entry(&entry).is_none());
+    }
+
+    fn test_exchange() -> ExchangeConfig {
+        ExchangeConfig {
+            name: "kraken".into(),
+            ws_url: "wss://ws.kraken.com/v2".into(),
+            rest_url: "https://api.kraken.com".into(),
+            enabled: true,
+        }
+    }
+
+    // Built via serde_json::from_str on real JSON text, not the `json!`
+    // macro — deliberately, so this exercises the exact same
+    // arbitrary_precision string-preserving parse path production code
+    // uses (see parse_levels' docs), which a float literal built through
+    // `json!` would not reliably go through.
+    fn book_snapshot_entry(checksum: &str) -> serde_json::Value {
+        let raw = format!(
+            r#"{{"symbol": "BTC/USD", "bids": [{{"price": 99.0, "qty": 1.0}}], "asks": [{{"price": 100.0, "qty": 1.0}}], "checksum": {checksum}}}"#
+        );
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    // Both test levels are already at 1 decimal place, so price_decimals=1,
+    // qty_decimals=1 is a no-op pad here — realistic per-pair values are
+    // exercised separately in checksum.rs and config.rs.
+    const TEST_PRICE_DECIMALS: u32 = 1;
+    const TEST_QTY_DECIMALS: u32 = 1;
+
+    fn test_checksum_decimals() -> HashMap<String, (u32, u32)> {
+        let mut m = HashMap::new();
+        m.insert("BTC/USD".to_string(), (TEST_PRICE_DECIMALS, TEST_QTY_DECIMALS));
+        m
+    }
+
+    fn expected_checksum_for_test_book() -> u32 {
+        let d = |s: &str| Decimal::from_str(s).unwrap();
+        crate::checksum::compute_book_checksum(
+            &[(d("100.0"), d("1.0"))],
+            &[(d("99.0"), d("1.0"))],
+            TEST_PRICE_DECIMALS,
+            TEST_QTY_DECIMALS,
+        )
+    }
+
+    #[tokio::test]
+    async fn handle_book_entry_accepts_a_matching_checksum_and_keeps_the_book() {
+        let books = crate::orderbook::new_shared_books();
+        let (tx, _rx) = broadcast::channel(16);
+        let mut native_to_normalized = HashMap::new();
+        native_to_normalized.insert("BTC/USD".to_string(), "BTC-USD".to_string());
+        let checksum_decimals = test_checksum_decimals();
+
+        let entry = book_snapshot_entry(&expected_checksum_for_test_book().to_string());
+        let result = handle_book_entry(
+            &entry,
+            "snapshot",
+            &test_exchange(),
+            &native_to_normalized,
+            &checksum_decimals,
+            &books,
+            &tx,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(books.lock().await.contains_key("BTC-USD"));
+    }
+
+    #[tokio::test]
+    async fn handle_book_entry_rejects_a_mismatched_checksum_and_drops_the_book() {
+        let books = crate::orderbook::new_shared_books();
+        let (tx, _rx) = broadcast::channel(16);
+        let mut native_to_normalized = HashMap::new();
+        native_to_normalized.insert("BTC/USD".to_string(), "BTC-USD".to_string());
+        let checksum_decimals = test_checksum_decimals();
+
+        // Deliberately wrong — one off the real value.
+        let wrong = expected_checksum_for_test_book().wrapping_add(1);
+        let entry = book_snapshot_entry(&wrong.to_string());
+        let result = handle_book_entry(
+            &entry,
+            "snapshot",
+            &test_exchange(),
+            &native_to_normalized,
+            &checksum_decimals,
+            &books,
+            &tx,
+        )
+        .await;
+
+        assert!(result.is_err(), "a checksum mismatch should force a reconnect via an Err");
+        assert!(
+            !books.lock().await.contains_key("BTC-USD"),
+            "the desynced book should be dropped, not left for something else to trust"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_book_entry_with_no_checksum_field_is_accepted() {
+        // Defensive: if a message type ever omits checksum, this must not
+        // be treated as a mismatch.
+        let books = crate::orderbook::new_shared_books();
+        let (tx, _rx) = broadcast::channel(16);
+        let mut native_to_normalized = HashMap::new();
+        native_to_normalized.insert("BTC/USD".to_string(), "BTC-USD".to_string());
+        let checksum_decimals = test_checksum_decimals();
+
+        let raw = r#"{"symbol": "BTC/USD", "bids": [{"price": 99.0, "qty": 1.0}], "asks": [{"price": 100.0, "qty": 1.0}]}"#;
+        let entry: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let result = handle_book_entry(
+            &entry,
+            "snapshot",
+            &test_exchange(),
+            &native_to_normalized,
+            &checksum_decimals,
+            &books,
+            &tx,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(books.lock().await.contains_key("BTC-USD"));
+    }
+
+    #[tokio::test]
+    async fn handle_book_entry_pads_to_configured_decimals_so_kraken_trailing_zero_stripping_matches() {
+        // Regression test for the real production incident this padding
+        // fix addresses: a book entry whose price/qty arrive with FEWER
+        // digits than the pair's configured precision (exactly what
+        // Kraken's own wire messages do — see checksum.rs's docs) must
+        // still validate correctly once padded to that precision, not be
+        // treated as a mismatch just because the wire text was shorter
+        // than the fully-padded form.
+        let books = crate::orderbook::new_shared_books();
+        let (tx, _rx) = broadcast::channel(16);
+        let mut native_to_normalized = HashMap::new();
+        native_to_normalized.insert("BTC/USD".to_string(), "BTC-USD".to_string());
+        let mut checksum_decimals = HashMap::new();
+        checksum_decimals.insert("BTC/USD".to_string(), (7u32, 8u32));
+
+        let d = |s: &str| Decimal::from_str(s).unwrap();
+        // Expected checksum computed as Kraken would: pad "99" -> 7 decimals
+        // and "1" -> 8 decimals before stripping, even though the wire
+        // entry below sends bare integers.
+        let expected =
+            crate::checksum::compute_book_checksum(&[(d("100"), d("1"))], &[(d("99"), d("1"))], 7, 8);
+
+        let raw = format!(
+            r#"{{"symbol": "BTC/USD", "bids": [{{"price": 99, "qty": 1}}], "asks": [{{"price": 100, "qty": 1}}], "checksum": {expected}}}"#
+        );
+        let entry: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let result = handle_book_entry(
+            &entry,
+            "snapshot",
+            &test_exchange(),
+            &native_to_normalized,
+            &checksum_decimals,
+            &books,
+            &tx,
+        )
+        .await;
+
+        assert!(result.is_ok(), "padding to configured decimals should make this checksum match: {result:?}");
+        assert!(books.lock().await.contains_key("BTC-USD"));
     }
 }

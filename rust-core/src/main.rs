@@ -1,4 +1,5 @@
 mod alerting;
+mod checksum;
 mod config;
 mod guardrails;
 mod heartbeat;

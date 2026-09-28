@@ -2,8 +2,10 @@
 //! strongly-typed structs. Nothing here is exchange- or asset-specific:
 //! symbols, exchanges, and risk limits are all just data.
 
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::path::Path;
+use std::str::FromStr;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct GeneralConfig {
@@ -43,6 +45,31 @@ pub struct SymbolConfig {
     pub lot_size: String,
     pub enabled: bool,
     pub risk: SymbolRisk,
+}
+
+impl SymbolConfig {
+    /// The number of decimal places Kraken's own order-book checksum
+    /// expects prices on this pair to be padded to (see checksum.rs's
+    /// top-level docs for why this matters). Derived from `tick_size`
+    /// rather than hardcoded per-pair, since `tick_size` is already this
+    /// codebase's source of truth for the pair's price precision and, per
+    /// live testing, matches Kraken's `pair_decimals` exactly. Falls back
+    /// to 0 for an unparseable `tick_size` rather than panicking — checksum
+    /// validation degrading to (probably-wrong) padding on a config typo is
+    /// preferable to taking down ingestion for every symbol over it.
+    pub fn price_decimals(&self) -> u32 {
+        decimal_places(&self.tick_size)
+    }
+
+    /// Same as `price_decimals`, but for quantities via `lot_size`
+    /// (Kraken's `lot_decimals`).
+    pub fn qty_decimals(&self) -> u32 {
+        decimal_places(&self.lot_size)
+    }
+}
+
+fn decimal_places(value: &str) -> u32 {
+    Decimal::from_str(value).map(|d| d.scale()).unwrap_or(0)
 }
 
 fn default_max_slippage_pct() -> String {
@@ -320,5 +347,51 @@ impl Config {
             .filter(|s| s.enabled && s.exchange == exchange)
             .cloned()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn symbol(tick_size: &str, lot_size: &str) -> SymbolConfig {
+        SymbolConfig {
+            symbol: "TEST-USD".into(),
+            exchange: "kraken".into(),
+            exchange_native_symbol: "TEST/USD".into(),
+            rest_native_symbol: "TESTUSD".into(),
+            tick_size: tick_size.into(),
+            lot_size: lot_size.into(),
+            enabled: true,
+            risk: SymbolRisk {
+                max_position_usd: "1000".into(),
+                max_order_size: "1".into(),
+                max_order_notional_usd: "1000".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn price_and_qty_decimals_come_from_tick_and_lot_size_scale() {
+        // DOGE-USD's real config.example.toml values — confirmed via live
+        // testing against Kraken's real feed to be exactly the checksum
+        // padding precision Kraken itself uses (see checksum.rs).
+        let s = symbol("0.0000001", "0.00000001");
+        assert_eq!(s.price_decimals(), 7);
+        assert_eq!(s.qty_decimals(), 8);
+    }
+
+    #[test]
+    fn decimals_of_a_whole_number_tick_size_is_zero() {
+        let s = symbol("1", "1");
+        assert_eq!(s.price_decimals(), 0);
+        assert_eq!(s.qty_decimals(), 0);
+    }
+
+    #[test]
+    fn unparseable_tick_size_falls_back_to_zero_decimals_instead_of_panicking() {
+        let s = symbol("not-a-number", "also-not-a-number");
+        assert_eq!(s.price_decimals(), 0);
+        assert_eq!(s.qty_decimals(), 0);
     }
 }
