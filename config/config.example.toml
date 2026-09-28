@@ -8,6 +8,18 @@
 # Normalized symbol format used everywhere internally: BASE-QUOTE
 log_level = "info"
 
+# Outbound alerting (rust-core/src/alerting.rs) is entirely optional and
+# has no config section of its own — it's controlled by one environment
+# variable, never a config file, the same credential-like pattern as
+# KRAKEN_API_KEY/KRAKEN_API_SECRET (whoever holds the URL can post into
+# your channel):
+#   ALERT_WEBHOOK_URL — a Slack/Mattermost-style incoming webhook URL.
+#     Unset = alerting silently no-ops; the tracing::error! log lines it
+#     supplements still fire either way. Currently used for one thing:
+#     a startup reconciliation pass that finds a fill Kraken confirms but
+#     this process never recorded locally (reconcile.rs's
+#     possible_missed_fills).
+
 [[exchanges]]
 name = "kraken"
 ws_url = "wss://ws.kraken.com/v2"

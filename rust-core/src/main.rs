@@ -1,3 +1,4 @@
+mod alerting;
 mod config;
 mod guardrails;
 mod kraken;
@@ -17,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tonic::transport::Server;
 
+use alerting::{possible_missed_fills_message, AlertSink};
 use config::Config;
 use kraken_rest::{KrakenCredentials, KrakenRestClient};
 use market_data::MarketDataServiceImpl;
@@ -144,6 +146,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // A best-effort outbound alert sink (see alerting.rs) — no-ops if
+    // ALERT_WEBHOOK_URL isn't set, same optional-infrastructure posture as
+    // the persistence store and execution clients above.
+    let alert_sink = AlertSink::from_env();
+    tracing::info!(alerting_configured = alert_sink.is_configured(), "alert sink initialized");
+
     // Startup reconciliation: cross-check what's locally persisted as
     // "open" against what Kraken itself says is open, before this process
     // starts trusting that local picture again. Only possible when both a
@@ -170,6 +178,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         kraken_open_with_no_local_record = summary.kraken_open_with_no_local_record,
                         "startup reconciliation complete"
                     );
+                    // The one reconciliation outcome that needs a human to
+                    // actually look, not just a log line — see alerting.rs
+                    // and reconcile.rs's possible_missed_fills docs.
+                    if summary.possible_missed_fills > 0 {
+                        alert_sink
+                            .send(&possible_missed_fills_message(&exchange.name, summary.possible_missed_fills))
+                            .await;
+                    }
                 }
                 Ok(Err(e)) => {
                     tracing::error!(
