@@ -7,6 +7,7 @@ mod kraken;
 mod kraken_private_ws;
 mod kraken_rest;
 mod market_data;
+mod observability;
 mod order;
 mod orderbook;
 mod persistence;
@@ -31,6 +32,7 @@ use orderbook::new_shared_books;
 use persistence::Store;
 use proto::pb::market_data_service_server::MarketDataServiceServer;
 use proto::pb::order_service_server::OrderServiceServer;
+use observability::ObservabilityState;
 use risk::RiskEngine;
 use stop_loss::StopLossState;
 
@@ -254,7 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.clone(),
         order_service.clone(),
         execution_clients,
-        store,
+        store.clone(),
         risk_engine.clone(),
         alert_sink.clone(),
     ));
@@ -270,6 +272,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stop_loss_state,
         config.clone(),
         order_service.clone(),
+        risk_engine.clone(),
+        alert_sink.clone(),
+    ));
+
+    // Institutional audit Phase 2.4: real observability — elevated
+    // order-rejection-rate alerting plus a periodic PnL/exposure summary
+    // log. See observability.rs's module docs.
+    let observability_state = Arc::new(ObservabilityState::new());
+    tokio::spawn(observability::run_observability_monitor(
+        observability_state,
+        config.clone(),
+        store,
         risk_engine,
         alert_sink,
     ));

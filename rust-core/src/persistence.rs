@@ -75,6 +75,29 @@ pub struct OrderRecord {
     pub updated_at_ns: i64,
 }
 
+/// Order counts over some recent window, for institutional audit Phase
+/// 2.4's rejection-rate observability. `rejected` is always <= `total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OrderStats {
+    pub total: u64,
+    pub rejected: u64,
+}
+
+impl OrderStats {
+    /// Fraction of `total` that were rejected, as an `f64` in `[0.0, 1.0]`.
+    /// `0.0` (not `NaN`) for a window with no orders at all — "no orders
+    /// submitted" is not the same claim as "elevated rejections," and
+    /// should never itself read as one to a caller comparing against a
+    /// threshold.
+    pub fn rejection_rate(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.rejected as f64 / self.total as f64
+        }
+    }
+}
+
 /// A single applied fill, kept as an append-only audit trail. `exec_id` is
 /// the exchange's own identifier for the execution when one is available
 /// (Kraken's `exec_id`/`trade_id`) — the same value `RiskEngine::apply_fill`
@@ -454,6 +477,47 @@ impl Store {
             None => Ok(None),
         }
     }
+
+    // -- observability (institutional audit Phase 2.4) ----------------------
+
+    /// Total order count and how many of those were rejected (by risk or by
+    /// the exchange — `orders.status = 'REJECTED'` covers both, see
+    /// `order.rs`'s `submit_internal`) since `since_ns`. Backs the
+    /// observability monitor's elevated-rejection-rate alerting
+    /// (`observability.rs`) — a rolling window, not all-time, since an
+    /// old burst of rejections shouldn't keep tripping the alert forever.
+    pub fn order_stats_since(&self, since_ns: i64) -> anyhow::Result<OrderStats> {
+        let conn = self.conn.lock().unwrap();
+        let (total, rejected): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), SUM(CASE WHEN status = 'REJECTED' THEN 1 ELSE 0 END)
+             FROM orders WHERE created_at_ns >= ?1",
+            params![since_ns],
+            |row| Ok((row.get(0)?, row.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+        )?;
+        Ok(OrderStats { total: total as u64, rejected: rejected as u64 })
+    }
+
+    /// Sum of `fills.realized_pnl_usd` for fills applied since `since_ns` —
+    /// the same realized-PnL figure the kill switch tracks intraday, but
+    /// queryable over an arbitrary window for observability rather than
+    /// only "since UTC midnight."
+    pub fn realized_pnl_since(&self, since_ns: i64) -> anyhow::Result<Decimal> {
+        let conn = self.conn.lock().unwrap();
+        // realized_pnl_usd is stored as TEXT (this project's usual
+        // decimal-as-string discipline), so SQLite's own SUM() can't add
+        // the rows as numbers directly — CAST to REAL first, which comes
+        // back as SQLite's native REAL column type, not TEXT.
+        let total: Option<f64> = conn.query_row(
+            "SELECT SUM(CAST(realized_pnl_usd AS REAL)) FROM fills WHERE applied_at_ns >= ?1",
+            params![since_ns],
+            |row| row.get(0),
+        )?;
+        match total {
+            None => Ok(Decimal::ZERO),
+            Some(f) => Decimal::from_f64_retain(f)
+                .ok_or_else(|| anyhow::anyhow!("realized_pnl_usd sum {f} could not be represented as a Decimal")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -628,5 +692,98 @@ mod tests {
     fn get_order_returns_none_for_an_unknown_client_order_id() {
         let store = Store::open_in_memory().unwrap();
         assert!(store.get_order("co-unknown").unwrap().is_none());
+    }
+
+    // --- Institutional audit Phase 2.4: observability queries ---
+
+    fn order_record(client_order_id: &str, status: &str, created_at_ns: i64) -> OrderRecord {
+        OrderRecord {
+            client_order_id: client_order_id.to_string(),
+            exchange_order_id: String::new(),
+            symbol: "BTC-USD".to_string(),
+            exchange: "kraken".to_string(),
+            side: "BUY".to_string(),
+            order_type: "MARKET".to_string(),
+            quantity: "0.01".to_string(),
+            limit_price: None,
+            strategy_id: "test-strategy".to_string(),
+            status: status.to_string(),
+            reject_reason: if status == "REJECTED" { "too big".to_string() } else { String::new() },
+            created_at_ns,
+            updated_at_ns: created_at_ns,
+        }
+    }
+
+    #[test]
+    fn order_stats_since_counts_total_and_rejected() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_order(&order_record("co-1", "ACCEPTED", 100)).unwrap();
+        store.upsert_order(&order_record("co-2", "REJECTED", 200)).unwrap();
+        store.upsert_order(&order_record("co-3", "FILLED", 300)).unwrap();
+        store.upsert_order(&order_record("co-4", "REJECTED", 400)).unwrap();
+
+        let stats = store.order_stats_since(0).unwrap();
+        assert_eq!(stats.total, 4);
+        assert_eq!(stats.rejected, 2);
+        assert_eq!(stats.rejection_rate(), 0.5);
+    }
+
+    #[test]
+    fn order_stats_since_excludes_orders_before_the_window() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_order(&order_record("co-old", "REJECTED", 100)).unwrap();
+        store.upsert_order(&order_record("co-new", "ACCEPTED", 500)).unwrap();
+
+        let stats = store.order_stats_since(300).unwrap();
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.rejected, 0);
+    }
+
+    #[test]
+    fn order_stats_rejection_rate_is_zero_not_nan_for_an_empty_window() {
+        let store = Store::open_in_memory().unwrap();
+        let stats = store.order_stats_since(0).unwrap();
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.rejection_rate(), 0.0);
+    }
+
+    fn fill(symbol: &str, realized_pnl_usd: &str, applied_at_ns: i64) -> FillRecord {
+        FillRecord {
+            exec_id: None,
+            client_order_id: None,
+            symbol: symbol.to_string(),
+            side: "BUY".to_string(),
+            qty: Decimal::from_str("0.01").unwrap(),
+            price: Decimal::from_str("30000").unwrap(),
+            realized_pnl_usd: Decimal::from_str(realized_pnl_usd).unwrap(),
+            applied_at_ns,
+        }
+    }
+
+    #[test]
+    fn realized_pnl_since_sums_fills_within_the_window() {
+        let store = Store::open_in_memory().unwrap();
+        store.record_fill(&fill("BTC-USD", "10.5", 100)).unwrap();
+        store.record_fill(&fill("BTC-USD", "-3.25", 200)).unwrap();
+        store.record_fill(&fill("ETH-USD", "2.0", 300)).unwrap();
+
+        let total = store.realized_pnl_since(0).unwrap();
+        assert_eq!(total, Decimal::from_str("9.25").unwrap());
+    }
+
+    #[test]
+    fn realized_pnl_since_excludes_fills_before_the_window() {
+        let store = Store::open_in_memory().unwrap();
+        store.record_fill(&fill("BTC-USD", "100", 100)).unwrap();
+        store.record_fill(&fill("BTC-USD", "5", 500)).unwrap();
+
+        let total = store.realized_pnl_since(300).unwrap();
+        assert_eq!(total, Decimal::from_str("5").unwrap());
+    }
+
+    #[test]
+    fn realized_pnl_since_is_zero_for_no_fills_at_all() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.realized_pnl_since(0).unwrap(), Decimal::ZERO);
     }
 }

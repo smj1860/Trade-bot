@@ -444,3 +444,23 @@ enabled = true
 max_loss_pct = "0.03"      # flatten a position once it's down 3% against its
                             # own average entry price
 check_interval_secs = 10   # how often the monitor re-checks every open position
+
+# -----------------------------------------------------------------------------
+# Institutional audit Phase 2.4: real observability. Alerts (via the same
+# webhook as everything else in this file — see ALERT_WEBHOOK_URL) when the
+# fraction of orders rejected over a rolling window gets too high, and logs a
+# periodic realized-PnL/total-exposure summary an operator can feed into
+# whatever log-based dashboard they already run. See
+# rust-core/src/observability.rs. Every field below has the built-in default
+# shown here even if this whole section is omitted.
+# -----------------------------------------------------------------------------
+[observability]
+enabled = true
+check_interval_secs = 60    # how often the monitor re-checks the rejection
+                             # rate and logs the PnL/exposure summary
+window_secs = 900           # the rolling lookback window (15 minutes) both
+                             # the rejection-rate check and the summary use
+min_sample_size = 10        # don't alert on the rejection rate below this
+                             # many orders in the window — too few to be signal
+max_rejection_rate = 0.25   # alert once more than this fraction of orders in
+                             # the window were rejected (0.25 = 1 in 4)

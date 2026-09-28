@@ -771,6 +771,16 @@ impl RiskEngine {
         total
     }
 
+    /// Total combined USD exposure across every symbol with a nonzero
+    /// tracked position, valued at each symbol's live best bid — exactly
+    /// `combined_exposure_excluding` with nothing excluded (no real symbol
+    /// is ever an empty string, so excluding `""` excludes nothing).
+    /// Institutional audit Phase 2.4's observability monitor logs this
+    /// periodically alongside realized PnL.
+    pub async fn total_exposure_usd(&self) -> Decimal {
+        self.combined_exposure_excluding("").await
+    }
+
     /// Institutional audit Phase 2.2: rejects if adding `projected_notional`
     /// (this order's own contribution) to any configured cluster containing
     /// `order_symbol` would push that cluster's combined exposure over its
@@ -907,6 +917,7 @@ mod tests {
             persistence: crate::config::PersistenceConfig { database_path: ":memory:".to_string() },
             dead_man_switch: crate::config::DeadManSwitchConfig::default(),
             stop_loss: crate::config::StopLossConfig::default(),
+            observability: crate::config::ObservabilityConfig::default(),
         }
     }
 
@@ -1639,6 +1650,26 @@ mod tests {
         engine.apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.1").unwrap(), Decimal::from_str("30000").unwrap(), None, None).await;
         let pnl_pct = engine.unrealized_pnl_pct("BTC-USD").await.unwrap();
         assert_eq!(pnl_pct, Decimal::from_str("0.1").unwrap());
+    }
+
+    #[tokio::test]
+    async fn total_exposure_usd_sums_every_symbols_position_with_nothing_excluded() {
+        let config = test_config_with_cluster("100000"); // adds ETH-USD alongside BTC-USD
+        let books = new_shared_books();
+        insert_book(&books, "ETH-USD", "2000", "2001").await;
+        insert_book(&books, "BTC-USD", "30000", "30010").await;
+        let engine = RiskEngine::new(Arc::new(config), books);
+
+        engine.apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("29000").unwrap(), None, None).await;
+        engine.apply_fill("ETH-USD", OrderSide::Buy, Decimal::from_str("1").unwrap(), Decimal::from_str("1900").unwrap(), None, None).await;
+        // BTC: 0.01 * 30000 (best bid) = 300; ETH: 1 * 2000 (best bid) = 2000.
+        assert_eq!(engine.total_exposure_usd().await, Decimal::from_str("2300").unwrap());
+    }
+
+    #[tokio::test]
+    async fn total_exposure_usd_is_zero_with_no_open_positions() {
+        let engine = RiskEngine::new(Arc::new(test_config()), new_shared_books());
+        assert_eq!(engine.total_exposure_usd().await, Decimal::ZERO);
     }
 
     #[tokio::test]

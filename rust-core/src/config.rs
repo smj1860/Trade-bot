@@ -398,6 +398,75 @@ impl Default for StopLossConfig {
     }
 }
 
+fn default_observability_enabled() -> bool {
+    true
+}
+
+fn default_observability_check_interval_secs() -> u64 {
+    60
+}
+
+fn default_observability_window_secs() -> u64 {
+    900
+}
+
+fn default_observability_min_sample_size() -> u64 {
+    10
+}
+
+fn default_observability_max_rejection_rate() -> f64 {
+    0.25
+}
+
+/// Institutional audit Phase 2.4: real observability. Two things,
+/// deliberately built on infrastructure this codebase already has rather
+/// than a new dashboarding stack: (1) alerting (via the same `AlertSink`
+/// Phase 1.5 wired up) when the fraction of orders rejected over a
+/// rolling window gets too high — a leading indicator that something
+/// upstream (a strategy's sizing, a stale config, a guardrail that's now
+/// too tight for real conditions) has gone wrong, well before it shows up
+/// as a PnL problem; and (2) a periodic structured log line summarizing
+/// realized PnL and total exposure (`persistence.rs`'s `realized_pnl_since`
+/// / `risk.rs`'s `total_exposure_usd`) that an operator can feed into
+/// whatever log-based dashboard (Grafana Loki, CloudWatch, etc.) they
+/// already run, rather than this project inventing its own. See
+/// `observability.rs`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ObservabilityConfig {
+    #[serde(default = "default_observability_enabled")]
+    pub enabled: bool,
+    /// How often the monitor re-checks the rejection rate and logs the
+    /// PnL/exposure summary.
+    #[serde(default = "default_observability_check_interval_secs")]
+    pub check_interval_secs: u64,
+    /// The rolling lookback window (from persisted `orders`/`fills`
+    /// history) that both the rejection-rate check and the PnL/exposure
+    /// summary are computed over.
+    #[serde(default = "default_observability_window_secs")]
+    pub window_secs: u64,
+    /// The rejection-rate alert doesn't fire below this many orders in the
+    /// window — a single rejected order out of one submitted is technically
+    /// a 100% rejection rate, and would be noise, not signal, this early.
+    #[serde(default = "default_observability_min_sample_size")]
+    pub min_sample_size: u64,
+    /// Alert once the window's rejection rate exceeds this fraction (e.g.
+    /// `0.25` = more than 1 in 4 orders rejected).
+    #[serde(default = "default_observability_max_rejection_rate")]
+    pub max_rejection_rate: f64,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_observability_enabled(),
+            check_interval_secs: default_observability_check_interval_secs(),
+            window_secs: default_observability_window_secs(),
+            min_sample_size: default_observability_min_sample_size(),
+            max_rejection_rate: default_observability_max_rejection_rate(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub general: GeneralConfig,
@@ -412,6 +481,8 @@ pub struct Config {
     pub dead_man_switch: DeadManSwitchConfig,
     #[serde(default)]
     pub stop_loss: StopLossConfig,
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 impl Config {
