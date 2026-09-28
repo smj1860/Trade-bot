@@ -193,11 +193,15 @@ fn default_dry_run() -> bool {
 
 fn default_rate_limit_max_counter() -> f64 {
     // Approximates Kraken's documented "Starter" verification tier
-    // (max counter 15, decays ~1 every 3s) — the most conservative
-    // tier, chosen as the safe default since this project has never
-    // verified which tier a real account sits in. See
-    // kraken_rest.rs::RateLimiter's docs for why these numbers are an
-    // approximation, not a byte-for-byte match to Kraken's real model.
+    // (max counter 15, decays ~1 every 3s). Stephen confirmed (2026-09-28)
+    // his real account is in fact on Starter, not a higher tier — so this
+    // is now a verified-correct tier choice, not just the conservative
+    // default. The exact decay/counter numbers below are still Kraken's
+    // documented shape for that tier, not yet confirmed against observed
+    // 429 behavior on the real account (that still wants live testing —
+    // see institutional audit Phase 2.6). See kraken_rest.rs::RateLimiter's
+    // docs for why these numbers are an approximation of Kraken's real
+    // model even for the right tier.
     15.0
 }
 
@@ -214,10 +218,13 @@ fn default_rate_limit_max_wait_secs() -> f64 {
 }
 
 /// Approximate token-bucket model of Kraken's private-REST call counter —
-/// see kraken_rest.rs::RateLimiter. Defaults are conservative
-/// (Starter-tier-shaped) precisely because they've never been verified
-/// against a real account's actual tier; re-tune against Kraken's current
-/// docs (or observed 429 behavior) before trading live.
+/// see kraken_rest.rs::RateLimiter. Defaults are Starter-tier-shaped, and
+/// Stephen confirmed (2026-09-28) his real account is on Starter — so the
+/// *tier choice* is now verified correct, not just a conservative guess.
+/// What's still unverified is Kraken's exact decay/counter numbers for
+/// that tier against real observed behavior (429s, actual timing); re-tune
+/// against Kraken's current docs or live observation once 1.4's real
+/// account testing happens (institutional audit Phase 2.6).
 #[derive(Debug, Deserialize, Clone)]
 pub struct RateLimitConfig {
     #[serde(default = "default_rate_limit_max_counter")]

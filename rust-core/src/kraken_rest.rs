@@ -45,16 +45,20 @@ type HmacSha512 = Hmac<Sha512>;
 /// documented-but-endpoint-varying cost per call, decays it continuously
 /// over time, and caps it at a value that depends on the account's
 /// verification tier (Starter/Intermediate/Pro) — all of which are
-/// Kraken's to change and none of which has been checked against a real
-/// account from this project. This implements the *shape* of that model
-/// (a counter that grows by a cost, decays continuously, and rejects/
-/// throttles once it would exceed a cap) with a single flat
-/// `cost_per_call` rather than Kraken's actual per-endpoint cost table,
-/// configured conservatively (`config::RateLimitConfig`'s defaults
-/// approximate the Starter tier, the most restrictive). Re-tune against
+/// Kraken's to change, and the exact decay/counter numbers below have not
+/// been checked against a real account's observed behavior from this
+/// project. The tier itself, though, is confirmed: Stephen verified
+/// (2026-09-28) his real account is on Starter, matching this module's
+/// conservative default rather than just assuming it. This implements the
+/// *shape* of that model (a counter that grows by a cost, decays
+/// continuously, and rejects/throttles once it would exceed a cap) with a
+/// single flat `cost_per_call` rather than Kraken's actual per-endpoint
+/// cost table, configured to the Starter tier's documented numbers
+/// (`config::RateLimitConfig`'s defaults). Re-tune those numbers against
 /// Kraken's current docs — or observed real 429/`EAPI:Rate limit
 /// exceeded` behavior — before relying on this to actually prevent a
-/// live-account suspension.
+/// live-account suspension (institutional audit Phase 2.6, still blocked
+/// on 1.4's real-account testing for that live observation).
 #[derive(Debug, Clone)]
 pub struct RateLimiter {
     max_counter: f64,
