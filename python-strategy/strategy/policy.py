@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Literal, Optional
 
+from strategy.config import SizingConfig
 from strategy.features import Features
 
 Side = Literal["BUY", "SELL"]
@@ -65,12 +66,14 @@ class DecisionPolicy:
         order_quantity: dict[str, Decimal],
         max_position: dict[str, Decimal],
         use_limit_orders: bool = True,
+        sizing: SizingConfig | None = None,
     ) -> None:
         self._signal_threshold = signal_threshold
         self._cooldown_seconds = cooldown_seconds
         self._order_quantity = order_quantity
         self._max_position = max_position
         self._use_limit_orders = use_limit_orders
+        self._sizing = sizing if sizing is not None else SizingConfig()
         self._last_order_time: dict[str, float] = {}
 
     def decide(
@@ -90,7 +93,10 @@ class DecisionPolicy:
             return None
 
         side: Side = "BUY" if signal > 0 else "SELL"
-        quantity = self._order_quantity[features.symbol]
+        base_quantity = self._order_quantity[features.symbol]
+        quantity = scaled_quantity(
+            base_quantity, signal, self._signal_threshold, features.realized_vol, self._sizing
+        )
         signed_qty = quantity if side == "BUY" else -quantity
         projected_position = current_position + signed_qty
 
@@ -112,6 +118,64 @@ class DecisionPolicy:
             order_type="LIMIT",
             limit_price=limit_price,
         )
+
+
+def scaled_quantity(
+    base_quantity: Decimal,
+    signal: float,
+    signal_threshold: float,
+    realized_vol: float,
+    sizing: SizingConfig,
+) -> Decimal:
+    """Institutional audit Phase 2.1: scales `base_quantity` (the flat
+    per-symbol size from strategy.order_quantity) by inverse recent
+    volatility and signal conviction, instead of submitting the identical
+    size on every trade regardless of current market conditions or
+    signal strength.
+
+    Returns `base_quantity` UNCHANGED (the flat fallback the audit asked
+    for) when:
+      - `sizing.enabled` is False, or
+      - `realized_vol <= 0` — either genuinely calm-to-the-point-of-zero
+        (vanishingly rare with a fee-clearing move label) or, far more
+        commonly, a symbol that hasn't accumulated enough bar history yet
+        for FeatureEngine to report anything but its neutral 0.0 "no
+        opinion" default (see features.py) — treating that as "target
+        volatility exactly met" would be a silent, wrong assumption, not
+        a safe default.
+
+    Otherwise: `base_quantity * volatility_scalar * conviction_scalar`,
+    where:
+      volatility_scalar = clamp(target_volatility / realized_vol,
+                                 min_size_multiplier, max_size_multiplier)
+        — a symbol currently calmer than the target gets sized up (more
+        size for the same implied dollar-risk budget); a symbol currently
+        more volatile than the target gets sized down.
+      conviction_scalar = min_conviction_multiplier + (1 -
+                           min_conviction_multiplier) * conviction_fraction
+        — linear from min_conviction_multiplier at |signal| ==
+        signal_threshold (the weakest signal that clears the trade gate
+        at all) up to 1.0 at |signal| == 1.0 (the strongest possible
+        signal). `decide()` already guarantees |signal| >=
+        signal_threshold by the time this is called, and
+        conviction_fraction is clamped to [0, 1] regardless as a
+        defensive measure against an out-of-range caller."""
+    if not sizing.enabled or realized_vol <= 0:
+        return base_quantity
+
+    volatility_scalar = sizing.target_volatility / realized_vol
+    volatility_scalar = max(sizing.min_size_multiplier, min(sizing.max_size_multiplier, volatility_scalar))
+
+    if signal_threshold < 1.0:
+        conviction_fraction = (abs(signal) - signal_threshold) / (1.0 - signal_threshold)
+        conviction_fraction = max(0.0, min(1.0, conviction_fraction))
+    else:
+        conviction_fraction = 1.0
+    conviction_scalar = sizing.min_conviction_multiplier + (1.0 - sizing.min_conviction_multiplier) * conviction_fraction
+
+    combined = volatility_scalar * conviction_scalar
+    combined = max(sizing.min_size_multiplier, min(sizing.max_size_multiplier, combined))
+    return base_quantity * Decimal(str(combined))
 
 
 def post_only_price(side: Side, mid_price: Decimal, spread: Decimal) -> Decimal:

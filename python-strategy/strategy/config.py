@@ -70,6 +70,45 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class SizingConfig:
+    """Institutional audit Phase 2.1: scales strategy.order_quantity's flat
+    per-symbol base size by inverse recent volatility (vol-targeting) and
+    signal conviction, instead of submitting the identical size on every
+    trade regardless of current market conditions or how strong the signal
+    is. See strategy/policy.py's scaled_quantity().
+
+    `order_quantity[symbol]` remains the reference size this scales
+    relative to, and the fallback used verbatim whenever scaling can't be
+    computed (enabled=False, or a symbol without enough bar history yet
+    for a real realized_vol reading — see Features.realized_vol's
+    "no opinion" 0.0 default)."""
+
+    enabled: bool = True
+    # The realized_vol level (see strategy/indicators.py's realized_vol —
+    # a per-bar log-return stdev, not annualized) this sizing scales
+    # toward: quantity is multiplied by target_volatility / realized_vol,
+    # so a symbol currently calmer than this target gets sized UP (more
+    # size for the same dollar-risk budget) and a symbol currently more
+    # volatile than this gets sized DOWN. Default is deliberately modest
+    # (2%/bar) — tune per bar_interval_minutes and the symbols actually
+    # traded; there's no universal right value.
+    target_volatility: float = 0.02
+    # The inverse-volatility scalar is clamped to this band before being
+    # applied, both as a sanity bound (a near-zero realized_vol reading
+    # from a very quiet market shouldn't blow the order up to 100x) and
+    # because these are multipliers of order_quantity[symbol], which is
+    # itself already sized to be reasonable for that symbol/account.
+    min_size_multiplier: float = 0.25
+    max_size_multiplier: float = 2.0
+    # Conviction scaling: a signal that just barely cleared
+    # signal_threshold gets min_conviction_multiplier applied; a signal at
+    # the maximum possible magnitude (1.0) gets the full 1.0x (before the
+    # volatility scalar is layered on top). Linear in between. Set to 1.0
+    # to disable conviction scaling while keeping volatility scaling.
+    min_conviction_multiplier: float = 0.5
+
+
+@dataclass(frozen=True)
 class StrategyConfig:
     name: str
     symbols: tuple[str, ...]
@@ -79,6 +118,7 @@ class StrategyConfig:
     order_quantity: dict[str, Decimal]
     features: FeatureConfig
     model: ModelConfig
+    sizing: SizingConfig = field(default_factory=SizingConfig)
 
 
 @dataclass(frozen=True)
@@ -151,6 +191,7 @@ class Config:
                 signal_threshold=float(strategy_raw["signal_threshold"]),
                 cooldown_seconds=float(strategy_raw["cooldown_seconds"]),
                 order_quantity={k: Decimal(v) for k, v in strategy_raw["order_quantity"].items()},
+                sizing=SizingConfig(**strategy_raw.get("sizing", {})),
                 features=FeatureConfig(
                     momentum_window=int(strategy_raw["features"]["momentum_window"]),
                     bar_interval_minutes=int(strategy_raw["features"].get("bar_interval_minutes", 60)),

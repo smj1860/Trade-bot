@@ -29,13 +29,44 @@ signal_threshold = 0.35
 # a basic guard against a noisy signal firing repeatedly on the same move.
 cooldown_seconds = 30
 
-# Fixed order size per symbol, in base-asset units. A real strategy would size
-# from volatility/conviction; fixed size keeps this first version simple and
-# auditable. Must be below the Rust risk engine's per-symbol max_order_size
-# in config/config.example.toml, or every order gets rejected there.
+# Base order size per symbol, in base-asset units — the reference size
+# [strategy.sizing] below scales relative to. Must be below the Rust risk
+# engine's per-symbol max_order_size in config/config.example.toml, or
+# every order gets rejected there (including a scaled-up one — sizing.
+# max_size_multiplier should be chosen with that ceiling in mind).
 [strategy.order_quantity]
 BTC-USD = "0.001"
 ETH-USD = "0.01"
+
+# Institutional audit Phase 2.1: volatility/conviction-scaled position
+# sizing (see strategy/policy.py's scaled_quantity()). Scales
+# [strategy.order_quantity] above by inverse recent volatility (so a
+# calmer-than-usual market gets a bigger clip for the same implied
+# dollar-risk budget, a choppier one a smaller clip) and by how strong the
+# signal is (a signal that just barely cleared signal_threshold gets less
+# size than one at maximum conviction). Falls back to the flat
+# order_quantity unchanged whenever a symbol doesn't have enough bar
+# history yet for a real realized_vol reading, or when disabled here.
+[strategy.sizing]
+enabled = true
+# Per-bar realized_vol level (a log-return stdev, NOT annualized — see
+# strategy/indicators.py's realized_vol) this scales toward. Tune this
+# per bar_interval_minutes and the symbols actually traded; there is no
+# universal right value, and the default here is a starting point, not a
+# calibrated one.
+target_volatility = 0.02
+# The inverse-volatility scalar (and the combined volatility x conviction
+# scalar) is clamped to this multiplicative band around order_quantity —
+# both a sanity bound and a reminder that these are multipliers of an
+# already-sized base quantity, not standalone sizing.
+min_size_multiplier = 0.25
+max_size_multiplier = 2.0
+# Conviction scaling: a signal right at signal_threshold gets this
+# multiplier; a signal at the maximum possible magnitude (1.0) gets 1.0x
+# (before the volatility scalar above is layered on). Linear in between.
+# Set to 1.0 to disable conviction scaling while keeping volatility
+# scaling.
+min_conviction_multiplier = 0.5
 
 # Feature engine parameters (see strategy/features.py).
 [strategy.features]
