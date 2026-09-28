@@ -1,0 +1,105 @@
+name: Deep OHLC backfill — automated deepening
+
+# Self-continuing counterpart to historical-backfill-trades.yml's manual,
+# one-symbol-at-a-time dispatch. On a schedule, this checks every
+# symbol's current depth in ohlc_backfill_state (via
+# historical-data/plan_backfill_deepening.py) and dispatches its next
+# 90-day-older window, in parallel, for every symbol still short of
+# --target-days — stopping on its own once every symbol reaches it. No
+# manual re-dispatch needed for ongoing deepening rounds (Stephen asked
+# for this 2026-09-28: "they can keep on auto running").
+#
+# Target: 1080 days (36 months), extended 2026-09-28 from the original
+# 540-day (18-month) target. Change via workflow_dispatch's target_days
+# input, or this file's default, if the target changes again.
+#
+# Same slow-majors caveat as historical-backfill-trades.yml: BTC-USD and
+# ETH-USD can take hours per 90-day window; every other symbol finishes
+# in under 45 minutes. Each symbol gets its own concurrency group so an
+# overrunning window is never double-dispatched by the next scheduled
+# tick — that tick just finds the symbol's depth unchanged and re-plans
+# the same window, which queues behind the running one rather than
+# duplicating the pull.
+#
+# Requires the same SUPABASE_DB_URL repository secret as the other
+# historical-data workflows.
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      target_days:
+        description: "Target depth in days (default 1080 = 36 months)"
+        required: false
+        default: "1080"
+      interval:
+        description: "Candle resolution in minutes"
+        required: false
+        default: "60"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      has_work: ${{ steps.plan.outputs.has_work }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: historical-data
+        run: pip install -r requirements.txt
+
+      - name: Compute next window per symbol
+        id: plan
+        working-directory: historical-data
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          PLAN=$(python3 plan_backfill_deepening.py \
+            --target-days "${{ github.event.inputs.target_days || '1080' }}" \
+            --interval "${{ github.event.inputs.interval || '60' }}")
+          echo "Plan: $PLAN"
+          echo "matrix=$PLAN" >> "$GITHUB_OUTPUT"
+          if [ "$PLAN" = "[]" ]; then
+            echo "has_work=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_work=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  backfill:
+    needs: plan
+    if: needs.plan.outputs.has_work == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355 # stay under GitHub-hosted runners' hard 6-hour job cap
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    concurrency:
+      group: backfill-deepening-${{ matrix.symbol }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r historical-data/requirements.txt
+
+      - name: Run deep OHLC backfill from trades
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          python historical-data/backfill_ohlc_from_trades.py \
+            --symbol "${{ matrix.symbol }}" \
+            --interval "${{ github.event.inputs.interval || '60' }}" \
+            --since-days "${{ matrix.since_days }}" \
+            --before-days "${{ matrix.before_days }}"
