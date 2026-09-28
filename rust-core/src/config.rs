@@ -149,9 +149,42 @@ pub struct GlobalRisk {
     pub vol_circuit_breaker_freeze_secs: u64,
 }
 
+/// Institutional audit Phase 2.2: a correlation-aware portfolio exposure
+/// bucket. `max_total_position_usd` is a flat sum across every symbol
+/// regardless of how correlated they are — 5 highly-correlated altcoins
+/// can each individually pass every per-symbol check while the
+/// *effective* portfolio risk from a correlated drawdown across all 5 is
+/// far higher than that single number implies. A cluster caps combined
+/// exposure across a named GROUP of symbols (majors, high-beta L1s, DeFi,
+/// etc.) that are expected to move together, independent of the flat
+/// total. This is the pragmatic cluster-based first step the audit
+/// suggested over a full covariance-weighted calculation, which would
+/// need a return-history feed this project doesn't currently maintain.
+///
+/// A symbol can appear in more than one cluster (e.g. a "majors" and an
+/// "L1s" cluster could both reasonably include ETH-USD) — every cluster
+/// containing the order's symbol is checked, not just the first match.
+/// A symbol in no configured cluster is only subject to the existing
+/// flat `max_total_position_usd` cap, unchanged.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ClusterConfig {
+    /// Human-readable name for log/rejection messages (e.g. "majors",
+    /// "high-beta-l1s", "defi") — not matched against anything, purely
+    /// for operators to understand which bucket rejected an order.
+    pub name: String,
+    pub symbols: Vec<String>,
+    pub max_exposure_usd: String,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct RiskSection {
     pub global: GlobalRisk,
+    /// Optional — an empty/absent list (the default for any config that
+    /// predates this option) means no cluster caps apply, only the
+    /// existing flat max_total_position_usd, exactly matching every prior
+    /// config's behavior.
+    #[serde(default)]
+    pub clusters: Vec<ClusterConfig>,
 }
 
 fn default_dry_run() -> bool {

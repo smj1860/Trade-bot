@@ -474,6 +474,10 @@ impl RiskEngine {
             ));
         }
 
+        if let Some(reason) = self.check_cluster_exposure(&order.symbol, projected_notional).await {
+            return RiskVerdict::Rejected(reason);
+        }
+
         RiskVerdict::Approved
     }
 
@@ -737,6 +741,60 @@ impl RiskEngine {
         }
         total
     }
+
+    /// Institutional audit Phase 2.2: rejects if adding `projected_notional`
+    /// (this order's own contribution) to any configured cluster containing
+    /// `order_symbol` would push that cluster's combined exposure over its
+    /// `max_exposure_usd`. A symbol in more than one cluster is checked
+    /// against every one it belongs to; a symbol in none is a no-op (only
+    /// the flat max_total_position_usd cap, checked by the caller, applies).
+    async fn check_cluster_exposure(&self, order_symbol: &str, projected_notional: Decimal) -> Option<String> {
+        for cluster in clusters_containing(&self.config.risk.clusters, order_symbol) {
+            let Ok(max_exposure) = Decimal::from_str(&cluster.max_exposure_usd) else {
+                return Some(format!("invalid config: max_exposure_usd for cluster '{}'", cluster.name));
+            };
+            let cluster_exposure =
+                self.combined_cluster_exposure_excluding(&cluster.symbols, order_symbol).await + projected_notional;
+            if cluster_exposure > max_exposure {
+                return Some(format!(
+                    "combined exposure {cluster_exposure} in cluster '{}' would exceed its max_exposure_usd {max_exposure} for {order_symbol}",
+                    cluster.name
+                ));
+            }
+        }
+        None
+    }
+
+    /// Same idea as `combined_exposure_excluding`, but restricted to the
+    /// symbols in one cluster rather than the whole portfolio.
+    async fn combined_cluster_exposure_excluding(&self, cluster_symbols: &[String], exclude_symbol: &str) -> Decimal {
+        let positions = self.positions.lock().await;
+        let books = self.books.lock().await;
+        let mut total = Decimal::ZERO;
+        for symbol in cluster_symbols {
+            if symbol == exclude_symbol {
+                continue;
+            }
+            let Some(position) = positions.get(symbol) else { continue };
+            if position.qty.is_zero() {
+                continue;
+            }
+            if let Some(book) = books.get(symbol) {
+                if let Some((price, _)) = book.best_bid() {
+                    total += (position.qty * price).abs();
+                }
+            }
+        }
+        total
+    }
+}
+
+/// Every configured cluster that lists `symbol` among its members. Pure and
+/// synchronous so the "which clusters apply" logic is unit-testable
+/// independent of the async position/book state check_cluster_exposure also
+/// needs.
+fn clusters_containing<'a>(clusters: &'a [crate::config::ClusterConfig], symbol: &str) -> Vec<&'a crate::config::ClusterConfig> {
+    clusters.iter().filter(|c| c.symbols.iter().any(|s| s == symbol)).collect()
 }
 
 /// Institutional audit Phase 1.3's client-side post-only guarantee: a
@@ -811,6 +869,7 @@ mod tests {
                     vol_baseline_bucket_secs: 60,
                     vol_circuit_breaker_freeze_secs: 300,
                 },
+                clusters: vec![],
             },
             execution: crate::config::ExecutionConfig {
                 dry_run: true,
@@ -1389,5 +1448,129 @@ mod tests {
         let engine = RiskEngine::new(Arc::new(vol_test_config()), books);
         let order = buy_order("BTC-USD", "0.001", Some("100"));
         assert_eq!(engine.evaluate(&order).await, RiskVerdict::Approved);
+    }
+
+    // --- Institutional audit Phase 2.2: correlation-aware cluster exposure caps ---
+
+    fn cluster_config(symbols: &[&str], name: &str, max_exposure_usd: &str) -> crate::config::ClusterConfig {
+        crate::config::ClusterConfig {
+            name: name.to_string(),
+            symbols: symbols.iter().map(|s| s.to_string()).collect(),
+            max_exposure_usd: max_exposure_usd.to_string(),
+        }
+    }
+
+    /// test_config() plus a second symbol (ETH-USD, generous individual
+    /// limits so only the cluster cap itself binds) and one cluster
+    /// containing both BTC-USD and ETH-USD.
+    fn test_config_with_cluster(max_exposure_usd: &str) -> Config {
+        let mut config = test_config();
+        config.symbols.push(SymbolConfig {
+            symbol: "ETH-USD".into(),
+            exchange: "kraken".into(),
+            exchange_native_symbol: "ETH/USD".into(),
+            rest_native_symbol: "ETHUSD".into(),
+            tick_size: "0.01".into(),
+            lot_size: "0.0001".into(),
+            enabled: true,
+            risk: SymbolRisk {
+                max_position_usd: "50000".into(),
+                max_order_size: "10".into(),
+                max_order_notional_usd: "50000".into(),
+            },
+        });
+        config.risk.clusters = vec![cluster_config(&["BTC-USD", "ETH-USD"], "test-cluster", max_exposure_usd)];
+        config
+    }
+
+    async fn insert_book(books: &crate::orderbook::SharedBooks, symbol: &str, bid: &str, ask: &str) {
+        let mut guard = books.lock().await;
+        let mut book = OrderBook::new(symbol);
+        book.apply_snapshot(
+            vec![(Decimal::from_str(bid).unwrap(), Decimal::from_str("10").unwrap())],
+            vec![(Decimal::from_str(ask).unwrap(), Decimal::from_str("10").unwrap())],
+        );
+        guard.insert(symbol.to_string(), book);
+    }
+
+    #[test]
+    fn clusters_containing_finds_every_cluster_with_the_symbol() {
+        let clusters = vec![
+            cluster_config(&["BTC-USD", "ETH-USD"], "majors", "6000"),
+            cluster_config(&["ETH-USD", "UNI-USD"], "eth-adjacent", "4000"),
+            cluster_config(&["SOL-USD"], "l1s", "1000"),
+        ];
+        let matches = clusters_containing(&clusters, "ETH-USD");
+        assert_eq!(matches.len(), 2);
+        assert!(matches.iter().any(|c| c.name == "majors"));
+        assert!(matches.iter().any(|c| c.name == "eth-adjacent"));
+    }
+
+    #[test]
+    fn clusters_containing_is_empty_for_a_symbol_in_no_cluster() {
+        let clusters = vec![cluster_config(&["BTC-USD"], "majors", "6000")];
+        assert!(clusters_containing(&clusters, "DOGE-USD").is_empty());
+    }
+
+    #[tokio::test]
+    async fn cluster_exposure_approves_an_order_within_the_cluster_cap() {
+        let config = test_config_with_cluster("10000"); // generous, shouldn't bind
+        let books = new_shared_books();
+        insert_book(&books, "ETH-USD", "2000", "2001").await;
+        let engine = RiskEngine::new(Arc::new(config), books);
+
+        engine.apply_fill("ETH-USD", OrderSide::Buy, Decimal::from_str("1").unwrap(), Decimal::from_str("2000").unwrap(), None, None).await;
+        // ETH exposure ~2000, BTC order notional 300 -> combined ~2300, well under 10000.
+        let order = buy_order("BTC-USD", "0.01", Some("30000"));
+        assert_eq!(engine.evaluate(&order).await, RiskVerdict::Approved);
+    }
+
+    #[tokio::test]
+    async fn cluster_exposure_rejects_an_order_that_would_exceed_the_cluster_cap() {
+        let config = test_config_with_cluster("1000"); // tight — ETH position alone is already close to it
+        let books = new_shared_books();
+        insert_book(&books, "ETH-USD", "2000", "2001").await;
+        let engine = RiskEngine::new(Arc::new(config), books);
+
+        engine.apply_fill("ETH-USD", OrderSide::Buy, Decimal::from_str("1").unwrap(), Decimal::from_str("2000").unwrap(), None, None).await;
+        // ETH exposure ~2000 already exceeds the 1000 cluster cap before the new BTC order is even added.
+        let order = buy_order("BTC-USD", "0.01", Some("30000"));
+        match engine.evaluate(&order).await {
+            RiskVerdict::Rejected(reason) => assert!(reason.contains("test-cluster")),
+            other => panic!("expected a cluster-exposure rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cluster_exposure_is_a_no_op_for_a_symbol_in_no_configured_cluster() {
+        // test_config() (no clusters configured at all) — a large BTC
+        // position must not be rejected by cluster logic that doesn't apply.
+        let engine = RiskEngine::new(Arc::new(test_config()), new_shared_books());
+        let order = buy_order("BTC-USD", "0.01", Some("30000"));
+        assert_eq!(engine.evaluate(&order).await, RiskVerdict::Approved);
+    }
+
+    #[tokio::test]
+    async fn cluster_exposure_excludes_the_orders_own_symbol_from_the_other_side_of_the_sum() {
+        // A large existing BTC position must not be double counted against
+        // itself when BTC-USD is the symbol being ordered -- only OTHER
+        // cluster members' positions (here, ETH's) are summed before adding
+        // this order's own projected notional.
+        let config = test_config_with_cluster("10000");
+        let books = new_shared_books();
+        insert_book(&books, "ETH-USD", "2000", "2001").await;
+        let engine = RiskEngine::new(Arc::new(config), books);
+
+        engine.apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("30000").unwrap(), None, None).await;
+        engine.apply_fill("ETH-USD", OrderSide::Buy, Decimal::from_str("1").unwrap(), Decimal::from_str("2000").unwrap(), None, None).await;
+        // If BTC's own existing position were double-counted alongside this
+        // new order's notional, this would come out to roughly 2x 300 = 600
+        // plus ETH's 2000 = 2600, still under 10000 either way here, so
+        // assert the more telling internal fact instead: exposure computed
+        // excluding BTC-USD is just ETH's ~2000, not ~2300.
+        let excluding_btc = engine.combined_cluster_exposure_excluding(
+            &["BTC-USD".to_string(), "ETH-USD".to_string()], "BTC-USD"
+        ).await;
+        assert_eq!(excluding_btc, Decimal::from_str("2000").unwrap());
     }
 }

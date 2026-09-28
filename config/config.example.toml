@@ -297,6 +297,51 @@ max_total_position_usd = "20000"      # across all symbols combined
 max_orders_per_minute = 20
 kill_switch_max_daily_loss_usd = "500" # halts all trading if breached
 
+# -----------------------------------------------------------------------------
+# Institutional audit Phase 2.2: correlation-aware portfolio exposure caps.
+# max_total_position_usd above is a flat sum across all 14 symbols regardless
+# of how correlated they are — 5 highly-correlated L1 alts could each pass
+# every per-symbol check individually while the *effective* portfolio risk
+# from a correlated drawdown across all 5 is far higher than that one number
+# implies. Each [[risk.clusters]] entry below caps combined exposure across a
+# named group of symbols expected to move together, on top of (not instead
+# of) the flat total. This is the pragmatic cluster-based first step the
+# audit suggested, not a full covariance-weighted calculation (which would
+# need a return-history feed this project doesn't currently maintain).
+#
+# A symbol can belong to more than one cluster; every cluster containing an
+# order's symbol is checked (see risk.rs's evaluate()). A symbol in no
+# cluster here is only subject to the flat max_total_position_usd cap,
+# exactly like before this option existed — an empty/absent [[risk.clusters]]
+# list is fully backward compatible with a config that predates it.
+#
+# Grouping and caps below are a first pass, not a rigorously fitted
+# covariance-based partition — revisit once a real return-history feed
+# exists (see the audit's Phase 3 note on a covariance-weighted version).
+# Each cap is set below the sum of its members' own max_position_usd
+# (same reasoning as max_total_position_usd above), so it's a real,
+# binding constraint that forces trade-offs within the cluster, not a
+# number large enough to never bind.
+[[risk.clusters]]
+name = "majors"
+symbols = ["BTC-USD", "ETH-USD"]
+max_exposure_usd = "6000"      # sum of members' max_position_usd = 8000
+
+[[risk.clusters]]
+name = "high-beta-l1s"
+symbols = ["SOL-USD", "AVAX-USD", "NEAR-USD", "SUI-USD", "ADA-USD"]
+max_exposure_usd = "5000"      # sum of members' max_position_usd = 8000
+
+[[risk.clusters]]
+name = "defi"
+symbols = ["UNI-USD", "AAVE-USD", "PENDLE-USD"]
+max_exposure_usd = "3000"      # sum of members' max_position_usd = 4500
+
+[[risk.clusters]]
+name = "other-alts"
+symbols = ["XRP-USD", "DOGE-USD", "LINK-USD", "TAO-USD"]
+max_exposure_usd = "5000"      # sum of members' max_position_usd = 7000
+
 # --- Dynamic slippage/spread guardrails and the volatility circuit breaker --
 # All added 2026-09-27 to catch failure modes the plain size/notional/
 # position caps above don't address at all: a thin book that makes an
