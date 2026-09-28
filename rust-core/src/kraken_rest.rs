@@ -24,14 +24,105 @@
 //!    authenticated account.
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::{Digest, Sha256, Sha512};
+use tokio::sync::Mutex;
+
+use crate::config::RateLimitConfig;
 
 type HmacSha512 = Hmac<Sha512>;
+
+/// Approximate token-bucket model of Kraken's private-REST call counter.
+///
+/// **Honesty about what this is and isn't**, in the same spirit as this
+/// module's top-level docs on the signing scheme: Kraken's real private
+/// API rate limiting increments an account-wide counter by a
+/// documented-but-endpoint-varying cost per call, decays it continuously
+/// over time, and caps it at a value that depends on the account's
+/// verification tier (Starter/Intermediate/Pro) — all of which are
+/// Kraken's to change and none of which has been checked against a real
+/// account from this project. This implements the *shape* of that model
+/// (a counter that grows by a cost, decays continuously, and rejects/
+/// throttles once it would exceed a cap) with a single flat
+/// `cost_per_call` rather than Kraken's actual per-endpoint cost table,
+/// configured conservatively (`config::RateLimitConfig`'s defaults
+/// approximate the Starter tier, the most restrictive). Re-tune against
+/// Kraken's current docs — or observed real 429/`EAPI:Rate limit
+/// exceeded` behavior — before relying on this to actually prevent a
+/// live-account suspension.
+#[derive(Debug, Clone)]
+pub struct RateLimiter {
+    max_counter: f64,
+    decay_per_sec: f64,
+    cost_per_call: f64,
+    max_wait: Duration,
+    state: Arc<Mutex<RateLimiterState>>,
+}
+
+#[derive(Debug)]
+struct RateLimiterState {
+    counter: f64,
+    last_update: Instant,
+}
+
+impl RateLimiter {
+    pub fn new(config: &RateLimitConfig) -> Self {
+        Self {
+            max_counter: config.max_counter,
+            decay_per_sec: config.decay_per_sec,
+            cost_per_call: config.cost_per_call,
+            max_wait: Duration::from_secs_f64(config.max_wait_secs.max(0.0)),
+            state: Arc::new(Mutex::new(RateLimiterState { counter: 0.0, last_update: Instant::now() })),
+        }
+    }
+
+    /// Decays the counter for elapsed time, then either reserves
+    /// `cost_per_call` and returns immediately, or — if the counter is
+    /// currently too high to fit the call — sleeps until it would fit,
+    /// as long as that wait is within `max_wait`. Returns
+    /// `Err(needed_wait)` without reserving anything if the wait would
+    /// exceed `max_wait`: this is a time-sensitive execution path, so a
+    /// call that can't be throttled within a bounded window fails fast
+    /// (the caller surfaces `KrakenRestError::RateLimited`) rather than
+    /// blocking indefinitely.
+    pub async fn acquire(&self) -> Result<(), Duration> {
+        loop {
+            let wait = {
+                let mut state = self.state.lock().await;
+                let now = Instant::now();
+                let elapsed = now.duration_since(state.last_update).as_secs_f64();
+                state.counter = (state.counter - elapsed * self.decay_per_sec).max(0.0);
+                state.last_update = now;
+
+                if state.counter + self.cost_per_call <= self.max_counter {
+                    state.counter += self.cost_per_call;
+                    return Ok(());
+                }
+
+                // How long until decay alone brings the counter down
+                // enough for this call to fit.
+                let overage = state.counter + self.cost_per_call - self.max_counter;
+                if self.decay_per_sec <= 0.0 {
+                    return Err(self.max_wait + Duration::from_secs(1)); // never decays — never fits
+                }
+                Duration::from_secs_f64(overage / self.decay_per_sec)
+            };
+
+            if wait > self.max_wait {
+                return Err(wait);
+            }
+            tokio::time::sleep(wait).await;
+            // Loop again: re-check under lock rather than assuming the
+            // sleep left the counter exactly where predicted (a
+            // concurrent call could have reserved capacity in between).
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct KrakenCredentials {
@@ -45,6 +136,7 @@ pub struct KrakenRestClient {
     http: reqwest::Client,
     rest_url: String,
     credentials: KrakenCredentials,
+    rate_limiter: RateLimiter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +221,12 @@ pub enum KrakenRestError {
     Parse(String),
     #[error("system clock error building nonce: {0}")]
     Clock(String),
+    #[error(
+        "local rate limiter throttled this call: would need to wait {0:?} to stay under the configured \
+         counter cap, which exceeds max_wait_secs — refusing to send rather than block indefinitely \
+         (see RateLimiter's docs)"
+    )]
+    RateLimited(Duration),
 }
 
 const ADD_ORDER_PATH: &str = "/0/private/AddOrder";
@@ -191,10 +289,19 @@ pub struct WebSocketsToken {
 
 impl KrakenRestClient {
     pub fn new(rest_url: impl Into<String>, credentials: KrakenCredentials) -> Self {
+        Self::with_rate_limit(rest_url, credentials, &RateLimitConfig::default())
+    }
+
+    pub fn with_rate_limit(
+        rest_url: impl Into<String>,
+        credentials: KrakenCredentials,
+        rate_limit: &RateLimitConfig,
+    ) -> Self {
         Self {
             http: reqwest::Client::new(),
             rest_url: rest_url.into(),
             credentials,
+            rate_limiter: RateLimiter::new(rate_limit),
         }
     }
 
@@ -309,10 +416,13 @@ impl KrakenRestClient {
         Ok(parsed.result.unwrap_or_default())
     }
 
-    /// Shared signed-POST plumbing: builds the nonce, form-encodes
+    /// Shared signed-POST plumbing: throttles against the local rate
+    /// limiter (see `RateLimiter`), builds the nonce, form-encodes
     /// `params` (with nonce prepended), signs, sends, and returns the raw
     /// response body for the caller to parse into its own result type.
     async fn signed_post(&self, path: &str, mut params: Vec<(&str, String)>) -> Result<String, KrakenRestError> {
+        self.rate_limiter.acquire().await.map_err(KrakenRestError::RateLimited)?;
+
         let nonce = nonce_millis()?;
         params.insert(0, ("nonce", nonce.clone()));
 
@@ -369,6 +479,49 @@ fn sign(api_secret_b64: &str, uri_path: &str, nonce: &str, post_data: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rate_limit_config(max_counter: f64, decay_per_sec: f64, cost_per_call: f64, max_wait_secs: f64) -> RateLimitConfig {
+        RateLimitConfig { max_counter, decay_per_sec, cost_per_call, max_wait_secs }
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_allows_calls_under_the_cap() {
+        let limiter = RateLimiter::new(&rate_limit_config(10.0, 1.0, 1.0, 5.0));
+        for _ in 0..10 {
+            assert!(limiter.acquire().await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_throttles_within_max_wait() {
+        // max_counter=2, cost=1 per call, decays fast (10/sec) — the third
+        // call needs to wait ~0.1s for the counter to drop back to 1, well
+        // inside max_wait, so it should succeed rather than error.
+        let limiter = RateLimiter::new(&rate_limit_config(2.0, 10.0, 1.0, 5.0));
+        assert!(limiter.acquire().await.is_ok());
+        assert!(limiter.acquire().await.is_ok());
+        let start = Instant::now();
+        assert!(limiter.acquire().await.is_ok());
+        assert!(start.elapsed() >= Duration::from_millis(50), "should have actually waited for decay");
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_fails_fast_when_wait_exceeds_max_wait() {
+        // max_counter=1, cost=1, decays very slowly (0.01/sec) and
+        // max_wait is tiny — the second call would need ~99s to fit,
+        // which exceeds max_wait, so it should error rather than block.
+        let limiter = RateLimiter::new(&rate_limit_config(1.0, 0.01, 1.0, 0.05));
+        assert!(limiter.acquire().await.is_ok());
+        let result = limiter.acquire().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_never_decaying_always_errors_after_first_fill() {
+        let limiter = RateLimiter::new(&rate_limit_config(1.0, 0.0, 1.0, 0.1));
+        assert!(limiter.acquire().await.is_ok());
+        assert!(limiter.acquire().await.is_err());
+    }
 
     // These are structural tests only — they confirm the signing function
     // is deterministic and sensitive to its inputs. They do NOT and

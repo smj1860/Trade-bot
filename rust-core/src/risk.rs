@@ -8,8 +8,15 @@
 //! 2. Symbol must be configured and enabled for the requesting exchange
 //! 3. Order size <= per-symbol max_order_size
 //! 4. Order notional (qty * price) <= per-symbol max_order_notional_usd
-//! 5. Projected position after this order <= per-symbol max_position_usd
-//! 6. Projected combined portfolio exposure <= global max_total_position_usd
+//! 5. Dynamic slippage guard: simulated fill price vs. mid, walking real
+//!    book depth (see guardrails::simulate_fill_price)
+//! 6. Dynamic spread guard: current spread vs. its own rolling average
+//!    (see guardrails::rolling_average_spread)
+//! 7. Volatility circuit breaker: if tripped, only reduce-only/flat orders
+//!    are approved (see guardrails::assess_volatility and
+//!    `check_volatility_breaker` below)
+//! 8. Projected position after this order <= per-symbol max_position_usd
+//! 9. Projected combined portfolio exposure <= global max_total_position_usd
 
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
@@ -20,9 +27,16 @@ use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 
 use crate::config::Config;
+use crate::guardrails;
 use crate::orderbook::SharedBooks;
 use crate::persistence::{FillRecord, Store};
 use crate::proto::pb::{OrderRequest, OrderSide};
+
+/// Baseline window used for both the spread guard's rolling average and
+/// the volatility breaker's baseline distribution — matches
+/// `orderbook.rs::HISTORY_MAX_AGE`, the longest either guardrail could
+/// possibly look back regardless of what's requested.
+const GUARDRAIL_HISTORY_WINDOW: Duration = Duration::from_secs(3600);
 
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const SECONDS_PER_DAY: u64 = 86_400;
@@ -101,6 +115,13 @@ pub struct RiskEngine {
     /// startup) — `apply_fill` still works correctly, it just has nothing
     /// to survive a restart with.
     store: Mutex<Option<Arc<Store>>>,
+    /// Per-symbol volatility-breaker freeze deadline: while `Instant::now()
+    /// < deadline`, only reduce-only/flat orders for that symbol are
+    /// approved (see `check_volatility_breaker`). Deliberately in-memory
+    /// only, not persisted — a freeze is a short-lived reaction to a live
+    /// market condition, not state that should outlive a restart the way
+    /// positions and the kill switch counter do.
+    vol_freeze_until: Mutex<HashMap<String, Instant>>,
 }
 
 impl RiskEngine {
@@ -113,6 +134,7 @@ impl RiskEngine {
             realized_pnl_usd: Mutex::new(Decimal::ZERO),
             kill_switch_day: Mutex::new(current_day_index()),
             store: Mutex::new(None),
+            vol_freeze_until: Mutex::new(HashMap::new()),
         }
     }
 
@@ -417,13 +439,22 @@ impl RiskEngine {
             ));
         }
 
-        let Ok(max_position_usd) = Decimal::from_str(&symbol_cfg.risk.max_position_usd) else {
-            return RiskVerdict::Rejected("invalid config: max_position_usd".to_string());
-        };
         let signed_qty = if side == OrderSide::Buy { qty } else { -qty };
         let current_position = {
             let positions = self.positions.lock().await;
             positions.get(&order.symbol).map(|p| p.qty).unwrap_or(Decimal::ZERO)
+        };
+
+        if let Some(reason) = self.check_slippage_and_spread(order, side, qty, price).await {
+            return RiskVerdict::Rejected(reason);
+        }
+
+        if let Some(reason) = self.check_volatility_breaker(order, current_position, signed_qty).await {
+            return RiskVerdict::Rejected(reason);
+        }
+
+        let Ok(max_position_usd) = Decimal::from_str(&symbol_cfg.risk.max_position_usd) else {
+            return RiskVerdict::Rejected("invalid config: max_position_usd".to_string());
         };
         let projected_notional = ((current_position + signed_qty) * price).abs();
         if projected_notional > max_position_usd {
@@ -463,6 +494,177 @@ impl RiskEngine {
             return Some(format!("global order rate limit exceeded ({limit} orders/minute)"));
         }
         recent.push_back(now);
+        None
+    }
+
+    /// Dynamic slippage + spread guardrails (see guardrails.rs). Both are
+    /// no-ops (approve) when there's no live book for this symbol yet, or
+    /// not enough rolling history for the spread check specifically —
+    /// "can't judge yet" is not the same as "reject," and every other
+    /// check in `evaluate` already has its own independent protection
+    /// (order size, notional, position caps) that doesn't depend on this
+    /// history existing.
+    async fn check_slippage_and_spread(
+        &self,
+        order: &OrderRequest,
+        side: OrderSide,
+        qty: Decimal,
+        mid_or_limit_price: Decimal,
+    ) -> Option<String> {
+        let books = self.books.lock().await;
+        let Some(book) = books.get(&order.symbol) else {
+            return None;
+        };
+        let (Some((best_bid, _)), Some((best_ask, _))) = (book.best_bid(), book.best_ask()) else {
+            return None;
+        };
+        if best_ask <= best_bid {
+            return None; // crossed/locked book — nothing sane to check against
+        }
+        let mid = (best_bid + best_ask) / Decimal::TWO;
+
+        // Slippage: walk the side of the book this order would actually
+        // consume (asks for a buy, bids for a sell) — the top-of-book
+        // price alone understates cost for anything bigger than the best
+        // level's own quantity.
+        let levels = match side {
+            OrderSide::Buy => book.ask_levels(50),
+            OrderSide::Sell => book.bid_levels(50),
+            _ => Vec::new(),
+        };
+        if let Some(fill_price) = guardrails::simulate_fill_price(&levels, qty) {
+            let Ok(max_slippage) = Decimal::from_str(&self.config.risk.global.max_slippage_pct) else {
+                return Some("invalid config: max_slippage_pct".to_string());
+            };
+            let slippage = guardrails::slippage_fraction(mid, fill_price);
+            if slippage > max_slippage {
+                return Some(format!(
+                    "expected slippage {slippage} (fill price {fill_price} vs mid {mid}) exceeds \
+                     max_slippage_pct {max_slippage} for {} — book is too thin for this order size",
+                    order.symbol
+                ));
+            }
+        } else {
+            // Not enough depth on the relevant side to fill this order at
+            // all — a market/limit order this large has no honest
+            // "expected fill price" to check, which is itself the
+            // liquidity-vacuum condition this guardrail exists to catch.
+            return Some(format!(
+                "order book for {} does not have enough depth on the {side:?} side to fill a {qty} order \
+                 — refusing to estimate slippage against a book this thin",
+                order.symbol
+            ));
+        }
+
+        // Spread: current spread vs. this book's own rolling average,
+        // scaled by a configured multiplier — a threshold that adapts to
+        // each symbol's normal spread rather than one flat number.
+        let current_spread = guardrails::spread_fraction(best_bid, best_ask, mid_or_limit_price.max(mid));
+        let history = book.recent_samples(GUARDRAIL_HISTORY_WINDOW);
+        if let Some(avg_spread) =
+            guardrails::rolling_average_spread(&history, self.config.risk.global.min_spread_samples)
+        {
+            let Ok(multiplier) = Decimal::from_str(&self.config.risk.global.spread_multiplier) else {
+                return Some("invalid config: spread_multiplier".to_string());
+            };
+            let threshold = avg_spread * multiplier;
+            if current_spread > threshold {
+                return Some(format!(
+                    "current spread {current_spread} exceeds {multiplier}x its rolling average \
+                     ({avg_spread}, threshold {threshold}) for {} — book looks dislocated from its own recent normal",
+                    order.symbol
+                ));
+            }
+        }
+
+        None
+    }
+
+    /// Micro-volatility circuit breaker. If a fresh spike trips it, this
+    /// symbol freezes into reduce-only/flat for `vol_circuit_breaker_freeze_secs`
+    /// (see `vol_freeze_until`): while frozen, an order is only approved
+    /// if it would not increase the position's absolute size and would
+    /// not flip its sign — i.e. it can only shrink or close the existing
+    /// position, never grow or reverse it. A flat symbol (no position)
+    /// approves nothing at all while frozen, matching the "Reduce-Only /
+    /// Flat" framing this guardrail was asked for in.
+    async fn check_volatility_breaker(
+        &self,
+        order: &OrderRequest,
+        current_position: Decimal,
+        signed_qty: Decimal,
+    ) -> Option<String> {
+        let now = Instant::now();
+
+        {
+            let freezes = self.vol_freeze_until.lock().await;
+            if let Some(&deadline) = freezes.get(&order.symbol) {
+                if now < deadline {
+                    return self.reduce_only_verdict(order, current_position, signed_qty, deadline);
+                }
+            }
+        }
+
+        let history = {
+            let books = self.books.lock().await;
+            let Some(book) = books.get(&order.symbol) else {
+                return None;
+            };
+            book.recent_samples(GUARDRAIL_HISTORY_WINDOW)
+        };
+
+        let short_window = Duration::from_secs(self.config.risk.global.vol_short_window_secs);
+        let bucket = Duration::from_secs(self.config.risk.global.vol_baseline_bucket_secs);
+        let Some(reading) = guardrails::assess_volatility(&history, now, short_window, bucket) else {
+            return None; // not enough history to judge yet — approve, don't guess
+        };
+
+        let Ok(threshold_stddev) = self.config.risk.global.vol_circuit_breaker_stddev.parse::<f64>() else {
+            return Some("invalid config: vol_circuit_breaker_stddev".to_string());
+        };
+
+        if reading.zscore <= threshold_stddev {
+            return None;
+        }
+
+        let freeze_secs = self.config.risk.global.vol_circuit_breaker_freeze_secs;
+        let deadline = now + Duration::from_secs(freeze_secs);
+        self.vol_freeze_until.lock().await.insert(order.symbol.clone(), deadline);
+        tracing::warn!(
+            symbol = %order.symbol,
+            zscore = reading.zscore,
+            short_window_vol = reading.short_window_vol,
+            baseline_mean = reading.baseline_mean,
+            baseline_stddev = reading.baseline_stddev,
+            freeze_secs,
+            "volatility circuit breaker tripped — freezing to reduce-only/flat"
+        );
+
+        self.reduce_only_verdict(order, current_position, signed_qty, deadline)
+    }
+
+    /// Shared reduce-only check for `check_volatility_breaker`, used both
+    /// on a freshly-tripped breaker and on one still inside an earlier
+    /// freeze window.
+    fn reduce_only_verdict(
+        &self,
+        order: &OrderRequest,
+        current_position: Decimal,
+        signed_qty: Decimal,
+        deadline: Instant,
+    ) -> Option<String> {
+        let new_qty = current_position + signed_qty;
+        let increases_size = new_qty.abs() > current_position.abs();
+        let flips_sign = !current_position.is_zero() && !new_qty.is_zero() && sign_of(new_qty) != sign_of(current_position);
+
+        if increases_size || flips_sign {
+            let remaining = deadline.saturating_duration_since(Instant::now()).as_secs();
+            return Some(format!(
+                "volatility circuit breaker is active for {} (reduce-only/flat for another {remaining}s) — \
+                 this order would increase or flip the position, which is not allowed while frozen",
+                order.symbol
+            ));
+        }
         None
     }
 
@@ -541,9 +743,19 @@ mod tests {
                     max_total_position_usd: "10000".into(),
                     max_orders_per_minute: 20,
                     kill_switch_max_daily_loss_usd: "500".into(),
+                    max_slippage_pct: "0.005".into(),
+                    spread_multiplier: "3.0".into(),
+                    min_spread_samples: 30,
+                    vol_circuit_breaker_stddev: "4.0".into(),
+                    vol_short_window_secs: 60,
+                    vol_baseline_bucket_secs: 60,
+                    vol_circuit_breaker_freeze_secs: 300,
                 },
             },
-            execution: crate::config::ExecutionConfig { dry_run: true },
+            execution: crate::config::ExecutionConfig {
+                dry_run: true,
+                rate_limit: crate::config::RateLimitConfig::default(),
+            },
             persistence: crate::config::PersistenceConfig { database_path: ":memory:".to_string() },
         }
     }
@@ -554,6 +766,19 @@ mod tests {
             symbol: symbol.into(),
             exchange: "kraken".into(),
             side: OrderSide::Buy as i32,
+            r#type: if limit_price.is_some() { OrderType::Limit as i32 } else { OrderType::Market as i32 },
+            quantity: Some(PbDecimal { value: qty.into() }),
+            limit_price: limit_price.map(|p| PbDecimal { value: p.into() }),
+            strategy_id: "test-strategy".into(),
+        }
+    }
+
+    fn sell_order(symbol: &str, qty: &str, limit_price: Option<&str>) -> OrderRequest {
+        OrderRequest {
+            client_order_id: "test-1".into(),
+            symbol: symbol.into(),
+            exchange: "kraken".into(),
+            side: OrderSide::Sell as i32,
             r#type: if limit_price.is_some() { OrderType::Limit as i32 } else { OrderType::Market as i32 },
             quantity: Some(PbDecimal { value: qty.into() }),
             limit_price: limit_price.map(|p| PbDecimal { value: p.into() }),
@@ -770,5 +995,248 @@ mod tests {
         engine.attach_store(Arc::new(store)).await.unwrap();
 
         assert_eq!(engine.realized_pnl_today().await, Decimal::ZERO);
+    }
+
+    // --- Slippage / spread / volatility guardrails (guardrails.rs, wired
+    // in via check_slippage_and_spread / check_volatility_breaker) ---
+
+    #[tokio::test]
+    async fn rejects_order_when_book_too_thin_to_estimate_slippage() {
+        let books = new_shared_books();
+        {
+            let mut guard = books.lock().await;
+            let mut book = OrderBook::new("BTC-USD");
+            // Only 0.01 available at the best ask — far less than the 1.0
+            // this order wants to buy.
+            book.apply_snapshot(
+                vec![(Decimal::from_str("29999").unwrap(), Decimal::from_str("1").unwrap())],
+                vec![(Decimal::from_str("30001").unwrap(), Decimal::from_str("0.01").unwrap())],
+            );
+            guard.insert("BTC-USD".to_string(), book);
+        }
+        let engine = RiskEngine::new(Arc::new(test_config()), books);
+        let order = buy_order("BTC-USD", "1.0", None); // market order, wants more depth than exists
+        assert!(matches!(engine.evaluate(&order).await, RiskVerdict::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn rejects_order_when_expected_slippage_exceeds_configured_max() {
+        let mut config = test_config();
+        config.risk.global.max_slippage_pct = "0.0001".to_string(); // very tight, 0.01%
+        let books = new_shared_books();
+        {
+            let mut guard = books.lock().await;
+            let mut book = OrderBook::new("BTC-USD");
+            // Buying 1.0: 0.5 @ 30001, then 0.5 @ 30500 -> vwap well above
+            // mid (~30000), tripping even a modest slippage cap.
+            book.apply_snapshot(
+                vec![(Decimal::from_str("29999").unwrap(), Decimal::from_str("1").unwrap())],
+                vec![
+                    (Decimal::from_str("30001").unwrap(), Decimal::from_str("0.5").unwrap()),
+                    (Decimal::from_str("30500").unwrap(), Decimal::from_str("0.5").unwrap()),
+                ],
+            );
+            guard.insert("BTC-USD".to_string(), book);
+        }
+        let engine = RiskEngine::new(Arc::new(config), books);
+        let order = buy_order("BTC-USD", "1.0", None);
+        assert!(matches!(engine.evaluate(&order).await, RiskVerdict::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn approves_order_within_configured_slippage_tolerance() {
+        let books = new_shared_books();
+        {
+            let mut guard = books.lock().await;
+            let mut book = OrderBook::new("BTC-USD");
+            book.apply_snapshot(
+                vec![(Decimal::from_str("29999").unwrap(), Decimal::from_str("1").unwrap())],
+                vec![(Decimal::from_str("30001").unwrap(), Decimal::from_str("1").unwrap())],
+            );
+            guard.insert("BTC-USD".to_string(), book);
+        }
+        let engine = RiskEngine::new(Arc::new(test_config()), books);
+        let order = buy_order("BTC-USD", "0.01", None); // fills entirely at best ask, negligible slippage
+        assert_eq!(engine.evaluate(&order).await, RiskVerdict::Approved);
+    }
+
+    #[tokio::test]
+    async fn rejects_order_when_spread_blows_out_past_its_rolling_average() {
+        let mut config = test_config();
+        config.risk.global.min_spread_samples = 3; // fast to build up in a test
+        config.risk.global.max_slippage_pct = "1.0".to_string(); // isolate the spread guard specifically
+        let books = new_shared_books();
+        {
+            let mut guard = books.lock().await;
+            let mut book = OrderBook::new("BTC-USD");
+            // A handful of narrow-spread snapshots to build up a tight
+            // rolling average (~0.0067% spread each). Each call fully
+            // replaces the book (unlike apply_update, which only adds/
+            // changes individual levels) so top-of-book actually moves.
+            for _ in 0..5 {
+                book.apply_snapshot(
+                    vec![(Decimal::from_str("29999").unwrap(), Decimal::from_str("1").unwrap())],
+                    vec![(Decimal::from_str("30001").unwrap(), Decimal::from_str("1").unwrap())],
+                );
+            }
+            // ...then the book blows out to a much wider spread right
+            // before the order is evaluated.
+            book.apply_snapshot(
+                vec![(Decimal::from_str("29000").unwrap(), Decimal::from_str("1").unwrap())],
+                vec![(Decimal::from_str("31000").unwrap(), Decimal::from_str("1").unwrap())],
+            );
+            guard.insert("BTC-USD".to_string(), book);
+        }
+        let engine = RiskEngine::new(Arc::new(config), books);
+        let order = buy_order("BTC-USD", "0.01", None);
+        assert!(matches!(engine.evaluate(&order).await, RiskVerdict::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn spread_guard_does_not_apply_before_enough_history_accumulates() {
+        // Same wide spread as above, but default min_spread_samples (30)
+        // means this book's single snapshot hasn't built up a baseline
+        // yet — the dynamic spread check should simply not apply, not
+        // reject over an assumed baseline of zero. Slippage is also
+        // loosened here so this test is isolated to the spread guard.
+        let mut config = test_config();
+        config.risk.global.max_slippage_pct = "1.0".to_string();
+        let books = new_shared_books();
+        {
+            let mut guard = books.lock().await;
+            let mut book = OrderBook::new("BTC-USD");
+            book.apply_snapshot(
+                vec![(Decimal::from_str("29000").unwrap(), Decimal::from_str("1").unwrap())],
+                vec![(Decimal::from_str("31000").unwrap(), Decimal::from_str("1").unwrap())],
+            );
+            guard.insert("BTC-USD".to_string(), book);
+        }
+        let engine = RiskEngine::new(Arc::new(config), books);
+        let order = buy_order("BTC-USD", "0.01", None);
+        assert_eq!(engine.evaluate(&order).await, RiskVerdict::Approved);
+    }
+
+    /// Builds a book whose history contains a calm baseline (5 separate
+    /// 1-second-apart clusters, each with 2 ticks so `window_parkinson_vol`
+    /// has a real range to compute — see `MIN_BASELINE_BUCKETS`) older
+    /// than `short_window`, then a sharp spike within it. `OrderBook` has
+    /// no injectable clock (see guardrails.rs's docs on why), so spacing
+    /// the clusters into distinct baseline buckets means really waiting —
+    /// this takes ~6.3s of real time, which is why only the tests that
+    /// actually need a *tripped* breaker pay for it.
+    async fn spiky_vol_book(symbol: &str) -> SharedBooks {
+        let books = new_shared_books();
+        {
+            let mut guard = books.lock().await;
+            guard.insert(symbol.to_string(), OrderBook::new(symbol));
+        }
+
+        for cluster_price in ["100.00", "100.05", "100.10", "100.05", "100.00"] {
+            {
+                let mut guard = books.lock().await;
+                let book = guard.get_mut(symbol).unwrap();
+                for offset in ["0.00", "0.02"] {
+                    let bid = Decimal::from_str(cluster_price).unwrap() + Decimal::from_str(offset).unwrap();
+                    // apply_snapshot (not apply_update) so each tick fully
+                    // replaces top-of-book rather than just adding another
+                    // price level alongside whatever's already there —
+                    // otherwise best_bid/best_ask stop moving and the book
+                    // can end up crossed once the spike below is applied.
+                    book.apply_snapshot(
+                        vec![(bid, Decimal::from_str("1").unwrap())],
+                        vec![(bid + Decimal::from_str("0.1").unwrap(), Decimal::from_str("1").unwrap())],
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1050)).await;
+        }
+
+        // A sharp, wide-range spike, recorded well inside the 1s short
+        // window relative to the evaluate() call right after this
+        // function returns.
+        {
+            let mut guard = books.lock().await;
+            let book = guard.get_mut(symbol).unwrap();
+            for price in ["90", "110"] {
+                let bid = Decimal::from_str(price).unwrap();
+                book.apply_snapshot(
+                    vec![(bid, Decimal::from_str("1").unwrap())],
+                    vec![(bid + Decimal::from_str("0.1").unwrap(), Decimal::from_str("1").unwrap())],
+                );
+            }
+        }
+        books
+    }
+
+    fn vol_test_config() -> Config {
+        let mut config = test_config();
+        config.risk.global.vol_short_window_secs = 1;
+        config.risk.global.vol_baseline_bucket_secs = 1;
+        config.risk.global.vol_circuit_breaker_stddev = "1.0".to_string();
+        config.risk.global.vol_circuit_breaker_freeze_secs = 2;
+        // Loosen the other guardrails so this test is isolated to the
+        // volatility breaker, not incidentally tripping slippage/spread
+        // over the same wide-range spike.
+        config.risk.global.max_slippage_pct = "1.0".to_string();
+        config.risk.global.min_spread_samples = 1_000_000; // effectively disabled
+        config
+    }
+
+    #[tokio::test]
+    async fn volatility_breaker_trips_on_a_genuine_spike_and_freezes_new_exposure() {
+        let books = spiky_vol_book("BTC-USD").await;
+        let engine = RiskEngine::new(Arc::new(vol_test_config()), books);
+
+        // Flat symbol, breaker tripped: even a small buy is rejected,
+        // matching the "Reduce-Only / Flat" framing (nothing to reduce).
+        let order = buy_order("BTC-USD", "0.001", Some("100"));
+        assert!(matches!(engine.evaluate(&order).await, RiskVerdict::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn volatility_breaker_allows_reduce_only_orders_while_frozen() {
+        let books = spiky_vol_book("BTC-USD").await;
+        let engine = RiskEngine::new(Arc::new(vol_test_config()), books);
+
+        // Open a long position first (before evaluating against the spike
+        // — apply_fill doesn't go through the breaker, only evaluate()
+        // does).
+        engine
+            .apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.01").unwrap(), Decimal::from_str("100").unwrap(), None, None)
+            .await;
+
+        // Trip the breaker via one rejected buy (which would grow the
+        // position, so it's correctly rejected and also trips/records the
+        // freeze for the next check).
+        let growing_order = buy_order("BTC-USD", "0.005", Some("100"));
+        assert!(matches!(engine.evaluate(&growing_order).await, RiskVerdict::Rejected(_)));
+
+        // A sell that only shrinks the existing long (never flips it) is
+        // still approved while frozen.
+        let reducing_order = sell_order("BTC-USD", "0.005", Some("100"));
+        assert_eq!(engine.evaluate(&reducing_order).await, RiskVerdict::Approved);
+
+        // But a sell large enough to flip the position to short is not.
+        let flipping_order = sell_order("BTC-USD", "0.02", Some("100"));
+        assert!(matches!(engine.evaluate(&flipping_order).await, RiskVerdict::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn volatility_breaker_does_not_trip_in_a_calm_market() {
+        let books = new_shared_books();
+        {
+            let mut guard = books.lock().await;
+            let mut book = OrderBook::new("BTC-USD");
+            for _ in 0..8 {
+                book.apply_snapshot(
+                    vec![(Decimal::from_str("100.00").unwrap(), Decimal::from_str("1").unwrap())],
+                    vec![(Decimal::from_str("100.10").unwrap(), Decimal::from_str("1").unwrap())],
+                );
+            }
+            guard.insert("BTC-USD".to_string(), book);
+        }
+        let engine = RiskEngine::new(Arc::new(vol_test_config()), books);
+        let order = buy_order("BTC-USD", "0.001", Some("100"));
+        assert_eq!(engine.evaluate(&order).await, RiskVerdict::Approved);
     }
 }

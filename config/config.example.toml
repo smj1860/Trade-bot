@@ -285,6 +285,23 @@ max_total_position_usd = "20000"      # across all symbols combined
 max_orders_per_minute = 20
 kill_switch_max_daily_loss_usd = "500" # halts all trading if breached
 
+# --- Dynamic slippage/spread guardrails and the volatility circuit breaker --
+# All added 2026-09-27 to catch failure modes the plain size/notional/
+# position caps above don't address at all: a thin book that makes an
+# order's *actual* fill price much worse than top-of-book, a spread that
+# has blown out past its own recent normal, or a sudden volatility spike
+# consistent with a flash crash. See rust-core/src/guardrails.rs and
+# risk.rs's evaluate() for the full mechanics. Every field below has a
+# built-in default (shown here) even if omitted from this file entirely,
+# so an older config.toml that predates these fields keeps working.
+max_slippage_pct = "0.005"            # reject if simulated fill vs. mid exceeds this
+spread_multiplier = "3.0"             # reject if current spread > this x its own rolling average
+min_spread_samples = 30               # the spread guard doesn't apply below this many history samples
+vol_circuit_breaker_stddev = "4.0"    # trip if 1-min vol is this many stddevs above its own baseline
+vol_short_window_secs = 60            # the "1-minute" window judged against the baseline
+vol_baseline_bucket_secs = 60         # bucket width used to build that baseline distribution
+vol_circuit_breaker_freeze_secs = 300 # how long a trip freezes the symbol to reduce-only/flat
+
 # -----------------------------------------------------------------------------
 # Execution safety switch. dry_run = true sends every order to Kraken's
 # AddOrder endpoint with validate=true — Kraken checks and rejects/accepts
@@ -297,6 +314,21 @@ kill_switch_max_daily_loss_usd = "500" # halts all trading if breached
 # -----------------------------------------------------------------------------
 [execution]
 dry_run = true
+
+# Approximate token-bucket model of Kraken's private-REST call counter
+# (see rust-core/src/kraken_rest.rs::RateLimiter) — throttles this
+# process's own AddOrder/OpenOrders/etc. calls before Kraken itself would
+# start returning rate-limit errors, so an active position doesn't get an
+# order silently dropped by an unhandled 429. Defaults (shown here)
+# approximate Kraken's most conservative documented tier ("Starter") since
+# this project has never verified which tier a real account sits in —
+# re-tune against Kraken's current docs before trading live if the
+# account is on a higher tier.
+[execution.rate_limit]
+max_counter = 15.0        # the counter's cap before calls start throttling
+decay_per_sec = 0.3333333 # ~1 count recovered every 3 seconds
+cost_per_call = 1.0       # flat cost per private REST call (a simplification — see RateLimiter's docs)
+max_wait_secs = 5.0       # a call needing to wait longer than this fails fast instead of blocking
 
 # -----------------------------------------------------------------------------
 # Where positions, the kill switch's daily realized-PnL counter, and

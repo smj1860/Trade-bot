@@ -1,4 +1,5 @@
 mod config;
+mod guardrails;
 mod kraken;
 mod kraken_private_ws;
 mod kraken_rest;
@@ -126,7 +127,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (Ok(api_key), Ok(api_secret)) if !api_key.is_empty() && !api_secret.is_empty() => {
                 execution_clients.insert(
                     exchange.name.clone(),
-                    KrakenRestClient::new(exchange.rest_url.clone(), KrakenCredentials { api_key, api_secret }),
+                    KrakenRestClient::with_rate_limit(
+                        exchange.rest_url.clone(),
+                        KrakenCredentials { api_key, api_secret },
+                        &config.execution.rate_limit,
+                    ),
                 );
                 tracing::info!(exchange = %exchange.name, "execution client configured");
             }

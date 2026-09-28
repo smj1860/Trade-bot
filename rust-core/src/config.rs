@@ -45,11 +45,81 @@ pub struct SymbolConfig {
     pub risk: SymbolRisk,
 }
 
+fn default_max_slippage_pct() -> String {
+    "0.005".to_string()
+}
+
+fn default_spread_multiplier() -> String {
+    "3.0".to_string()
+}
+
+fn default_min_spread_samples() -> usize {
+    30
+}
+
+fn default_vol_circuit_breaker_stddev() -> String {
+    "4.0".to_string()
+}
+
+fn default_vol_short_window_secs() -> u64 {
+    60
+}
+
+fn default_vol_baseline_bucket_secs() -> u64 {
+    60
+}
+
+fn default_vol_freeze_secs() -> u64 {
+    300
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct GlobalRisk {
     pub max_total_position_usd: String,
     pub max_orders_per_minute: u32,
     pub kill_switch_max_daily_loss_usd: String,
+    /// Reject an order whose simulated fill price (walking the live book
+    /// depth, not just top-of-book — see guardrails::simulate_fill_price)
+    /// would differ from the current midpoint by more than this fraction.
+    /// Defaults preserve old config.toml files that predate this guardrail
+    /// (a config that says nothing about slippage gets a conservative
+    /// 0.5% cap, not an unlimited one).
+    #[serde(default = "default_max_slippage_pct")]
+    pub max_slippage_pct: String,
+    /// Reject an order if the book's current spread exceeds this many
+    /// times its own rolling average spread (see
+    /// guardrails::rolling_average_spread) — a dynamic threshold that
+    /// adapts to each symbol's own normal spread rather than one flat
+    /// number across very different assets.
+    #[serde(default = "default_spread_multiplier")]
+    pub spread_multiplier: String,
+    /// The dynamic spread check does not apply until the book has
+    /// recorded at least this many rolling history samples — comparing
+    /// against a baseline built from a handful of ticks right after
+    /// startup would be noise, not signal.
+    #[serde(default = "default_min_spread_samples")]
+    pub min_spread_samples: usize,
+    /// Freeze new orders (see risk.rs's reduce-only enforcement while
+    /// tripped) whenever the short-window Parkinson volatility estimate
+    /// (guardrails::assess_volatility) is this many standard deviations
+    /// above its own recent baseline.
+    #[serde(default = "default_vol_circuit_breaker_stddev")]
+    pub vol_circuit_breaker_stddev: String,
+    /// The "1-minute" in "1-minute price volatility surges" — the recent
+    /// window judged against the baseline.
+    #[serde(default = "default_vol_short_window_secs")]
+    pub vol_short_window_secs: u64,
+    /// Bucket width used to build the baseline distribution of past
+    /// short-window volatility readings that the current one is compared
+    /// against.
+    #[serde(default = "default_vol_baseline_bucket_secs")]
+    pub vol_baseline_bucket_secs: u64,
+    /// Once tripped, how long the volatility circuit breaker stays in its
+    /// reduce-only/flat freeze before re-evaluating — a deliberate
+    /// cooldown so a single tick dropping back under the threshold right
+    /// after a spike doesn't immediately reopen the door.
+    #[serde(default = "default_vol_freeze_secs")]
+    pub vol_circuit_breaker_freeze_secs: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -61,6 +131,61 @@ fn default_dry_run() -> bool {
     true
 }
 
+fn default_rate_limit_max_counter() -> f64 {
+    // Approximates Kraken's documented "Starter" verification tier
+    // (max counter 15, decays ~1 every 3s) — the most conservative
+    // tier, chosen as the safe default since this project has never
+    // verified which tier a real account sits in. See
+    // kraken_rest.rs::RateLimiter's docs for why these numbers are an
+    // approximation, not a byte-for-byte match to Kraken's real model.
+    15.0
+}
+
+fn default_rate_limit_decay_per_sec() -> f64 {
+    1.0 / 3.0
+}
+
+fn default_rate_limit_cost_per_call() -> f64 {
+    1.0
+}
+
+fn default_rate_limit_max_wait_secs() -> f64 {
+    5.0
+}
+
+/// Approximate token-bucket model of Kraken's private-REST call counter —
+/// see kraken_rest.rs::RateLimiter. Defaults are conservative
+/// (Starter-tier-shaped) precisely because they've never been verified
+/// against a real account's actual tier; re-tune against Kraken's current
+/// docs (or observed 429 behavior) before trading live.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RateLimitConfig {
+    #[serde(default = "default_rate_limit_max_counter")]
+    pub max_counter: f64,
+    #[serde(default = "default_rate_limit_decay_per_sec")]
+    pub decay_per_sec: f64,
+    #[serde(default = "default_rate_limit_cost_per_call")]
+    pub cost_per_call: f64,
+    /// A call that would need to wait longer than this to fit under
+    /// `max_counter` fails fast (KrakenRestError::RateLimited) instead of
+    /// blocking the calling task indefinitely — bounded throttling, not
+    /// unbounded queuing, on what's meant to be a time-sensitive
+    /// execution path.
+    #[serde(default = "default_rate_limit_max_wait_secs")]
+    pub max_wait_secs: f64,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_counter: default_rate_limit_max_counter(),
+            decay_per_sec: default_rate_limit_decay_per_sec(),
+            cost_per_call: default_rate_limit_cost_per_call(),
+            max_wait_secs: default_rate_limit_max_wait_secs(),
+        }
+    }
+}
+
 /// Execution safety switch. Defaults to `true` (dry-run / validate-only)
 /// even if the `[execution]` section is missing from config entirely —
 /// a config that says nothing about execution must never be read as
@@ -69,11 +194,13 @@ fn default_dry_run() -> bool {
 pub struct ExecutionConfig {
     #[serde(default = "default_dry_run")]
     pub dry_run: bool,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 impl Default for ExecutionConfig {
     fn default() -> Self {
-        Self { dry_run: true }
+        Self { dry_run: true, rate_limit: RateLimitConfig::default() }
     }
 }
 
