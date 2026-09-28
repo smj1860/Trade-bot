@@ -70,6 +70,21 @@ def rsi(closes: Sequence[float]) -> float:
     return (traditional_rsi - 50.0) / 50.0  # rescale to [-1, 1]
 
 
+def _log_returns(closes: Sequence[float]) -> list[float] | None:
+    """log(close[i] / close[i-1]) for each consecutive pair in `closes` —
+    shared by realized_vol() and returns_zscore() so both compute the
+    exact same return series from the exact same window rather than two
+    copies that could quietly drift apart. Returns None (rather than a
+    partial list) if any close is non-positive, since a single bad price
+    invalidates the whole series for both callers' purposes."""
+    log_returns = []
+    for prev, curr in zip(closes, closes[1:]):
+        if prev <= 0 or curr <= 0:
+            return None
+        log_returns.append(math.log(curr / prev))
+    return log_returns
+
+
 def realized_vol(closes: Sequence[float]) -> float:
     """Standard deviation of log returns across the given closes — a
     simple realized-volatility estimate. Needs at least 3 closes (2 log
@@ -78,14 +93,53 @@ def realized_vol(closes: Sequence[float]) -> float:
     for a model to calibrate against rather than assumed here."""
     if len(closes) < 3:
         return 0.0
-    log_returns = []
-    for prev, curr in zip(closes, closes[1:]):
-        if prev <= 0 or curr <= 0:
-            return 0.0
-        log_returns.append(math.log(curr / prev))
+    log_returns = _log_returns(closes)
+    if log_returns is None:
+        return 0.0
     mean = sum(log_returns) / len(log_returns)
     variance = sum((r - mean) ** 2 for r in log_returns) / (len(log_returns) - 1)
     return math.sqrt(variance)
+
+
+def returns_zscore(closes: Sequence[float]) -> float:
+    """The most recent bar's log return, expressed as a Z-score against
+    the window's own log-return distribution: (last_return - mean_return)
+    / std_return, using the identical log-return series and sample-
+    variance convention realized_vol() uses (via _log_returns()), so this
+    reads in the same volatility units realized_vol reports — a
+    return_zscore of +2 means "this bar moved about 2 realized_vol's
+    worth further than this window's average move."
+
+    This is a materially different question from every other feature
+    here: bollinger_percent_b Z-scores the *price level* against its SMA
+    (a positioning signal — is price high or low right now), and
+    bar_momentum is a raw cumulative return (not standardized by
+    volatility at all). returns_zscore asks whether *this specific bar's*
+    move was unusually large or small given how volatile this window has
+    actually been — the same absolute return reads very differently after
+    a quiet, low-vol stretch than during an already-turbulent one, which
+    is exactly the kind of *stationary, regime-relative* signal (rather
+    than a price-level- or volatility-regime-dependent one) that keeps a
+    pooled cross-asset model from just learning "BTC in March" instead of
+    a genuinely reusable pattern.
+
+    Already dimensionless by construction (both the numerator and
+    denominator are in log-return units), so no separate normalization is
+    needed — same reasoning as realized_vol's. Needs at least 3 closes (2
+    log returns, matching realized_vol's minimum) and a non-zero,
+    non-degenerate std; returns 0.0 otherwise, or on any non-positive
+    close."""
+    if len(closes) < 3:
+        return 0.0
+    log_returns = _log_returns(closes)
+    if log_returns is None:
+        return 0.0
+    mean = sum(log_returns) / len(log_returns)
+    variance = sum((r - mean) ** 2 for r in log_returns) / (len(log_returns) - 1)
+    std = math.sqrt(variance)
+    if std == 0:
+        return 0.0
+    return (log_returns[-1] - mean) / std
 
 
 def bar_momentum(closes: Sequence[float]) -> float:

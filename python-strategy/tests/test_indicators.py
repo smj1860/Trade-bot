@@ -14,6 +14,7 @@ from strategy.indicators import (
     macd_histogram,
     parkinson_vol,
     realized_vol,
+    returns_zscore,
     rsi,
     sma,
     sma_ratio,
@@ -345,6 +346,49 @@ def test_parkinson_vol_wider_range_is_more_volatile():
     calm_highs, calm_lows = [101.0, 101.0], [99.0, 99.0]
     wild_highs, wild_lows = [120.0, 120.0], [80.0, 80.0]
     assert parkinson_vol(wild_highs, wild_lows) > parkinson_vol(calm_highs, calm_lows)
+
+
+def test_returns_zscore_too_little_history_is_zero():
+    assert returns_zscore([]) == 0.0
+    assert returns_zscore([100.0]) == 0.0
+    assert returns_zscore([100.0, 101.0]) == 0.0  # only 1 log return -> no std
+
+
+def test_returns_zscore_non_positive_close_is_zero():
+    assert returns_zscore([100.0, 0.0, 101.0]) == 0.0
+    assert returns_zscore([100.0, 101.0, -5.0]) == 0.0
+
+
+def test_returns_zscore_flat_series_is_zero():
+    # Every return is 0 -> std is 0 -> defined as neutral, not a division error.
+    assert returns_zscore([100.0, 100.0, 100.0, 100.0]) == 0.0
+
+
+def test_returns_zscore_matches_hand_computed_value():
+    closes = [100.0, 101.0, 102.0, 90.0]  # a sharp final drop after two calm gains
+    expected_returns = [math.log(101.0 / 100.0), math.log(102.0 / 101.0), math.log(90.0 / 102.0)]
+    mean = sum(expected_returns) / len(expected_returns)
+    variance = sum((r - mean) ** 2 for r in expected_returns) / (len(expected_returns) - 1)
+    std = math.sqrt(variance)
+    expected = (expected_returns[-1] - mean) / std
+    assert returns_zscore(closes) == pytest.approx(expected)
+
+
+def test_returns_zscore_outsized_move_reads_larger_than_ordinary_move():
+    # Same-magnitude relative move, but one window is otherwise calm and
+    # the other already choppy -> the calm window's return_zscore should
+    # be larger in magnitude for the same-sized final move.
+    calm = [100.0, 100.1, 100.2, 100.1, 90.0]
+    choppy = [100.0, 95.0, 105.0, 96.0, 86.4]  # same ~10% final drop, noisier lead-in
+    assert abs(returns_zscore(calm)) > abs(returns_zscore(choppy))
+
+
+def test_returns_zscore_scale_invariant_across_price_levels():
+    # Same proportional path at very different absolute price levels
+    # should read identically.
+    altcoin = [1.00, 1.01, 1.02, 0.90]
+    btc = [61_200.0, 61_812.0, 62_424.0, 55_080.0]
+    assert returns_zscore(altcoin) == pytest.approx(returns_zscore(btc), rel=1e-3)
 
 
 def test_parkinson_vol_scale_invariant_across_price_levels():

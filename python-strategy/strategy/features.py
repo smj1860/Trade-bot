@@ -39,6 +39,7 @@ from strategy.indicators import (
     macd_histogram,
     parkinson_vol,
     realized_vol,
+    returns_zscore,
     rsi,
     sma_ratio,
     volume_ratio,
@@ -76,6 +77,11 @@ class Features:
     # same "no opinion" convention as every other not-enough-history case.
     volume_ratio: float = 0.0
     parkinson_vol: float = 0.0
+    # Rolling Z-score of log returns (see strategy/indicators.py's
+    # returns_zscore docstring for how this differs from
+    # bollinger_percent_b (a price Z-score) and bar_momentum (a raw,
+    # non-standardized cumulative return). Same neutral-default convention.
+    returns_zscore: float = 0.0
 
 
 class _SymbolState:
@@ -235,6 +241,7 @@ class FeatureEngine:
                 self._bars.high_window(symbol, self._vol_window),
                 self._bars.low_window(symbol, self._vol_window),
             ),
+            returns_zscore=returns_zscore(self._bars.window(symbol, self._vol_window + 1)),
         )
 
     def on_trade(

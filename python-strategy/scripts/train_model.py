@@ -3,8 +3,9 @@
 Trains a baseline classifier on the OHLC-derived bar features
 (strategy/indicators.py: sma_ratio, ema_ratio, rsi, realized_vol,
 bar_momentum, bollinger_percent_b, bollinger_bandwidth, awesome_oscillator,
-macd_histogram, cci, williams_percent_r, volume_ratio, parkinson_vol —
-see FEATURE_ORDER) using real historical Kraken candles from Supabase,
+macd_histogram, cci, williams_percent_r, volume_ratio, parkinson_vol,
+returns_zscore — see FEATURE_ORDER) using real historical Kraken candles
+from Supabase,
 and saves it via joblib for use as strategy.model.kind = "sklearn" (see
 strategy_config.example.toml). Every feature is already a dimensionless
 ratio (a fraction of price, of the feature's own recent average, or of a
@@ -229,6 +230,7 @@ from strategy.indicators import (
     macd_histogram,
     parkinson_vol,
     realized_vol,
+    returns_zscore,
     rsi,
     sma_ratio,
     volume_ratio,
@@ -254,6 +256,13 @@ FEATURE_ORDER = [
     # silent reordering of what it did see).
     "volume_ratio",
     "parkinson_vol",
+    # Rolling Z-score of log returns — see strategy/indicators.py's
+    # returns_zscore docstring for how this differs from
+    # bollinger_percent_b (a price Z-score, not a returns Z-score) and
+    # bar_momentum (raw, non-standardized cumulative return). Appended
+    # last for the same feature_order-stability reason as the volume
+    # features above.
+    "returns_zscore",
 ]
 
 
@@ -397,6 +406,9 @@ def features_at(
         "williams_percent_r": williams_percent_r(wr_closes, wr_highs, wr_lows),
         "volume_ratio": volume_ratio(volume_win),
         "parkinson_vol": parkinson_vol(parkinson_highs, parkinson_lows),
+        # Same window as realized_vol (vol_win) — see returns_zscore's
+        # docstring for why this needs the identical log-return series.
+        "returns_zscore": returns_zscore(vol_win),
     }
 
 

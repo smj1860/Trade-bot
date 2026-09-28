@@ -90,6 +90,7 @@ def test_bar_derived_features_default_to_neutral_with_no_bar_history():
     assert features.williams_percent_r == 0.0
     assert features.volume_ratio == 0.0
     assert features.parkinson_vol == 0.0
+    assert features.returns_zscore == 0.0
 
 
 def test_bar_derived_features_populate_once_bars_complete():
@@ -170,6 +171,28 @@ def test_volume_ratio_populates_once_a_trade_feed_is_wired_up():
     assert features is not None
     assert features.volume_ratio > 0
     assert features.parkinson_vol >= 0.0
+
+
+def test_returns_zscore_stays_neutral_with_too_little_bar_history():
+    engine = FeatureEngine(momentum_window=5, bar_interval_seconds=60, vol_window=5)
+    features = engine.on_order_book_update(
+        "BTC-USD", Decimal(100), Decimal(1), Decimal(102), Decimal(1), timestamp=0.0
+    )
+    assert features is not None
+    assert features.returns_zscore == 0.0
+
+
+def test_returns_zscore_populates_once_enough_bars_complete():
+    engine = FeatureEngine(momentum_window=5, bar_interval_seconds=60, vol_window=3)
+    # Steady small moves, then one outsized jump -> the jump's bar should
+    # read as a clearly positive returns_zscore relative to the window.
+    prices = [100, 100.1, 100.2, 105, 105.1]
+    for i, p in enumerate(prices):
+        features = engine.on_order_book_update(
+            "BTC-USD", Decimal(str(p)), Decimal(1), Decimal(str(p + 2)), Decimal(1), timestamp=float(i * 60)
+        )
+    assert features is not None
+    assert features.returns_zscore > 0
 
 
 def test_on_trade_symbol_not_yet_seen_by_order_book_update_does_not_raise():

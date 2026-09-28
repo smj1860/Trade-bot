@@ -662,3 +662,60 @@ real sweep, not a new sweep result. The next sweep (profit-margin, or a
 re-run of the horizon sweep now that leakage is closed and volume
 features exist) should be run against this corrected pipeline, not the
 prior one.
+
+## Stationarity double-check: returns Z-score added, fractional differentiation deliberately skipped (2026-09-27)
+
+Stephen asked to double-check "Standardize Features to Stationarity"
+(raw price levels never entering the feature matrix; Z-scores over
+rolling windows, fractional differentiation, volume ratios, return
+volatility) rather than assume the prior round's work already covered
+it. Checked each item against the actual code instead of asserting:
+
+1. **Raw price levels never enter the feature matrix — already true.**
+   Every entry in `FEATURE_ORDER` is a ratio, a bounded oscillator, or a
+   Z-score computed off ratios/returns (see the pooling-review section
+   above, which verified this for the original 11 features; volume_ratio
+   and parkinson_vol added since are the same self-relative idiom). No
+   change needed.
+
+2. **Return volatility — already true.** `realized_vol` (close-to-close
+   log-return stdev) and `parkinson_vol` (high-low range estimator,
+   added last round) both cover this.
+
+3. **Volume ratios — already true.** `volume_ratio`, added last round.
+
+4. **Z-scores over rolling windows — partially true, now closed.**
+   `bollinger_percent_b` is a Z-score, but of *price* against its SMA (a
+   positioning signal: is price high or low right now). Nothing existing
+   Z-scored *returns* — the question of whether a given bar's move was
+   unusually large given how volatile the window has actually been,
+   which is the more literal reading of "log returns... scaled relative
+   to each asset's rolling Z-score." Added `returns_zscore` to
+   `strategy/indicators.py`: `(last_return - mean_return) / std_return`
+   over the window's own log-return series, sharing a new `_log_returns`
+   helper with `realized_vol` so both read the exact same return series
+   rather than two implementations that could quietly drift apart.
+   Wired into `strategy/features.py`'s `Features` dataclass and
+   `FeatureEngine`, and into `scripts/train_model.py`'s `FEATURE_ORDER`
+   (appended last, same feature-order-stability reasoning as the volume
+   features) and `features_at()`.
+
+5. **Fractional differentiation — genuinely not implemented, and not
+   planned for now.** Reasoning: its usual selling point (stationarity
+   *while preserving long-memory information*) mainly earns its keep
+   when a model consumes raw or lightly-processed price directly — this
+   pipeline never does that (item 1 above). It also needs a long,
+   slowly-decaying weighted lookback, which is a harder fit for this
+   project's live/historical feature-parity constraint than the existing
+   indicators: every feature here must be computable identically from a
+   bounded rolling window, both live (via `BarAggregator`'s incremental
+   deques) and historically (via `load_ohlc`'s full history), and
+   frac-diff's weight series doesn't have a natural truncation point the
+   way a fixed SMA/EMA/RSI window does. Skipped rather than built
+   speculatively; revisit if a future sweep result suggests the existing
+   ratio-based features are throwing away long-memory structure that
+   frac-diff would recover.
+
+199 Python tests total (up from 191), 60 Rust tests, all passing. No
+sweep re-run yet — this is another pipeline-correctness pass, not a new
+result.
