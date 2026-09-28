@@ -350,6 +350,54 @@ impl Default for DeadManSwitchConfig {
     }
 }
 
+fn default_stop_loss_enabled() -> bool {
+    true
+}
+
+fn default_stop_loss_max_loss_pct() -> String {
+    "0.03".to_string()
+}
+
+fn default_stop_loss_check_interval_secs() -> u64 {
+    10
+}
+
+/// Institutional audit Phase 2.3: per-position stop-loss / auto-reduce.
+/// Independent of both the daily kill switch (risk.rs's realized-PnL-based
+/// daily loss limit, which only reacts once a loss is *realized* by a
+/// closing fill) and the dead-man's switch (heartbeat.rs, which only
+/// reacts to a strategy going silent) — this watches each open position's
+/// live *unrealized* loss and submits a reduce-to-flat order for that one
+/// symbol once it crosses `max_loss_pct`, regardless of whether the owning
+/// strategy is alive and well but simply riding a large adverse move.
+/// Defaults to enabled at a conservative 3% of entry notional, since an
+/// unbounded open position with no stop at all is the more dangerous
+/// default for a config that says nothing about this.
+#[derive(Debug, Deserialize, Clone)]
+pub struct StopLossConfig {
+    #[serde(default = "default_stop_loss_enabled")]
+    pub enabled: bool,
+    /// Fractional unrealized loss against a position's average entry
+    /// price (e.g. "0.03" = 3%) that triggers an automatic reduce-to-flat
+    /// order for that symbol alone.
+    #[serde(default = "default_stop_loss_max_loss_pct")]
+    pub max_loss_pct: String,
+    /// How often the stop-loss monitor task re-checks every open
+    /// position's unrealized PnL.
+    #[serde(default = "default_stop_loss_check_interval_secs")]
+    pub check_interval_secs: u64,
+}
+
+impl Default for StopLossConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_stop_loss_enabled(),
+            max_loss_pct: default_stop_loss_max_loss_pct(),
+            check_interval_secs: default_stop_loss_check_interval_secs(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub general: GeneralConfig,
@@ -362,6 +410,8 @@ pub struct Config {
     pub persistence: PersistenceConfig,
     #[serde(default)]
     pub dead_man_switch: DeadManSwitchConfig,
+    #[serde(default)]
+    pub stop_loss: StopLossConfig,
 }
 
 impl Config {

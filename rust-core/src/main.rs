@@ -13,6 +13,7 @@ mod persistence;
 mod proto;
 mod reconcile;
 mod risk;
+mod stop_loss;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -31,6 +32,7 @@ use persistence::Store;
 use proto::pb::market_data_service_server::MarketDataServiceServer;
 use proto::pb::order_service_server::OrderServiceServer;
 use risk::RiskEngine;
+use stop_loss::StopLossState;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -253,6 +255,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         order_service.clone(),
         execution_clients,
         store,
+        risk_engine.clone(),
+        alert_sink.clone(),
+    ));
+
+    // Institutional audit Phase 2.3: per-position stop-loss / auto-reduce.
+    // Independent of the dead-man's switch above (which reacts to a
+    // strategy going silent, not to how a live strategy's position is
+    // performing) — see stop_loss.rs's module docs for how the two
+    // relate. Shares the same order_service so a stop-loss flatten goes
+    // through the exact same risk-evaluation path as every other order.
+    let stop_loss_state = Arc::new(StopLossState::new());
+    tokio::spawn(stop_loss::run_stop_loss_monitor(
+        stop_loss_state,
+        config.clone(),
+        order_service.clone(),
         risk_engine,
         alert_sink,
     ));

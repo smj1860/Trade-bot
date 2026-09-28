@@ -425,3 +425,22 @@ auto_flatten_positions = false # submit a market order to zero out every open
                                 # (non-vol-scaled) order sizing means a flatten
                                 # order could itself be a large, un-sized-for-the-
                                 # moment trade. Turn on deliberately.
+
+# -----------------------------------------------------------------------------
+# Institutional audit Phase 2.3: per-position stop-loss / auto-reduce.
+# Independent of the dead-man's switch above and of the kill switch's daily
+# realized-PnL limit ([risk.global].kill_switch_max_daily_loss_usd) — this
+# watches each open position's live UNREALIZED PnL (marked against the
+# current book) and submits a reduce-to-flat market order for that symbol
+# alone once its loss crosses max_loss_pct, regardless of whether the owning
+# strategy is still alive and heartbeating normally. See
+# rust-core/src/stop_loss.rs for the full mechanics. Every field below has
+# the built-in default shown here even if this whole section is omitted, so
+# an older config.toml keeps working (and defaults to enabled — an unbounded
+# open position with no stop at all is the more dangerous default).
+# -----------------------------------------------------------------------------
+[stop_loss]
+enabled = true
+max_loss_pct = "0.03"      # flatten a position once it's down 3% against its
+                            # own average entry price
+check_interval_secs = 10   # how often the monitor re-checks every open position

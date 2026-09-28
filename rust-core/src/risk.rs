@@ -337,6 +337,35 @@ impl RiskEngine {
         *self.realized_pnl_usd.lock().await
     }
 
+    /// Unrealized PnL for a symbol's current open position, as a fraction
+    /// of its entry notional (e.g. `-0.05` means the position is down 5%
+    /// against its average entry price). Institutional audit Phase 2.3's
+    /// stop-loss monitor polls this. Marks a long against the book's best
+    /// bid and a short against its best ask — the same best-bid/best-ask
+    /// mark-to-market approximation this file already uses elsewhere (see
+    /// `combined_exposure_excluding`'s docs); good enough for a guardrail,
+    /// not meant to be a precise valuation. Returns `None` when the
+    /// position is flat or there is no live book to mark against, rather
+    /// than a false `0.0` that would read as "flat PnL" instead of
+    /// "unknown."
+    pub async fn unrealized_pnl_pct(&self, symbol: &str) -> Option<Decimal> {
+        let position = {
+            let positions = self.positions.lock().await;
+            positions.get(symbol).copied()?
+        };
+        if position.qty.is_zero() || position.avg_entry_price.is_zero() {
+            return None;
+        }
+
+        let books = self.books.lock().await;
+        let book = books.get(symbol)?;
+        let mark = if position.qty > Decimal::ZERO { book.best_bid()?.0 } else { book.best_ask()?.0 };
+
+        let pnl_per_unit =
+            if position.qty > Decimal::ZERO { mark - position.avg_entry_price } else { position.avg_entry_price - mark };
+        Some(pnl_per_unit / position.avg_entry_price)
+    }
+
     /// Resets the daily realized-PnL counter when the UTC day has rolled
     /// over since it was last checked, persisting the reset immediately so
     /// a restart moments later doesn't resurrect yesterday's total.
@@ -877,6 +906,7 @@ mod tests {
             },
             persistence: crate::config::PersistenceConfig { database_path: ":memory:".to_string() },
             dead_man_switch: crate::config::DeadManSwitchConfig::default(),
+            stop_loss: crate::config::StopLossConfig::default(),
         }
     }
 
@@ -1572,5 +1602,55 @@ mod tests {
             &["BTC-USD".to_string(), "ETH-USD".to_string()], "BTC-USD"
         ).await;
         assert_eq!(excluding_btc, Decimal::from_str("2000").unwrap());
+    }
+
+    // --- Institutional audit Phase 2.3: unrealized-PnL-pct for the stop-loss monitor ---
+
+    #[tokio::test]
+    async fn unrealized_pnl_pct_is_none_for_a_flat_symbol() {
+        let engine = RiskEngine::new(Arc::new(test_config()), new_shared_books());
+        assert_eq!(engine.unrealized_pnl_pct("BTC-USD").await, None);
+    }
+
+    #[tokio::test]
+    async fn unrealized_pnl_pct_is_none_without_a_live_book() {
+        // Position exists but no book was ever inserted for this symbol.
+        let engine = RiskEngine::new(Arc::new(test_config()), new_shared_books());
+        engine.apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.1").unwrap(), Decimal::from_str("30000").unwrap(), None, None).await;
+        assert_eq!(engine.unrealized_pnl_pct("BTC-USD").await, None);
+    }
+
+    #[tokio::test]
+    async fn unrealized_pnl_pct_is_negative_for_a_long_marked_below_entry() {
+        let books = new_shared_books();
+        insert_book(&books, "BTC-USD", "27000", "27010").await; // best_bid=27000, entry=30000
+        let engine = RiskEngine::new(Arc::new(test_config()), books);
+        engine.apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.1").unwrap(), Decimal::from_str("30000").unwrap(), None, None).await;
+        let pnl_pct = engine.unrealized_pnl_pct("BTC-USD").await.unwrap();
+        // (27000 - 30000) / 30000 = -0.1
+        assert_eq!(pnl_pct, Decimal::from_str("-0.1").unwrap());
+    }
+
+    #[tokio::test]
+    async fn unrealized_pnl_pct_is_positive_for_a_long_marked_above_entry() {
+        let books = new_shared_books();
+        insert_book(&books, "BTC-USD", "33000", "33010").await;
+        let engine = RiskEngine::new(Arc::new(test_config()), books);
+        engine.apply_fill("BTC-USD", OrderSide::Buy, Decimal::from_str("0.1").unwrap(), Decimal::from_str("30000").unwrap(), None, None).await;
+        let pnl_pct = engine.unrealized_pnl_pct("BTC-USD").await.unwrap();
+        assert_eq!(pnl_pct, Decimal::from_str("0.1").unwrap());
+    }
+
+    #[tokio::test]
+    async fn unrealized_pnl_pct_marks_a_short_against_the_best_ask() {
+        let books = new_shared_books();
+        // Short at entry 30000; best_ask (what it'd cost to buy back and
+        // close) has risen to 33000 -> a loss for the short.
+        insert_book(&books, "BTC-USD", "32990", "33000").await;
+        let engine = RiskEngine::new(Arc::new(test_config()), books);
+        engine.apply_fill("BTC-USD", OrderSide::Sell, Decimal::from_str("0.1").unwrap(), Decimal::from_str("30000").unwrap(), None, None).await;
+        let pnl_pct = engine.unrealized_pnl_pct("BTC-USD").await.unwrap();
+        // (30000 - 33000) / 30000 = -0.1
+        assert_eq!(pnl_pct, Decimal::from_str("-0.1").unwrap());
     }
 }
