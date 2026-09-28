@@ -16,6 +16,14 @@ name: Deep OHLC backfill from trade history
 # smaller --since-days, or run multiple shorter windows and let them
 # upsert into the same rows.
 #
+# To deepen history already backfilled, use before_days rather than just
+# raising since_days — before_days sets how many days ago the window
+# ENDS (default 0 = now), so e.g. going from 6 to 9 months of history
+# means since_days=270, before_days=180 (only the new 90-day slice),
+# not since_days=270 alone (which would re-pull the whole 270 days,
+# including the 180 already covered — idempotent but wasteful and
+# needlessly slow for high-volume pairs).
+#
 # Requires the same SUPABASE_DB_URL repository secret as
 # historical-backfill.yml.
 
@@ -30,9 +38,13 @@ on:
         required: false
         default: "60"
       since_days:
-        description: "How far back to pull trade history from now"
+        description: "How far back the window starts (days ago)"
         required: false
         default: "180"
+      before_days:
+        description: "How far back the window ends (days ago; 0 = now). Use this to deepen history without re-pulling what's already covered."
+        required: false
+        default: "0"
 
 jobs:
   backfill:
@@ -55,4 +67,5 @@ jobs:
           python historical-data/backfill_ohlc_from_trades.py \
             --symbol "${{ github.event.inputs.symbol }}" \
             --interval "${{ github.event.inputs.interval }}" \
-            --since-days "${{ github.event.inputs.since_days }}"
+            --since-days "${{ github.event.inputs.since_days }}" \
+            --before-days "${{ github.event.inputs.before_days }}"

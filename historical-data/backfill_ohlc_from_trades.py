@@ -23,6 +23,13 @@ Usage:
 
     # A quick timing test on one symbol before committing to the rest:
     python3 backfill_ohlc_from_trades.py --symbol DOGE-USD --interval 60 --since-days 7
+
+    # Deepening an already-backfilled symbol without re-pulling what's
+    # already covered: having previously run --since-days 180 (6 months),
+    # extend to 9 months by pulling only the 90-day slice *before* that —
+    # --before-days sets how many days ago the window ENDS (default 0 =
+    # now), so this pulls days 270-180 ago instead of re-fetching 0-270:
+    python3 backfill_ohlc_from_trades.py --symbol BTC-USD --interval 60 --since-days 270 --before-days 180
 """
 
 from __future__ import annotations
@@ -58,7 +65,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--symbol", required=True, help="Normalized symbol (e.g. BTC-USD).")
     parser.add_argument("--interval", type=int, default=60, help="Candle resolution in minutes to build (default 60).")
-    parser.add_argument("--since-days", type=float, default=180.0, help="How far back to pull trade history from now (default 180 = ~6 months).")
+    parser.add_argument("--since-days", type=float, default=180.0, help="How far back to pull trade history from --before-days (default 180 = ~6 months).")
+    parser.add_argument(
+        "--before-days",
+        type=float,
+        default=0.0,
+        help=(
+            "How many days ago the window ENDS (default 0 = now). Lets a later run pull only "
+            "an older slice instead of re-fetching a range already covered — e.g. having already "
+            "backfilled --since-days 180 (the last 6 months), extending to 9 months of history "
+            "means --since-days 270 --before-days 180 (the 90 days *before* what's already "
+            "covered), not --since-days 270 alone, which would re-pull the whole 270 days "
+            "including the 180 already-covered days. Upserts are idempotent either way, so "
+            "re-covering old ground is wasteful, not incorrect — this just avoids the waste."
+        ),
+    )
     parser.add_argument("--rate-limit-sleep", type=float, default=1.0, help="Seconds to sleep between paginated Trades calls (default 1.0, well under Kraken's public rate limit).")
     args = parser.parse_args()
 
@@ -68,11 +89,20 @@ def main() -> None:
         parser.error(f"unknown or disabled symbol: {args.symbol}")
     spec = matches[0]
 
+    if args.since_days <= args.before_days:
+        parser.error("--since-days must be greater than --before-days (the window would be empty or backwards)")
+
     now = time.time()
     since_ns = int((now - args.since_days * 86400) * 1_000_000_000)
+    until_unix = now - args.before_days * 86400
+    window_desc = (
+        f"last {args.since_days:.0f} days"
+        if args.before_days == 0
+        else f"the window {args.since_days:.0f}-{args.before_days:.0f} days ago"
+    )
     print(
         f"[{spec.symbol}] backfilling OHLC (interval={args.interval}min) from raw trades, "
-        f"last {args.since_days:.0f} days — this can take a while for high-volume pairs.",
+        f"{window_desc} — this can take a while for high-volume pairs.",
         file=sys.stderr,
     )
 
@@ -81,7 +111,7 @@ def main() -> None:
     total_candles = 0
     try:
         trade_stream = kraken_client.fetch_trades_window(
-            spec.rest_native_symbol, since_ns, now, rate_limit_sleep=args.rate_limit_sleep
+            spec.rest_native_symbol, since_ns, until_unix, rate_limit_sleep=args.rate_limit_sleep
         )
         progress_stream = _counted_trades(trade_stream, spec.symbol, started)
 
