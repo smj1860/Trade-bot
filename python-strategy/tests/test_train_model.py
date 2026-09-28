@@ -22,6 +22,7 @@ from scripts.train_model import (
     _embargo_test_start,
     _purge_train_end,
     build_dataset,
+    holdout_boundary,
     list_available_symbols,
     load_symbol_dataset,
     move,
@@ -30,6 +31,7 @@ from scripts.train_model import (
     persistence_correct_and_total,
     persistence_correct_and_total_from_labels,
     resolve_symbols,
+    seal_holdout,
     simulate_net_pnl,
     simulate_triple_barrier_net_pnl,
     split_point,
@@ -743,3 +745,86 @@ def test_build_dataset_triple_barrier_scheme_drops_timeouts_and_labels_by_touch(
     # Most of the flat stretch should have timed out and been dropped —
     # far fewer surviving rows than warmup-to-end candidate bars.
     assert len(X) < (n - warmup - 4)
+
+
+# --- Institutional audit Phase 2.5: --holdout-days sealing ---
+
+
+def test_holdout_boundary_disabled_returns_full_length():
+    assert holdout_boundary(n_bars=1000, holdout_days=0, interval_minutes=60) == 1000
+
+
+def test_holdout_boundary_seals_the_expected_number_of_bars():
+    # 60-minute candles, 10 days = 240 bars.
+    assert holdout_boundary(n_bars=1000, holdout_days=10, interval_minutes=60) == 760
+
+
+def test_holdout_boundary_respects_interval():
+    # 15-minute candles, 1 day = 96 bars.
+    assert holdout_boundary(n_bars=200, holdout_days=1, interval_minutes=15) == 104
+
+
+def test_holdout_boundary_clamps_to_zero_when_holdout_exceeds_history():
+    assert holdout_boundary(n_bars=50, holdout_days=1000, interval_minutes=60) == 0
+
+
+def test_seal_holdout_truncates_all_five_series_identically():
+    closes = list(range(100))
+    midpoints = [c + 0.5 for c in closes]
+    highs = [c + 1 for c in closes]
+    lows = [c - 1 for c in closes]
+    volumes = [1.0] * 100
+
+    sealed = seal_holdout(closes, midpoints, highs, lows, volumes, holdout_days=1, interval_minutes=24)
+    # 1 day at 24-minute bars = 60 bars sealed off -> 40 remain.
+    for series in sealed:
+        assert len(series) == 40
+    sealed_closes, sealed_mids, sealed_highs, sealed_lows, sealed_vols = sealed
+    assert sealed_closes == closes[:40]
+    assert sealed_mids == midpoints[:40]
+    assert sealed_highs == highs[:40]
+    assert sealed_lows == lows[:40]
+    assert sealed_vols == volumes[:40]
+
+
+def test_seal_holdout_is_a_no_op_when_holdout_days_is_zero():
+    closes = list(range(50))
+    midpoints, highs, lows, volumes = closes[:], closes[:], closes[:], [1.0] * 50
+    sealed = seal_holdout(closes, midpoints, highs, lows, volumes, holdout_days=0, interval_minutes=60)
+    assert sealed == (closes, midpoints, highs, lows, volumes)
+
+
+def test_load_symbol_dataset_never_sees_the_sealed_holdout_window(monkeypatch):
+    import scripts.train_model as train_model
+
+    n = 200
+    closes = [100.0 + i * 0.1 for i in range(n)]
+    highs = [c + 1.0 for c in closes]
+    lows = [c - 1.0 for c in closes]
+    midpoints = [(h + l) / 2.0 for h, l in zip(highs, lows)]
+    volumes = [1.0] * n
+    monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: (closes, midpoints, highs, lows, volumes))
+
+    # 60-minute bars, 10 days = 240 bars sealed -- more than the whole
+    # 200-bar series, so everything should be sealed off (boundary clamps
+    # to 0) and the dataset should come back None (too little history).
+    sealed_all = load_symbol_dataset(
+        conn=None, symbol="BTC-USD", interval_minutes=60,
+        window_args=_make_window_args(min_move=0.0, holdout_days=10),
+    )
+    assert sealed_all is None
+
+    # A smaller holdout (1 day = 24 bars) should leave a visibly shorter
+    # `closes` series than the unsealed run -- proof the tail is actually
+    # gone, not merely unused by feature/label computation.
+    unsealed = load_symbol_dataset(
+        conn=None, symbol="BTC-USD", interval_minutes=60,
+        window_args=_make_window_args(min_move=0.0, holdout_days=0),
+    )
+    sealed_small = load_symbol_dataset(
+        conn=None, symbol="BTC-USD", interval_minutes=60,
+        window_args=_make_window_args(min_move=0.0, holdout_days=1),
+    )
+    assert unsealed is not None and sealed_small is not None
+    assert len(sealed_small["closes"]) == len(unsealed["closes"]) - 24
+    assert sealed_small["closes"] == closes[:-24]

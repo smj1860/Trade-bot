@@ -109,6 +109,32 @@ factor. Two knobs loosen it, and can be combined:
                      way to see since it only checks where price ended up.
                      See triple_barrier_label / triple_barrier_net_pnl.
 
+  --holdout-days N  Institutional audit Phase 2.5 (sequential data-
+                     snooping correction — see
+                     claude/institutional-audit-2026-09-27.md): seals off
+                     the most recent N days of EVERY symbol's history
+                     before it ever reaches build_dataset, walk-forward
+                     CV, or the production train/test split — the data
+                     simply isn't there as far as this script's normal
+                     sweep/train path is concerned. Default 0 disables
+                     sealing (matches every round run before this option
+                     existed).
+
+                     The discipline this requires: once you start a
+                     research program with --holdout-days N, use the
+                     SAME N on every sweep round from then on, and never
+                     look at that sealed window's data by any means
+                     (not even "just to peek") until you have a specific
+                     candidate configuration you're ready to call final.
+                     Only then run scripts/evaluate_holdout.py — a
+                     separate script, deliberately, so "sweep training"
+                     and "final holdout evaluation" can never be
+                     accidentally run through the same code path — against
+                     that exact configuration. This is what makes the
+                     holdout period a true out-of-sample test: no prior
+                     round's feature/label/horizon choice, however
+                     indirectly, was tuned against it.
+
   --embargo N       Purges/embargoes N bars at each train/test boundary —
                      applies to both --folds 1 (the single split that's
                      actually trained and saved) and --folds > 1
@@ -321,6 +347,44 @@ def load_ohlc(
     volumes = [float(r[3]) if r[3] is not None else 0.0 for r in rows]
     midpoints = [(h + l) / 2.0 for h, l in zip(highs, lows)]
     return closes, midpoints, highs, lows, volumes
+
+
+def holdout_boundary(n_bars: int, holdout_days: int, interval_minutes: int) -> int:
+    """The bar index that begins the sealed final-holdout window — bars
+    `[0, boundary)` are what the normal sweep/train path is allowed to see
+    when --holdout-days is set; bars `[boundary, n_bars)` are the sealed
+    window scripts/evaluate_holdout.py alone is allowed to look at.
+
+    holdout_days <= 0 (the default, matching every round run before this
+    option existed) returns n_bars — i.e. nothing is sealed, the whole
+    series is visible, unchanged behavior. Otherwise converts days to bars
+    via interval_minutes and clamps the result to [0, n_bars] so an
+    oversized --holdout-days on a short history seals everything rather
+    than producing a negative slice."""
+    if holdout_days <= 0:
+        return n_bars
+    holdout_bars = int(holdout_days * 24 * 60 / interval_minutes)
+    return max(0, min(n_bars, n_bars - holdout_bars))
+
+
+def seal_holdout(
+    closes: list[float],
+    midpoints: list[float],
+    highs: list[float],
+    lows: list[float],
+    volumes: list[float],
+    holdout_days: int,
+    interval_minutes: int,
+) -> tuple[list[float], list[float], list[float], list[float], list[float]]:
+    """Truncates all five parallel OHLC series to the research-visible
+    prefix `[0, holdout_boundary(...))`, dropping the sealed tail entirely
+    — used by load_symbol_dataset (the path every sweep/train round goes
+    through) so a sealed window isn't just unused, it's structurally
+    absent from anything build_dataset/walk_forward_splits/the production
+    split could ever see. See holdout_boundary's docstring and the module
+    docstring's --holdout-days section."""
+    boundary = holdout_boundary(len(closes), holdout_days, interval_minutes)
+    return closes[:boundary], midpoints[:boundary], highs[:boundary], lows[:boundary], volumes[:boundary]
 
 
 def list_available_symbols(conn, interval_minutes: int) -> list[str]:
@@ -907,6 +971,18 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
     apply."""
     closes, midpoints, highs, lows, volumes = load_ohlc(conn, symbol, interval_minutes)
 
+    holdout_days = getattr(window_args, "holdout_days", 0)
+    if holdout_days > 0:
+        total_bars = len(closes)
+        closes, midpoints, highs, lows, volumes = seal_holdout(
+            closes, midpoints, highs, lows, volumes, holdout_days, interval_minutes
+        )
+        print(
+            f"[{symbol}] --holdout-days {holdout_days}: sealed off the most recent "
+            f"{total_bars - len(closes)} of {total_bars} candles — this run cannot see them.",
+            file=sys.stderr,
+        )
+
     horizon = getattr(window_args, "horizon", 1)
     top_fraction = getattr(window_args, "top_fraction", 1.0)
     taker_fee = getattr(window_args, "taker_fee", 0.008)
@@ -1226,8 +1302,13 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
     _print_walk_forward_summary(fold_results)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def add_dataset_args(parser: argparse.ArgumentParser) -> None:
+    """Every CLI argument load_symbol_dataset() needs (indicator windows,
+    label/horizon/cost params, --holdout-days) — shared between this
+    script's main() and scripts/evaluate_holdout.py so the two scripts
+    can never quietly drift apart on what a given configuration means.
+    Deliberately excludes train-specific args (--kind, --model-out,
+    --folds, --test-fraction, --embargo) that only main() uses."""
     parser.add_argument(
         "--symbol",
         required=True,
@@ -1255,6 +1336,37 @@ def main() -> None:
     parser.add_argument("--taker-fee", type=float, default=0.008, help="Kraken's spot taker fee as a fraction (default 0.008 = 0.80%%, the entry 30-day-volume tier). Doubled for a round trip, used to derive --min-move's default.")
     parser.add_argument("--slippage", type=float, default=0.0005, help="Expected slippage per leg as a fraction (default 0.0005 = 0.05%%) — an allowance for the fill price differing from the quoted price, doubled for a round trip just like --taker-fee, and added into --min-move's derived default alongside it. Real spot execution rarely fills at the exact last-traded price, so a label that only subtracts fees is still optimistic about what a live order would net.")
     parser.add_argument("--profit-margin", type=float, default=0.0, help="Required edge above breakeven (a fraction, default 0.0), added to round-trip cost when deriving --min-move's default.")
+    parser.add_argument(
+        "--label-scheme",
+        choices=["fixed-horizon", "triple-barrier"],
+        default="fixed-horizon",
+        help='"fixed-horizon" (default): label by the sign of the move to bar i+horizon, filtered by '
+        "--min-move/--top-fraction on that endpoint move only (see the module docstring). "
+        '"triple-barrier": walk forward from bar i using each subsequent bar\'s real high/low (not '
+        "just its close), and label 1/0 by whichever of an upper (profit) or lower (stop) barrier is "
+        "touched *first* within --horizon bars — both barriers sized from the same fee-derived "
+        "--min-move threshold fixed-horizon uses as its endpoint-move cutoff. A bar whose path never "
+        "touches either barrier in time (a timeout), or that touches both within the same bar (real "
+        "OHLC data can't say which came first intrabar), is dropped rather than guessed. This tracks "
+        "what a live strategy running real stop-loss/take-profit orders would actually experience, "
+        "instead of only checking where price ended up at a fixed bar count later — see "
+        "triple_barrier_label/triple_barrier_net_pnl.",
+    )
+    parser.add_argument(
+        "--holdout-days",
+        type=int,
+        default=0,
+        help="Institutional audit Phase 2.5: seal off the most recent N days of every symbol's "
+        "history from this run entirely (0 = disabled, the default). See the module docstring's "
+        "--holdout-days section for the discipline this requires and "
+        "scripts/evaluate_holdout.py for the separate, one-time evaluation step against the "
+        "sealed window.",
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_dataset_args(parser)
     parser.add_argument("--test-fraction", type=float, default=0.2, help="Fraction of each symbol's (time-ordered) data held out for testing.")
     parser.add_argument(
         "--folds",
@@ -1278,22 +1390,6 @@ def main() -> None:
         "test). Pass an explicit value only to widen the buffer further (e.g. for extra margin "
         "against serial correlation across the boundary); passing something smaller than --horizon "
         "reopens the leakage this option exists to close, so there's rarely a reason to.",
-    )
-    parser.add_argument(
-        "--label-scheme",
-        choices=["fixed-horizon", "triple-barrier"],
-        default="fixed-horizon",
-        help='"fixed-horizon" (default): label by the sign of the move to bar i+horizon, filtered by '
-        "--min-move/--top-fraction on that endpoint move only (see the module docstring). "
-        '"triple-barrier": walk forward from bar i using each subsequent bar\'s real high/low (not '
-        "just its close), and label 1/0 by whichever of an upper (profit) or lower (stop) barrier is "
-        "touched *first* within --horizon bars — both barriers sized from the same fee-derived "
-        "--min-move threshold fixed-horizon uses as its endpoint-move cutoff. A bar whose path never "
-        "touches either barrier in time (a timeout), or that touches both within the same bar (real "
-        "OHLC data can't say which came first intrabar), is dropped rather than guessed. This tracks "
-        "what a live strategy running real stop-loss/take-profit orders would actually experience, "
-        "instead of only checking where price ended up at a fixed bar count later — see "
-        "triple_barrier_label/triple_barrier_net_pnl.",
     )
     parser.add_argument("--kind", choices=["logistic", "gboost"], default="logistic")
     parser.add_argument("--model-out", default=None, help="Defaults to models/<symbol>_<kind>.joblib, or models/pooled_<kind>.joblib when pooling more than one symbol.")

@@ -719,3 +719,72 @@ it. Checked each item against the actual code instead of asserting:
 199 Python tests total (up from 191), 60 Rust tests, all passing. No
 sweep re-run yet — this is another pipeline-correctness pass, not a new
 result.
+
+## Institutional audit Phase 2.5: sequential data-snooping correction (2026-09-28)
+
+The audit (`claude/institutional-audit-2026-09-27.md`) flagged the
+obvious risk in everything above: eleven-plus rounds of "try a
+feature/label/horizon, look at the same held-out accuracy or net P&L,
+iterate" is a textbook multiple-comparisons problem. No prior round
+applied any correction for how many attempts had already been made
+against the same underlying data, and nothing reserved a period no round
+had ever touched. If a future sweep *does* clear both baselines, there
+was previously no way to tell a real result apart from the best of N
+noisy ones.
+
+Two additions close this, without changing anything about how any prior
+round's numbers should be read (they stand as recorded — this is a
+go-forward discipline, not a retroactive correction):
+
+**`--holdout-days N` (`scripts/train_model.py`):** seals off the most
+recent N days of every symbol's history before it ever reaches
+`build_dataset`, `walk_forward_splits`, or the production train/test
+split — `load_symbol_dataset` truncates the tail via the new
+`holdout_boundary()`/`seal_holdout()` right after loading OHLC, so the
+sealed window is structurally absent from the sweep/train path, not just
+conventionally off-limits. Default 0 (disabled) preserves every prior
+round's exact behavior. The discipline this requires: once a research
+program starts using `--holdout-days N`, every sweep round from then on
+must use the identical N, and the sealed window is never examined by any
+means until a specific candidate is ready for final evaluation.
+
+**`scripts/evaluate_holdout.py` (new, separate script, deliberately not a
+mode flag on `train_model.py`):** the one-time final look at the sealed
+window. Loads a saved `.joblib` model, rebuilds features over the sealed
+tail (using pre-boundary bars only as indicator-warmup lookback, which
+isn't snooping — no label or move from inside the sealed window is ever
+touched by any earlier round), scores it against a persistence baseline
+on accuracy and simulated net P&L, and — the actual statistical gate —
+computes the **Deflated Sharpe Ratio** (`strategy/dsr.py`, implementing
+Bailey & Lopez de Prado's Probabilistic/Deflated Sharpe Ratio) of the
+per-trade net-P&L series, benchmarked against a required `--num-trials`
+(the honest count of distinct configurations already tried — the same
+count this document's round-by-round log exists to make countable).
+DSR ≥ 0.95 (the conventional 95%-significance bar, configurable via
+`--dsr-threshold`) *and* beating the persistence baseline on both
+accuracy and net P&L is the bar for calling a result a validated win;
+anything else prints a clear FAIL and exits non-zero rather than leaving
+the verdict to eyeballing two numbers.
+
+Being a separate script is itself part of the fix: a sweep session and a
+final-holdout evaluation can no longer be run through the same code
+path by accident, which is exactly how "just a quick peek" turns into
+another round of the same multiple-comparisons problem.
+
+`strategy/dsr.py` is pure math (Sharpe ratio, sample skew/kurtosis, PSR,
+`expected_max_sharpe`, DSR) with no I/O or ML dependencies, tested in
+isolation (`tests/test_dsr.py`) against known closed-form properties
+(e.g. `expected_max_sharpe(n_trials=1, ...) == 0.0` — no deflation with
+only one trial; DSR strictly decreases as `n_trials` grows for the same
+observed Sharpe ratio). `scripts/train_model.py`'s and
+`scripts/evaluate_holdout.py`'s own sealing/loading logic is tested with
+synthetic in-memory OHLC series (`tests/test_train_model.py`,
+`tests/test_evaluate_holdout.py`), confirming the sealed boundary is
+computed correctly and that no row on either side of it leaks across.
+
+241 Python tests total (up from 212), 131 Rust tests. No sweep has been
+re-run with `--holdout-days` yet — this is the tooling; the next actual
+sweep round (profit-margin, per-symbol, or the 18-month-deepened dataset,
+per the "natural next steps" above) should be the first one to adopt it,
+starting the honest trial count at whatever this document's round count
+is by then.
