@@ -76,7 +76,7 @@ jobs:
             --folds "${{ github.event.inputs.folds }}" \
             --kind "${{ github.event.inputs.kind }}" \
             ${{ github.event.inputs.extra_args }} \
-            | tee train_output.log
+            2>&1 | tee train_output.log
 
       - name: Upload console output
         if: always()
