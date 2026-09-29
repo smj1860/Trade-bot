@@ -237,6 +237,7 @@ joblib (requirements-ml.txt).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -552,16 +553,23 @@ def net_pnl(closes: list[float], i: int, horizon: int, predicted_up: bool, round
     return directional_return - round_trip_cost
 
 
+def simulate_net_pnl_series(closes: list[float], indices: list[int], horizon: int, predictions: list[int], round_trip_cost: float) -> list[float]:
+    """The individual per-trade net P&L (see net_pnl()) for every (index,
+    prediction) pair, in order — the raw series simulate_net_pnl reduces
+    to a (total, count) pair, and what scripts/promotion_gate.py's
+    Sharpe/deflated-Sharpe/MinTRL checks need (a return series, not just
+    its sum) to evaluate a candidate model for promotion."""
+    return [net_pnl(closes, i, horizon, predicted_up=bool(pred), round_trip_cost=round_trip_cost) for i, pred in zip(indices, predictions)]
+
+
 def simulate_net_pnl(closes: list[float], indices: list[int], horizon: int, predictions: list[int], round_trip_cost: float) -> tuple[float, int]:
     """Total and count of simulated net P&L (see net_pnl()) across every
     (index, prediction) pair — `predictions` must be 1 (predicted up) or 0
     (predicted down), aligned 1:1 with `indices`. Returns (total, count)
     rather than a mean so callers can aggregate across symbols before
     dividing."""
-    total = 0.0
-    for i, pred in zip(indices, predictions):
-        total += net_pnl(closes, i, horizon, predicted_up=bool(pred), round_trip_cost=round_trip_cost)
-    return total, len(indices)
+    series = simulate_net_pnl_series(closes, indices, horizon, predictions, round_trip_cost)
+    return sum(series), len(series)
 
 
 def triple_barrier_touch(
@@ -668,6 +676,30 @@ def triple_barrier_net_pnl(
     return directional_return - round_trip_cost
 
 
+def simulate_triple_barrier_net_pnl_series(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    indices: list[int],
+    horizon: int,
+    barrier_pct: float,
+    predictions: list[int],
+    round_trip_cost: float,
+) -> list[float]:
+    """The individual per-trade net P&L for every (index, prediction) pair
+    under --label-scheme triple-barrier — the raw series
+    simulate_triple_barrier_net_pnl reduces to a (total, count) pair, and
+    what scripts/promotion_gate.py needs for its Sharpe-based checks (see
+    simulate_net_pnl_series's docstring for why). Rows where the touch is
+    unresolved are skipped, same as simulate_triple_barrier_net_pnl."""
+    out = []
+    for i, pred in zip(indices, predictions):
+        pnl = triple_barrier_net_pnl(highs, lows, closes, i, horizon, barrier_pct, predicted_up=bool(pred), round_trip_cost=round_trip_cost)
+        if pnl is not None:
+            out.append(pnl)
+    return out
+
+
 def simulate_triple_barrier_net_pnl(
     highs: list[float],
     lows: list[float],
@@ -686,15 +718,8 @@ def simulate_triple_barrier_net_pnl(
     triple-barrier dataset already filtered to have a resolvable touch),
     but the check is kept defensive since a caller could pass indices from
     elsewhere."""
-    total = 0.0
-    count = 0
-    for i, pred in zip(indices, predictions):
-        pnl = triple_barrier_net_pnl(highs, lows, closes, i, horizon, barrier_pct, predicted_up=bool(pred), round_trip_cost=round_trip_cost)
-        if pnl is None:
-            continue
-        total += pnl
-        count += 1
-    return total, count
+    series = simulate_triple_barrier_net_pnl_series(highs, lows, closes, indices, horizon, barrier_pct, predictions, round_trip_cost)
+    return sum(series), len(series)
 
 
 def persistence_correct_and_total_from_labels(
@@ -1122,6 +1147,7 @@ def _train_and_evaluate(
 
     model_pnl_total = majority_pnl_total = persistence_pnl_total = 0.0
     model_pnl_count = majority_pnl_count = persistence_pnl_count = 0
+    model_pnl_series: list[float] = []
     for entry in per_symbol_test:
         triple_barrier = entry.get("label_scheme") == "triple-barrier"
 
@@ -1133,10 +1159,24 @@ def _train_and_evaluate(
                 )
             return simulate_net_pnl(entry["closes"], indices, entry["horizon"], predictions, entry["round_trip_cost"])
 
+        def _simulate_series(indices: list[int], predictions: list[int]) -> list[float]:
+            if triple_barrier:
+                return simulate_triple_barrier_net_pnl_series(
+                    entry["highs"], entry["lows"], entry["closes"], indices, entry["horizon"],
+                    entry["barrier_pct"], predictions, entry["round_trip_cost"],
+                )
+            return simulate_net_pnl_series(entry["closes"], indices, entry["horizon"], predictions, entry["round_trip_cost"])
+
         sym_predictions = model_predictions[entry["start"] : entry["end"]]
         total, count = _simulate(entry["idx_test"], sym_predictions)
         model_pnl_total += total
         model_pnl_count += count
+        # Only the MODEL's own per-trade series is needed for
+        # scripts/promotion_gate.py's checks (it evaluates the candidate
+        # being considered for promotion, not the naive baselines) —
+        # collected across every pooled symbol into one series, same as
+        # model_pnl_total/model_pnl_count already pool across symbols.
+        model_pnl_series.extend(_simulate_series(entry["idx_test"], sym_predictions))
 
         majority_predictions = [majority_class] * len(entry["idx_test"])
         total, count = _simulate(entry["idx_test"], majority_predictions)
@@ -1165,6 +1205,7 @@ def _train_and_evaluate(
         "persistence_mean_pnl": persistence_pnl_total / persistence_pnl_count if persistence_pnl_count else 0.0,
         "model_pnl_count": model_pnl_count,
         "model_pnl_total": model_pnl_total,
+        "model_pnl_series": model_pnl_series,
         "majority_pnl_count": majority_pnl_count,
         "majority_pnl_total": majority_pnl_total,
         "persistence_pnl_count": persistence_pnl_count,
@@ -1393,6 +1434,28 @@ def main() -> None:
     )
     parser.add_argument("--kind", choices=["logistic", "gboost"], default="logistic")
     parser.add_argument("--model-out", default=None, help="Defaults to models/<symbol>_<kind>.joblib, or models/pooled_<kind>.joblib when pooling more than one symbol.")
+    parser.add_argument(
+        "--gate",
+        action="store_true",
+        help="Run scripts/promotion_gate.py's deflated-Sharpe/MinTRL/PBO checks against this run's own simulated "
+        "net-P&L series (institutional audit Phase 3.2) before saving the model, and print a PASS/FAIL verdict. "
+        "Only meaningful with --folds 1 (the production save path) — a no-op warning otherwise.",
+    )
+    parser.add_argument(
+        "--gate-enforce",
+        action="store_true",
+        help="With --gate: exit 1 and refuse to save the model on a FAIL verdict, instead of just warning. "
+        "Off by default so --gate can be used to observe the gate's verdict without blocking a save.",
+    )
+    parser.add_argument(
+        "--gate-trial-sharpes-file",
+        default=None,
+        help="JSON file: Sharpe ratios of every configuration tried in the sweep that produced this candidate "
+        "(including its own), for the deflated Sharpe ratio's multiple-testing correction. Omitting this "
+        "disables that correction (N=1) and is flagged in the gate's output as understating overfitting risk.",
+    )
+    parser.add_argument("--gate-min-dsr", type=float, default=None, help="Override promotion_gate's default minimum Deflated Sharpe Ratio (0.95).")
+    parser.add_argument("--gate-max-pbo", type=float, default=None, help="Override promotion_gate's default maximum PBO (0.5).")
     args = parser.parse_args()
 
     try:
@@ -1413,6 +1476,8 @@ def main() -> None:
         sys.exit(1)
 
     if args.folds > 1:
+        if args.gate:
+            print("warning: --gate has no effect with --folds > 1 (validation-only, no model saved) — re-run with --folds 1 to gate a production save.", file=sys.stderr)
         run_walk_forward(datasets, args)
         return
 
@@ -1510,6 +1575,25 @@ def main() -> None:
     model_pnl_count, model_pnl_total = metrics["model_pnl_count"], metrics["model_pnl_total"]
     majority_pnl_count, majority_pnl_total = metrics["majority_pnl_count"], metrics["majority_pnl_total"]
     persistence_pnl_count, persistence_pnl_total = metrics["persistence_pnl_count"], metrics["persistence_pnl_total"]
+
+    if args.gate:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import promotion_gate
+
+        trial_sharpes = None
+        if args.gate_trial_sharpes_file:
+            with open(args.gate_trial_sharpes_file) as f:
+                trial_sharpes = json.load(f)
+        gate_kwargs = {}
+        if args.gate_min_dsr is not None:
+            gate_kwargs["min_dsr"] = args.gate_min_dsr
+        if args.gate_max_pbo is not None:
+            gate_kwargs["max_pbo"] = args.gate_max_pbo
+        verdict = promotion_gate.evaluate_gate(metrics["model_pnl_series"], trial_sharpes=trial_sharpes, **gate_kwargs)
+        promotion_gate._print_verdict(verdict)
+        if not verdict.passed and args.gate_enforce:
+            print("error: --gate-enforce is set and the promotion gate returned FAIL — refusing to save the model.", file=sys.stderr)
+            sys.exit(1)
 
     if args.model_out:
         model_out = args.model_out

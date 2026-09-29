@@ -45,6 +45,14 @@ on:
         description: "Any additional train_model.py flags, space-separated (e.g. --min-move 0.02)"
         required: false
         default: ""
+      gate:
+        description: "Run the promotion gate (deflated Sharpe/MinTRL/PBO) before saving — only meaningful with folds=1"
+        required: false
+        default: "false"
+      gate_enforce:
+        description: "Refuse to save the model on a gate FAIL verdict (default: warn only)"
+        required: false
+        default: "false"
 
 jobs:
   train:
@@ -68,6 +76,9 @@ jobs:
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
+          GATE_FLAGS=""
+          if [ "${{ github.event.inputs.gate }}" = "true" ]; then GATE_FLAGS="$GATE_FLAGS --gate"; fi
+          if [ "${{ github.event.inputs.gate_enforce }}" = "true" ]; then GATE_FLAGS="$GATE_FLAGS --gate-enforce"; fi
           python scripts/train_model.py \
             --symbol "${{ github.event.inputs.symbol }}" \
             --interval "${{ github.event.inputs.interval }}" \
@@ -75,6 +86,7 @@ jobs:
             --label-scheme "${{ github.event.inputs.label_scheme }}" \
             --folds "${{ github.event.inputs.folds }}" \
             --kind "${{ github.event.inputs.kind }}" \
+            $GATE_FLAGS \
             ${{ github.event.inputs.extra_args }} \
             2>&1 | tee train_output.log
 
