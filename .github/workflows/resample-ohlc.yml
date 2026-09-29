@@ -1,0 +1,52 @@
+name: Resample OHLC to higher timeframes
+
+# Derives 2hr/4hr/6hr/12hr/daily candles from the 60-minute candles
+# already in ohlc_candles (historical-data/resample_ohlc.py) — see that
+# script's module docstring for why this is a resample rather than a
+# separate from-trades backfill per timeframe. Manual dispatch only: this
+# is meant to be re-run occasionally as the underlying hourly backfill
+# deepens (historical-backfill-deepening.yml), not on its own schedule.
+#
+# Requires the same SUPABASE_DB_URL repository secret as the other
+# historical-data workflows.
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'Normalized symbol, or "all" for every configured symbol'
+        required: false
+        default: "all"
+      source_interval:
+        description: "Source candle resolution in minutes"
+        required: false
+        default: "60"
+      target_intervals:
+        description: "Comma-separated target resolutions in minutes"
+        required: false
+        default: "120,240,360,720,1440"
+
+jobs:
+  resample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: historical-data
+        run: pip install -r requirements.txt
+
+      - name: Resample to higher timeframes
+        working-directory: historical-data
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          python3 resample_ohlc.py \
+            --symbol "${{ github.event.inputs.symbol || 'all' }}" \
+            --source-interval "${{ github.event.inputs.source_interval || '60' }}" \
+            --target-intervals "${{ github.event.inputs.target_intervals || '120,240,360,720,1440' }}"
