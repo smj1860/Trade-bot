@@ -518,6 +518,33 @@ impl Store {
                 .ok_or_else(|| anyhow::anyhow!("realized_pnl_usd sum {f} could not be represented as a Decimal")),
         }
     }
+
+    /// Every fill's `(applied_at_ns, realized_pnl_usd)` since `since_ns`,
+    /// ordered ascending — the raw series `performance.rs` buckets into
+    /// daily PnL to compute Sharpe/Sortino/Calmar/drawdown (institutional
+    /// audit Phase 3.4). Deliberately returns the raw per-fill series
+    /// rather than pre-aggregating in SQL: the day-bucketing (and its unit
+    /// tests) live in `performance.rs` as pure functions, same split as
+    /// `realized_pnl_since` above keeps the SQL side thin.
+    pub fn fills_since(&self, since_ns: i64) -> anyhow::Result<Vec<(i64, Decimal)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT applied_at_ns, realized_pnl_usd FROM fills WHERE applied_at_ns >= ?1 ORDER BY applied_at_ns ASC",
+        )?;
+        let rows = stmt.query_map(params![since_ns], |row| {
+            let applied_at_ns: i64 = row.get(0)?;
+            let pnl_str: String = row.get(1)?;
+            Ok((applied_at_ns, pnl_str))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (applied_at_ns, pnl_str) = row?;
+            let pnl = Decimal::from_str(&pnl_str)
+                .map_err(|e| anyhow::anyhow!("corrupt realized_pnl_usd in fills: {e}"))?;
+            out.push((applied_at_ns, pnl));
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -785,5 +812,39 @@ mod tests {
     fn realized_pnl_since_is_zero_for_no_fills_at_all() {
         let store = Store::open_in_memory().unwrap();
         assert_eq!(store.realized_pnl_since(0).unwrap(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn fills_since_returns_the_raw_series_ordered_ascending() {
+        let store = Store::open_in_memory().unwrap();
+        store.record_fill(&fill("ETH-USD", "2.0", 300)).unwrap();
+        store.record_fill(&fill("BTC-USD", "10.5", 100)).unwrap();
+        store.record_fill(&fill("BTC-USD", "-3.25", 200)).unwrap();
+
+        let series = store.fills_since(0).unwrap();
+        assert_eq!(
+            series,
+            vec![
+                (100, Decimal::from_str("10.5").unwrap()),
+                (200, Decimal::from_str("-3.25").unwrap()),
+                (300, Decimal::from_str("2.0").unwrap()),
+            ]
+        );
+    }
+
+    #[test]
+    fn fills_since_excludes_fills_before_the_window() {
+        let store = Store::open_in_memory().unwrap();
+        store.record_fill(&fill("BTC-USD", "100", 100)).unwrap();
+        store.record_fill(&fill("BTC-USD", "5", 500)).unwrap();
+
+        let series = store.fills_since(300).unwrap();
+        assert_eq!(series, vec![(500, Decimal::from_str("5").unwrap())]);
+    }
+
+    #[test]
+    fn fills_since_is_empty_for_no_fills_at_all() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.fills_since(0).unwrap(), Vec::new());
     }
 }

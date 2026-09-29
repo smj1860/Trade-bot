@@ -425,6 +425,10 @@ fn default_observability_max_rejection_rate() -> f64 {
     0.25
 }
 
+fn default_observability_performance_window_days() -> u64 {
+    90
+}
+
 /// Institutional audit Phase 2.4: real observability. Two things,
 /// deliberately built on infrastructure this codebase already has rather
 /// than a new dashboarding stack: (1) alerting (via the same `AlertSink`
@@ -460,6 +464,13 @@ pub struct ObservabilityConfig {
     /// `0.25` = more than 1 in 4 orders rejected).
     #[serde(default = "default_observability_max_rejection_rate")]
     pub max_rejection_rate: f64,
+    /// Lookback window, in days, for the Sharpe/Sortino/Calmar/max-drawdown
+    /// performance summary (`performance.rs`, institutional audit Phase
+    /// 3.4) — deliberately separate from `window_secs` above, which is
+    /// tuned for near-real-time rejection-rate alerting (minutes), not a
+    /// statistically meaningful daily-return sample (weeks to months).
+    #[serde(default = "default_observability_performance_window_days")]
+    pub performance_window_days: u64,
 }
 
 impl Default for ObservabilityConfig {
@@ -470,6 +481,7 @@ impl Default for ObservabilityConfig {
             window_secs: default_observability_window_secs(),
             min_sample_size: default_observability_min_sample_size(),
             max_rejection_rate: default_observability_max_rejection_rate(),
+            performance_window_days: default_observability_performance_window_days(),
         }
     }
 }

@@ -19,6 +19,13 @@
 //!    "Real" observability here means real numbers an operator can
 //!    actually act on, not a promise of a UI this codebase doesn't have
 //!    the infrastructure to host yet.
+//! 3. A periodic Sharpe/Sortino/Calmar/max-drawdown summary
+//!    (`performance.rs`, institutional audit Phase 3.4) computed from the
+//!    same `fills` history the PnL summary above reads — judges the
+//!    live risk engine's own realized returns the same way
+//!    scripts/train_model.py's offline evaluation judges a candidate
+//!    model, without needing to export the fills table and run that
+//!    script by hand.
 //!
 //! Structurally this mirrors heartbeat.rs's watchdog and stop_loss.rs's
 //! monitor: a small polling loop, spawned once from `main.rs`, sharing
@@ -30,6 +37,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::alerting::AlertSink;
 use crate::config::Config;
+use crate::performance;
 use crate::persistence::Store;
 use crate::risk::RiskEngine;
 
@@ -94,11 +102,13 @@ pub async fn run_observability_monitor(
 
     let check_interval = Duration::from_secs(obs.check_interval_secs.max(1));
     let window_ns = Duration::from_secs(obs.window_secs.max(1)).as_nanos() as i64;
+    let performance_window_ns = Duration::from_secs(obs.performance_window_days.max(1) * 86_400).as_nanos() as i64;
     tracing::info!(
         check_interval_secs = obs.check_interval_secs,
         window_secs = obs.window_secs,
         min_sample_size = obs.min_sample_size,
         max_rejection_rate = obs.max_rejection_rate,
+        performance_window_days = obs.performance_window_days,
         "observability monitor started"
     );
 
@@ -147,6 +157,23 @@ pub async fn run_observability_monitor(
                 );
             }
             Err(e) => tracing::error!(error = %e, "observability: failed to query realized PnL"),
+        }
+
+        let performance_since_ns = now_ns() - performance_window_ns;
+        match store.fills_since(performance_since_ns) {
+            Ok(fills) => {
+                let metrics = performance::compute_metrics(&fills, now_ns());
+                tracing::info!(
+                    performance_window_days = obs.performance_window_days,
+                    days_of_history = metrics.days,
+                    sharpe = ?metrics.sharpe,
+                    sortino = ?metrics.sortino,
+                    calmar = ?metrics.calmar,
+                    max_drawdown_usd = metrics.max_drawdown_usd,
+                    "observability: performance summary (Sharpe/Sortino/Calmar/max-drawdown)"
+                );
+            }
+            Err(e) => tracing::error!(error = %e, "observability: failed to query fills for performance summary"),
         }
     }
 }

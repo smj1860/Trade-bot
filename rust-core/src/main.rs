@@ -10,6 +10,7 @@ mod market_data;
 mod observability;
 mod order;
 mod orderbook;
+mod performance;
 mod persistence;
 mod proto;
 mod reconcile;
