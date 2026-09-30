@@ -1,0 +1,29 @@
+name: Check backfill depth
+
+# Read-only: prints per-symbol OHLC depth from the DB vs a target.
+on:
+  workflow_dispatch:
+    inputs:
+      interval:
+        description: "OHLC interval in minutes"
+        default: "60"
+      target_days:
+        description: "Target depth in days"
+        default: "1080"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        working-directory: historical-data
+        run: pip install -r requirements.txt
+      - name: Check depth
+        working-directory: historical-data
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: python check_backfill_depth.py --interval "${{ inputs.interval }}" --target-days "${{ inputs.target_days }}"
