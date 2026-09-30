@@ -906,7 +906,8 @@ def accumulate_regime_stats(acc: dict, fold_idx: int, model_predictions: list[in
                     )
                 else:
                     pnls[name] = net_pnl(closes, i, horizon, bool(pred), entry["round_trip_cost"])
-            for dim, label in (("trend", reg[0]), ("vol", reg[1]), ("all", "all")):
+            side = "long" if preds["model"] == 1 else "short"
+            for dim, label in (("trend", reg[0]), ("vol", reg[1]), ("side", side), ("all", "all")):
                 b = acc.setdefault((fold_idx, dim, label), _regime_new_bucket())
                 b["n"] += 1
                 b["model_ok"] += int(preds["model"] == actual)
@@ -926,7 +927,7 @@ def print_regime_report(acc: dict, n_folds: int) -> None:
     print("\n--- regime breakdown (regimes use only data available at each bar) ---", file=sys.stderr)
     print(f"  {'regime':<14}{'rows':>8}{'share':>7}  {'model':>6}{'major':>7}{'persist':>8}  {'edge_acc':>9}   {'P&L model':>10}{'P&L pers':>10}{'edge_P&L':>10}  folds>both(acc/pnl)", file=sys.stderr)
     total_rows = sum(b["n"] for (f, d, r), b in acc.items() if d == "all") or 1
-    for dim, labels in (("all", ("all",)), ("trend", TREND_REGIMES), ("vol", VOL_REGIMES)):
+    for dim, labels in (("all", ("all",)), ("side", ("long", "short")), ("trend", TREND_REGIMES), ("vol", VOL_REGIMES)):
         for label in labels:
             tot = _regime_new_bucket()
             beat_acc = beat_pnl = cells = 0

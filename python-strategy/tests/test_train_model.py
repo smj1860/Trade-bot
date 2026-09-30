@@ -983,3 +983,19 @@ def test_fib_features_dataset_columns_and_parity_with_extended(monkeypatch):
     pos = order.index("fib_pos_55")
     assert all(0.0 <= row[pos] <= 1.0 for row in result["X"])
     assert min(result["indices"]) >= 143
+
+
+def test_regime_stats_include_model_side_buckets():
+    from scripts.train_model import accumulate_regime_stats
+
+    closes = [100.0 + i for i in range(20)]
+    entry = {
+        "closes": closes, "highs": closes, "lows": closes, "horizon": 2, "round_trip_cost": 0.0,
+        "barrier_pct": 0.01, "label_scheme": "fixed-horizon",
+        "idx_test": [5, 6, 7], "start": 0, "end": 3,
+        "regimes": {5: ("bull", "low_vol"), 6: ("bull", "high_vol"), 7: ("bear", "high_vol")},
+    }
+    acc = {}
+    accumulate_regime_stats(acc, 0, [1, 0, 0], [1, 1, 1], 1, [entry])
+    assert acc[(0, "side", "long")]["n"] == 1 and acc[(0, "side", "short")]["n"] == 2
+    assert acc[(0, "side", "long")]["model_ok"] == 1 and acc[(0, "side", "short")]["model_ok"] == 0
