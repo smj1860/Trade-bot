@@ -37,8 +37,10 @@ from strategy.indicators import (
     bollinger_percent_b,
     cci,
     ema_ratio,
+    fib_level_distance,
     macd_histogram,
     parkinson_vol,
+    range_position,
     realized_vol,
     returns_zscore,
     rsi,
@@ -93,6 +95,12 @@ class Features:
     atr_pct: float = 0.0
     rsi_divergence: float = 0.0
     rsi_divergence_htf: float = 0.0
+    # Fibonacci range features (see scripts/train_model.py's FIB_FEATURES).
+    fib_pos_55: float = 0.5
+    fib_pos_89: float = 0.5
+    fib_pos_144: float = 0.5
+    fib_dist_89: float = 0.0
+    fib_dist_144: float = 0.0
 
 
 class _SymbolState:
@@ -181,6 +189,7 @@ class FeatureEngine:
                 vwap_window,
                 atr_window + 1,
                 (rsi_window + divergence_lookback + 1) * htf_factor,
+                144,
             )
             + 1
         )
@@ -283,6 +292,7 @@ class FeatureEngine:
                 self._rsi_window,
                 self._divergence_lookback,
             ),
+            **self._fib_features(symbol),
             rsi_divergence_htf=rsi_divergence(
                 subsample_tail(
                     self._bars.window(symbol, (self._rsi_window + self._divergence_lookback + 1) * self._htf_factor),
@@ -292,6 +302,17 @@ class FeatureEngine:
                 self._divergence_lookback,
             ),
         )
+
+    def _fib_features(self, symbol: str) -> dict[str, float]:
+        out = {}
+        for w in (55, 89, 144):
+            c = self._bars.window(symbol, w)
+            h = self._bars.high_window(symbol, w)
+            l = self._bars.low_window(symbol, w)
+            out[f"fib_pos_{w}"] = range_position(c, h, l)
+            if w in (89, 144):
+                out[f"fib_dist_{w}"] = fib_level_distance(c, h, l)
+        return out
 
     def on_trade(
         self,

@@ -439,3 +439,18 @@ def test_rsi_divergence_bearish_and_bullish():
     mirror = [200 - x for x in series]
     assert rsi_divergence(mirror, rsi_window=5, lookback=10) == 1.0
     assert rsi_divergence([1.0, 2.0], 14, 14) == 0.0
+
+
+def test_range_position_and_fib_distance():
+    from strategy.indicators import fib_level_distance, range_position
+
+    highs = [110.0, 110.0, 110.0]
+    lows = [100.0, 100.0, 100.0]
+    assert range_position([105.0, 105.0, 105.0], highs, lows) == pytest.approx(0.5)
+    assert range_position([100.0, 100.0, 110.0], highs, lows) == pytest.approx(1.0)
+    assert range_position([], [], []) == 0.5
+    assert range_position([1.0], [1.0], [1.0]) == 0.5  # flat range -> neutral
+    # 0.5 exactly on a level -> distance 0; 0.62 is 0.002 above the 0.618 level
+    assert fib_level_distance([105.0], [110.0], [100.0]) == pytest.approx(0.0, abs=1e-12)
+    assert fib_level_distance([106.2], [110.0], [100.0]) == pytest.approx(0.002, abs=1e-9)
+    assert fib_level_distance([104.5], [110.0], [100.0]) == pytest.approx(-0.05, abs=1e-9)

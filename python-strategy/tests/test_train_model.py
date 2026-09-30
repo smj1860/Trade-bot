@@ -968,3 +968,18 @@ def test_regime_stats_accumulation_counts_rows():
     assert acc[(0, "trend", "bull")]["n"] == 2 and acc[(0, "trend", "bear")]["n"] == 1
     assert acc[(0, "vol", "high_vol")]["n"] == 2
     assert acc[(0, "trend", "bull")]["model_ok"] == 2 and acc[(0, "trend", "bear")]["model_ok"] == 0
+
+
+def test_fib_features_dataset_columns_and_parity_with_extended(monkeypatch):
+    import scripts.train_model as train_model
+    from scripts.train_model import FIB_FEATURES, active_feature_order
+
+    monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: _synthetic_ohlc())
+    args = _make_window_args(min_move=0.0, fib_features=True)
+    result = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=args)
+    assert result is not None
+    order = active_feature_order(None, {"windows": (55, 89, 144)})
+    assert len(result["X"][0]) == len(order) == len(FEATURE_ORDER) + len(FIB_FEATURES)
+    pos = order.index("fib_pos_55")
+    assert all(0.0 <= row[pos] <= 1.0 for row in result["X"])
+    assert min(result["indices"]) >= 143

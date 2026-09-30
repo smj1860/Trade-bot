@@ -299,3 +299,28 @@ def test_extended_features_live_matches_historical_features_at():
     )
     for name in EXTENDED_FEATURES:
         assert getattr(live, name) == pytest.approx(hist[name], abs=1e-9), name
+
+
+def test_fib_features_live_matches_historical_features_at():
+    import math
+
+    from scripts.train_model import FIB_DEFAULTS, FIB_FEATURES, features_at
+
+    engine = FeatureEngine(momentum_window=5, bar_interval_seconds=3600)
+    ts = 1_700_000_000.0
+    for b in range(300):
+        base = 100.0 * (1.0 + 0.03 * math.sin(b / 9.0) + 0.0004 * b)
+        t0 = ts + b * 3600
+        engine.on_trade("X-USD", Decimal(str(base * 0.995)), Decimal("1.5"), timestamp=t0 + 10)
+        engine.on_trade("X-USD", Decimal(str(base * 1.004)), Decimal("2.0"), timestamp=t0 + 20)
+        engine.on_trade("X-USD", Decimal(str(base)), Decimal("1.0"), timestamp=t0 + 30)
+        engine.on_order_book_update("X-USD", Decimal(str(base)), Decimal("1"), Decimal(str(base * 1.0001)), Decimal("1"), timestamp=t0 + 40)
+    live = engine.on_order_book_update("X-USD", Decimal("100"), Decimal("1"), Decimal("100.01"), Decimal("1"), timestamp=ts + 300 * 3600 + 5)
+    bars = engine._bars
+    c = bars.closes("X-USD")
+    hist = features_at(
+        c, bars.midpoints("X-USD"), bars.highs("X-USD"), bars.lows("X-USD"), bars.volumes("X-USD"),
+        len(c) - 1, 20, 12, 14, 20, 10, 20, 2.0, 5, 34, 12, 26, 9, 20, 14, None, FIB_DEFAULTS,
+    )
+    for name in FIB_FEATURES:
+        assert getattr(live, name) == pytest.approx(hist[name], abs=1e-9), name

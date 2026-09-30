@@ -255,9 +255,11 @@ from strategy.indicators import (
     bollinger_percent_b,
     cci,
     ema_ratio,
+    fib_level_distance,
     macd_histogram,
     parkinson_vol,
     realized_vol,
+    range_position,
     returns_zscore,
     rsi,
     rsi_divergence,
@@ -304,6 +306,18 @@ FEATURE_ORDER = [
 # base features so the base list above stays the untouched control.
 EXTENDED_FEATURES = ["ema_long_ratio", "vwap_ratio", "atr_pct", "rsi_divergence", "rsi_divergence_htf"]
 EXTENDED_FEATURE_ORDER = FEATURE_ORDER + EXTENDED_FEATURES
+# Opt-in Fibonacci feature set (--fib-features): where price sits inside its
+# rolling 55/89/144-bar high-low range, and the signed distance (in units of
+# that range) to the nearest Fibonacci retracement level of the 89/144-bar
+# range. Appended after the extended block.
+FIB_FEATURES = ["fib_pos_55", "fib_pos_89", "fib_pos_144", "fib_dist_89", "fib_dist_144"]
+FIB_DEFAULTS = {"windows": (55, 89, 144)}
+
+
+def active_feature_order(extended: dict | None, fib: dict | None) -> list[str]:
+    return FEATURE_ORDER + (EXTENDED_FEATURES if extended else []) + (FIB_FEATURES if fib else [])
+
+
 EXTENDED_DEFAULTS = {
     "ema_long_window": 200,
     "vwap_window": 24,
@@ -449,6 +463,7 @@ def features_at(
     cci_window: int,
     williams_r_window: int,
     extended: dict | None = None,
+    fib: dict | None = None,
 ) -> dict[str, float]:
     """The feature vector as of bar `i`, using the same window-slicing
     convention strategy/features.py's FeatureEngine applies live via
@@ -513,6 +528,16 @@ def features_at(
         out["rsi_divergence"] = rsi_divergence(closes[max(0, i - div_need + 1) : i + 1], rsi_window, lb)
         htf_raw = closes[max(0, i - div_need * hf + 1) : i + 1]
         out["rsi_divergence_htf"] = rsi_divergence(subsample_tail(htf_raw, hf), rsi_window, lb)
+    if fib:
+        w55, w89, w144 = fib["windows"]
+        def _rng(w):
+            a = max(0, i - w + 1)
+            return closes[a : i + 1], highs[a : i + 1], lows[a : i + 1]
+        out["fib_pos_55"] = range_position(*_rng(w55))
+        out["fib_pos_89"] = range_position(*_rng(w89))
+        out["fib_pos_144"] = range_position(*_rng(w144))
+        out["fib_dist_89"] = fib_level_distance(*_rng(w89))
+        out["fib_dist_144"] = fib_level_distance(*_rng(w144))
     return out
 
 
@@ -529,6 +554,7 @@ def dataset_warmup(
     cci_window: int,
     williams_r_window: int,
     extended: dict | None = None,
+    fib: dict | None = None,
 ) -> int:
     """The number of bars needed before every indicator's window has a
     full history — shared by build_dataset (to know where to start) and
@@ -546,6 +572,8 @@ def dataset_warmup(
         cci_window,
         williams_r_window,
     )
+    if fib:
+        base = max(base, max(fib["windows"]))
     if not extended:
         return base
     div_need = rsi_window + extended["divergence_lookback"] + 1
@@ -976,6 +1004,7 @@ def build_dataset(
     label_scheme: str = "fixed-horizon",
     extended: dict | None = None,
     barrier_fn=None,
+    fib: dict | None = None,
 ) -> tuple[list[list[float]], list[int], list[int]]:
     """Builds (X, y, indices) — X rows in FEATURE_ORDER, `indices` is the
     bar index `i` each row was computed as-of (needed by callers to score a
@@ -1003,9 +1032,9 @@ def build_dataset(
     warmup = dataset_warmup(
         sma_window, ema_window, rsi_window, vol_window, bar_momentum_window,
         bollinger_window, ao_slow_window, macd_slow_window, macd_signal_window,
-        cci_window, williams_r_window, extended,
+        cci_window, williams_r_window, extended, fib,
     )
-    feature_order = EXTENDED_FEATURE_ORDER if extended else FEATURE_ORDER
+    feature_order = active_feature_order(extended, fib)
     X: list[list[float]] = []
     y: list[int] = []
     indices: list[int] = []
@@ -1044,6 +1073,7 @@ def build_dataset(
             cci_window,
             williams_r_window,
             extended,
+            fib,
         )
         X.append([feats[name] for name in feature_order])
         y.append(label)
@@ -1234,6 +1264,7 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
             "divergence_lookback": window_args.divergence_lookback,
             "htf_factor": window_args.htf_factor,
         }
+    fib = {"windows": FIB_DEFAULTS["windows"]} if getattr(window_args, "fib_features", False) else None
     barrier_mode = getattr(window_args, "barrier_mode", "fixed")
     atr_mult = getattr(window_args, "atr_barrier_mult", 3.0)
     atr_window = getattr(window_args, "atr_window", 14)
@@ -1257,6 +1288,7 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
         window_args.cci_window,
         window_args.williams_r_window,
         extended,
+        fib,
     )
     min_required = warmup + horizon + 10  # a little slack beyond bare warmup so there's an actual dataset, not one row
     if len(closes) < min_required:
@@ -1306,10 +1338,11 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
         label_scheme=label_scheme,
         extended=extended,
         barrier_fn=barrier_fn,
+        fib=fib,
     )
     drop = [n for n in (getattr(window_args, "drop_features", "") or "").split(",") if n.strip()]
     if drop:
-        order = EXTENDED_FEATURE_ORDER if extended else FEATURE_ORDER
+        order = active_feature_order(extended, fib)
         unknown = [n for n in drop if n.strip() not in order]
         if unknown:
             print(f"error: --drop-features names not in the active feature set: {unknown}", file=sys.stderr)
@@ -1649,6 +1682,7 @@ def add_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--williams-r-window", type=int, default=14)
     parser.add_argument("--horizon", type=int, default=1, help="Label bar i by the direction of the move to bar i+horizon (default 1 = next-bar direction).")
     parser.add_argument("--extended-features", action="store_true", help="Add the extended feature set (EMA-200 ratio, rolling VWAP ratio, ATR%%, RSI divergence on the base timeframe and a rolling 4x-subsampled timeframe). Off by default so the base feature set stays the control.")
+    parser.add_argument("--fib-features", action="store_true", help="Add Fibonacci range features (position within the rolling 55/89/144-bar high-low range, plus signed distance to the nearest Fibonacci retracement level of the 89/144-bar range). Combinable with --extended-features.")
     parser.add_argument("--ema-long-window", type=int, default=EXTENDED_DEFAULTS["ema_long_window"])
     parser.add_argument("--vwap-window", type=int, default=EXTENDED_DEFAULTS["vwap_window"])
     parser.add_argument("--atr-window", type=int, default=EXTENDED_DEFAULTS["atr_window"])
@@ -1913,7 +1947,7 @@ def main() -> None:
     print(f"  majority-class baseline:     {majority_mean_pnl:+.4f} ({majority_pnl_count} trades, total {majority_pnl_total:+.4f})", file=sys.stderr)
     print(f"  persistence baseline:        {persistence_mean_pnl:+.4f} ({persistence_pnl_count} trades, total {persistence_pnl_total:+.4f})", file=sys.stderr)
     print(f"  saved model to:              {model_out}", file=sys.stderr)
-    print(f"  feature_order for strategy_config.toml: {EXTENDED_FEATURE_ORDER if args.extended_features else FEATURE_ORDER}", file=sys.stderr)
+    print(f"  feature_order for strategy_config.toml: {active_feature_order(EXTENDED_DEFAULTS if args.extended_features else None, FIB_DEFAULTS if args.fib_features else None)}", file=sys.stderr)
     if model_accuracy <= max(baseline_accuracy, persistence_baseline):
         print(
             "  WARNING: model did not beat both naive baselines on this test split — "

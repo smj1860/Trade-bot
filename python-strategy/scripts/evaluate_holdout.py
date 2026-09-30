@@ -253,7 +253,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if getattr(args, "extended_features", False) or getattr(args, "barrier_mode", "fixed") != "fixed":
+    if getattr(args, "extended_features", False) or getattr(args, "fib_features", False) or getattr(args, "barrier_mode", "fixed") != "fixed":
         print(
             "error: evaluate_holdout.py does not yet support --extended-features or --barrier-mode atr "
             "(its dataset/barrier path is the base one) -- refusing rather than silently scoring the "

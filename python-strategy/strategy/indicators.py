@@ -466,3 +466,35 @@ def subsample_tail(values: Sequence[float], factor: int) -> list[float]:
     if factor <= 1:
         return list(values)
     return list(values)[::-1][::factor][::-1]
+
+
+FIB_LEVELS = (0.236, 0.382, 0.5, 0.618, 0.786)
+
+
+def range_position(closes: Sequence[float], highs: Sequence[float], lows: Sequence[float]) -> float:
+    """Where the latest close sits inside the window's high-low range, in
+    [0, 1] (0 = at the window low, 1 = at the window high). This is the
+    quantity Fibonacci retracement levels are fractions of (and, over 14
+    bars, the same thing williams_percent_r() measures, rescaled). Returns
+    0.5 (mid-range, neutral) with no data, mismatched lengths, or a flat
+    range."""
+    if not closes or len(closes) != len(highs) or len(closes) != len(lows):
+        return 0.5
+    hi = max(highs)
+    lo = min(lows)
+    if hi <= lo:
+        return 0.5
+    return (closes[-1] - lo) / (hi - lo)
+
+
+def fib_level_distance(closes: Sequence[float], highs: Sequence[float], lows: Sequence[float]) -> float:
+    """Signed distance, in units of the window's high-low range, from the
+    latest close to the nearest Fibonacci retracement level
+    (0.236/0.382/0.5/0.618/0.786) of that range: positive means the close
+    is above its nearest level, negative below. Near 0 means price is
+    sitting on a Fibonacci level; the sign says which side. The range is a
+    plain rolling high/low (no swing-point detection), so it only uses
+    bars up to the latest one."""
+    pos = range_position(closes, highs, lows)
+    nearest = min(FIB_LEVELS, key=lambda lv: abs(pos - lv))
+    return pos - nearest
