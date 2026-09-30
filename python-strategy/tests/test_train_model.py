@@ -828,3 +828,21 @@ def test_load_symbol_dataset_never_sees_the_sealed_holdout_window(monkeypatch):
     assert unsealed is not None and sealed_small is not None
     assert len(sealed_small["closes"]) == len(unsealed["closes"]) - 24
     assert sealed_small["closes"] == closes[:-24]
+
+
+def test_parse_intervals_single_and_list():
+    from scripts.train_model import parse_intervals
+
+    assert parse_intervals("60") == [60]
+    assert parse_intervals(60) == [60]
+    assert parse_intervals("60, 240,360,1440") == [60, 240, 360, 1440]
+    assert parse_intervals("60,60,240") == [60, 240]
+
+
+def test_parse_intervals_rejects_bad_values():
+    from scripts.train_model import parse_intervals
+
+    with pytest.raises(ValueError):
+        parse_intervals("")
+    with pytest.raises(ValueError):
+        parse_intervals("0")

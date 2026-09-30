@@ -1088,6 +1088,24 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
     }
 
 
+def parse_intervals(raw) -> list[int]:
+    """Parses --interval: a single value ("60") or a comma-separated list
+    ("60,240,360,1440"), preserving order and dropping duplicates."""
+    out: list[int] = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        v = int(part)
+        if v <= 0:
+            raise ValueError(f"interval must be positive, got {v}")
+        if v not in out:
+            out.append(v)
+    if not out:
+        raise ValueError("--interval needs at least one value")
+    return out
+
+
 def resolve_symbols(conn, symbol_arg: str, interval_minutes: int) -> list[str]:
     """`--symbol` accepts a single symbol (e.g. "BTC-USD"), a
     comma-separated list ("BTC-USD,ETH-USD"), or the literal "all" — every
@@ -1356,7 +1374,7 @@ def add_dataset_args(parser: argparse.ArgumentParser) -> None:
         help='Normalized symbol (e.g. BTC-USD), a comma-separated list to pool ("BTC-USD,ETH-USD"), '
         'or "all" to pool every symbol with data at --interval.',
     )
-    parser.add_argument("--interval", type=int, default=60, help="Candle resolution in minutes (default 60, matching strategy_config.example.toml's bar_interval_minutes).")
+    parser.add_argument("--interval", type=str, default="60", help="Candle resolution in minutes (default 60, matching strategy_config.example.toml's bar_interval_minutes). Accepts a comma-separated list (e.g. 60,240,360,1440) to pool several timeframes of the same symbols together — each (symbol, interval) becomes its own dataset, walk-forward validation only (--folds > 1). Needs the coarser intervals to exist in ohlc_candles (historical-data/resample_ohlc.py).")
     parser.add_argument("--sma-window", type=int, default=20)
     parser.add_argument("--ema-window", type=int, default=12)
     parser.add_argument("--rsi-window", type=int, default=14)
@@ -1466,8 +1484,20 @@ def main() -> None:
 
     conn = connect()
     try:
-        symbols = resolve_symbols(conn, args.symbol, args.interval)
-        datasets = [d for d in (load_symbol_dataset(conn, s, args.interval, args) for s in symbols) if d is not None]
+        intervals = parse_intervals(args.interval)
+        multi_interval = len(intervals) > 1
+        if multi_interval and args.folds <= 1:
+            print("error: pooling multiple --interval values is validation-only — use --folds > 1 (a saved model must target one bar interval).", file=sys.stderr)
+            sys.exit(1)
+        datasets = []
+        for iv in intervals:
+            for s in resolve_symbols(conn, args.symbol, iv):
+                d = load_symbol_dataset(conn, s, iv, args)
+                if d is None:
+                    continue
+                if multi_interval:
+                    d["symbol"] = f"{s}@{iv}"
+                datasets.append(d)
     finally:
         conn.close()
 
