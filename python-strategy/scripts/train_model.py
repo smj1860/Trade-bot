@@ -773,6 +773,161 @@ def simulate_triple_barrier_net_pnl(
     return sum(series), len(series)
 
 
+TREND_REGIMES = ("bull", "bear", "range")
+VOL_REGIMES = ("low_vol", "mid_vol", "high_vol")
+
+
+def regime_labels(
+    closes: list[float],
+    highs: list[float],
+    lows: list[float],
+    indices: list[int],
+    ema_period: int = 200,
+    slope_bars: int = 72,
+    atr_window: int = 14,
+    vol_rank_window: int = 500,
+) -> dict[int, tuple[str, str]]:
+    """Causal (past-data-only) market-regime label for each requested bar
+    index -> (trend_regime, vol_regime). A bar with too little history for
+    either read is simply omitted.
+
+    trend_regime: "bull" if close is above its EMA-`ema_period` AND that EMA
+    is higher than it was `slope_bars` bars ago; "bear" if close is below
+    the EMA AND the EMA is lower than `slope_bars` bars ago; otherwise
+    "range" (price and EMA slope disagree, i.e. no clean trend).
+
+    vol_regime: ATR% (over `atr_window`) ranked against the trailing
+    `vol_rank_window` bars' ATR% (including the current one, never the
+    future): bottom third "low_vol", top third "high_vol", else "mid_vol".
+
+    Everything is computed from bars <= i, so a live system could compute
+    the identical label in real time (no hindsight labeling)."""
+    import numpy as np
+
+    n = len(closes)
+    if n == 0:
+        return {}
+    c = np.asarray(closes, dtype=float)
+    h = np.asarray(highs, dtype=float)
+    l = np.asarray(lows, dtype=float)
+    alpha = 2.0 / (ema_period + 1)
+    ema = np.empty(n)
+    ema[0] = c[0]
+    for k in range(1, n):
+        ema[k] = alpha * c[k] + (1.0 - alpha) * ema[k - 1]
+    prev_c = np.concatenate(([c[0]], c[:-1]))
+    tr = np.maximum.reduce([h - l, np.abs(h - prev_c), np.abs(l - prev_c)])
+    atr = np.full(n, np.nan)
+    csum = np.cumsum(tr)
+    atr[atr_window:] = (csum[atr_window:] - csum[:-atr_window]) / atr_window / c[atr_window:]
+    ranks = np.full(n, np.nan)
+    if n >= vol_rank_window + atr_window:
+        from numpy.lib.stride_tricks import sliding_window_view
+
+        w = sliding_window_view(atr[atr_window:], vol_rank_window)
+        cur = atr[atr_window + vol_rank_window - 1 :]
+        ranks[atr_window + vol_rank_window - 1 :] = (w <= cur[:, None]).mean(axis=1)
+    out: dict[int, tuple[str, str]] = {}
+    for i in indices:
+        if i < max(ema_period, slope_bars) or np.isnan(ranks[i]):
+            continue
+        if c[i] > ema[i] and ema[i] > ema[i - slope_bars]:
+            trend = "bull"
+        elif c[i] < ema[i] and ema[i] < ema[i - slope_bars]:
+            trend = "bear"
+        else:
+            trend = "range"
+        r = ranks[i]
+        vol = "low_vol" if r < 1.0 / 3.0 else ("high_vol" if r > 2.0 / 3.0 else "mid_vol")
+        out[i] = (trend, vol)
+    return out
+
+
+def _regime_new_bucket() -> dict:
+    return {"n": 0, "model_ok": 0, "maj_ok": 0, "per_ok": 0, "pnl_m": 0.0, "pnl_maj": 0.0, "pnl_per": 0.0, "pnl_n": 0}
+
+
+def accumulate_regime_stats(acc: dict, fold_idx: int, model_predictions: list[int], y_test: list[int], majority_class: int, per_symbol_test: list[dict]) -> None:
+    """Adds one walk-forward fold's per-row results into `acc`, bucketed by
+    each test row's trend regime and vol regime (entry['regimes'] must be
+    set: {bar_index: (trend, vol)}). acc[(fold_idx, dimension, regime)] ->
+    bucket of counts/sums (accuracy counts and net-P&L sums for the model,
+    the majority-class baseline, and the persistence baseline)."""
+    for entry in per_symbol_test:
+        regimes = entry.get("regimes") or {}
+        closes, horizon = entry["closes"], entry["horizon"]
+        tb = entry.get("label_scheme") == "triple-barrier"
+        barrier = entry.get("barrier_pct")
+        for k, i in enumerate(entry["idx_test"]):
+            reg = regimes.get(i)
+            if reg is None or i - horizon < 0:
+                continue
+            row = entry["start"] + k
+            actual = y_test[row]
+            preds = {
+                "model": int(model_predictions[row]),
+                "maj": majority_class,
+                "per": 1 if closes[i] > closes[i - horizon] else 0,
+            }
+            pnls = {}
+            for name, pred in preds.items():
+                if tb:
+                    b = barrier[i] if isinstance(barrier, dict) else barrier
+                    pnls[name] = triple_barrier_net_pnl(
+                        entry["highs"], entry["lows"], closes, i, horizon, b, bool(pred), entry["round_trip_cost"]
+                    )
+                else:
+                    pnls[name] = net_pnl(closes, i, horizon, bool(pred), entry["round_trip_cost"])
+            for dim, label in (("trend", reg[0]), ("vol", reg[1]), ("all", "all")):
+                b = acc.setdefault((fold_idx, dim, label), _regime_new_bucket())
+                b["n"] += 1
+                b["model_ok"] += int(preds["model"] == actual)
+                b["maj_ok"] += int(preds["maj"] == actual)
+                b["per_ok"] += int(preds["per"] == actual)
+                if all(v is not None for v in pnls.values()):
+                    b["pnl_n"] += 1
+                    b["pnl_m"] += pnls["model"]
+                    b["pnl_maj"] += pnls["maj"]
+                    b["pnl_per"] += pnls["per"]
+
+
+def print_regime_report(acc: dict, n_folds: int) -> None:
+    """Pooled-over-folds table per regime, plus how many folds the model
+    beat BOTH baselines' accuracy (and net P&L) inside that regime, counting
+    only fold-regime cells with at least 50 test rows."""
+    print("\n--- regime breakdown (regimes use only data available at each bar) ---", file=sys.stderr)
+    print(f"  {'regime':<14}{'rows':>8}{'share':>7}  {'model':>6}{'major':>7}{'persist':>8}  {'edge_acc':>9}   {'P&L model':>10}{'P&L pers':>10}{'edge_P&L':>10}  folds>both(acc/pnl)", file=sys.stderr)
+    total_rows = sum(b["n"] for (f, d, r), b in acc.items() if d == "all") or 1
+    for dim, labels in (("all", ("all",)), ("trend", TREND_REGIMES), ("vol", VOL_REGIMES)):
+        for label in labels:
+            tot = _regime_new_bucket()
+            beat_acc = beat_pnl = cells = 0
+            for f in range(n_folds):
+                b = acc.get((f, dim, label))
+                if not b:
+                    continue
+                for key in tot:
+                    tot[key] += b[key]
+                if b["n"] >= 50 and b["pnl_n"] >= 50:
+                    cells += 1
+                    ma = b["model_ok"] / b["n"]
+                    if ma > b["maj_ok"] / b["n"] and ma > b["per_ok"] / b["n"]:
+                        beat_acc += 1
+                    mp = b["pnl_m"] / b["pnl_n"]
+                    if mp > b["pnl_maj"] / b["pnl_n"] and mp > b["pnl_per"] / b["pnl_n"]:
+                        beat_pnl += 1
+            if tot["n"] == 0:
+                continue
+            n = tot["n"]
+            pn = max(tot["pnl_n"], 1)
+            ma, xa, pa = tot["model_ok"] / n, tot["maj_ok"] / n, tot["per_ok"] / n
+            mp, pp = tot["pnl_m"] / pn, tot["pnl_per"] / pn
+            print(
+                f"  {dim + ':' + label if dim != 'all' else 'ALL':<14}{n:>8}{n / total_rows:>7.0%}  {ma:>6.3f}{xa:>7.3f}{pa:>8.3f}  {100 * (ma - max(xa, pa)):>+8.1f}p   {mp:>+10.4f}{pp:>+10.4f}{100 * (mp - max(pp, tot['pnl_maj'] / pn)):>+9.2f}p  {beat_acc}/{cells} , {beat_pnl}/{cells}",
+                file=sys.stderr,
+            )
+
+
 def persistence_correct_and_total_from_labels(
     closes: list[float], indices: list[int], y: list[int], horizon: int
 ) -> tuple[int, int]:
@@ -1392,12 +1547,16 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
             )
             continue
         per_symbol_folds.append((d, folds))
+        if getattr(args, "regime_report", False):
+            all_test_idx = sorted({i for f in folds for i in f[5]})
+            d["regimes"] = regime_labels(d["closes"], d["highs"], d["lows"], all_test_idx)
 
     if not per_symbol_folds:
         print(f"error: no symbol had enough history for even one walk-forward fold at --folds {args.folds}.", file=sys.stderr)
         sys.exit(1)
 
     fold_results = []
+    regime_acc: dict = {}
     for fold_idx in range(args.folds):
         X_train, y_train, X_test, y_test = [], [], [], []
         persistence_correct = persistence_total = 0
@@ -1423,6 +1582,7 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
                 "idx_test": sym_idx_test,
                 "start": test_start,
                 "end": len(X_test),
+                "regimes": d.get("regimes"),
             })
             if d["label_scheme"] == "triple-barrier":
                 correct, total = persistence_correct_and_total_from_labels(d["closes"], sym_idx_test, sym_y_test, d["horizon"])
@@ -1444,12 +1604,19 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
         )
         fold_results.append(metrics)
         _print_fold_report(fold_idx, args.folds, metrics)
+        if getattr(args, "regime_report", False):
+            majority_class = 1 if sum(y_train) >= len(y_train) / 2 else 0
+            accumulate_regime_stats(
+                regime_acc, fold_idx, list(metrics["model"].predict(X_test)), y_test, majority_class, per_symbol_test
+            )
 
     if not fold_results:
         print("error: no fold produced a usable train/test split.", file=sys.stderr)
         sys.exit(1)
 
     _print_walk_forward_summary(fold_results)
+    if getattr(args, "regime_report", False):
+        print_regime_report(regime_acc, args.folds)
 
 
 def add_dataset_args(parser: argparse.ArgumentParser) -> None:
@@ -1487,6 +1654,7 @@ def add_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--atr-window", type=int, default=EXTENDED_DEFAULTS["atr_window"])
     parser.add_argument("--divergence-lookback", type=int, default=EXTENDED_DEFAULTS["divergence_lookback"])
     parser.add_argument("--htf-factor", type=int, default=EXTENDED_DEFAULTS["htf_factor"], help="Subsample factor for the coarser RSI-divergence view (4 = every 4th bar counting back from the latest).")
+    parser.add_argument("--regime-report", action="store_true", help="With --folds > 1: after the walk-forward summary, break the held-out results down by market regime (trend: bull/bear/range from price vs EMA-200 and its slope; volatility: ATR%% terciles), using only data available at each bar. Diagnostic only -- trains no extra models.")
     parser.add_argument("--drop-features", type=str, default="", help="Comma-separated feature names to remove from the model input (ablation). Applied after the dataset is built, so labels/rows are unchanged.")
     parser.add_argument("--barrier-mode", choices=["fixed", "atr"], default="fixed", help="triple-barrier width: fixed (the fee-derived width, default) or atr (k x ATR%%, floored at the fee-derived width).")
     parser.add_argument("--atr-barrier-mult", type=float, default=3.0, help="k in --barrier-mode atr.")

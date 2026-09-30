@@ -927,3 +927,44 @@ def test_drop_features_removes_columns_only(monkeypatch):
     assert dropped["y"] == full["y"] and dropped["indices"] == full["indices"]
     k = EXTENDED_FEATURE_ORDER.index("rsi")
     assert dropped["X"][5][EXTENDED_FEATURE_ORDER.index("rsi") - 0] is not None
+
+
+def test_regime_labels_bull_bear_range_and_causality():
+    import math
+
+    from scripts.train_model import regime_labels
+
+    n = 1200
+    # steady uptrend, then steady downtrend, with mild noise
+    closes = [100.0 * (1.0 + 0.001 * i) * (1.0 + 0.002 * math.sin(i)) for i in range(700)]
+    closes += [closes[-1] * (1.0 - 0.0015 * k) for k in range(1, n - 700 + 1)]
+    highs = [c * 1.003 for c in closes]
+    lows = [c * 0.997 for c in closes]
+    idx = list(range(n))
+    labels = regime_labels(closes, highs, lows, idx)
+    assert labels[650][0] == "bull"
+    assert labels[1190][0] == "bear"
+    assert all(v[1] in ("low_vol", "mid_vol", "high_vol") for v in labels.values())
+    # warmup bars are omitted rather than guessed
+    assert 100 not in labels
+    # causality: truncating the future must not change past labels
+    cut = regime_labels(closes[:900], highs[:900], lows[:900], list(range(900)))
+    assert all(cut[i] == labels[i] for i in cut)
+
+
+def test_regime_stats_accumulation_counts_rows():
+    from scripts.train_model import accumulate_regime_stats
+
+    closes = [100.0 + i for i in range(20)]
+    entry = {
+        "closes": closes, "highs": closes, "lows": closes, "horizon": 2, "round_trip_cost": 0.0,
+        "barrier_pct": 0.01, "label_scheme": "fixed-horizon",
+        "idx_test": [5, 6, 7], "start": 0, "end": 3,
+        "regimes": {5: ("bull", "low_vol"), 6: ("bull", "high_vol"), 7: ("bear", "high_vol")},
+    }
+    acc = {}
+    accumulate_regime_stats(acc, 0, [1, 1, 0], [1, 1, 1], 1, [entry])
+    assert acc[(0, "all", "all")]["n"] == 3
+    assert acc[(0, "trend", "bull")]["n"] == 2 and acc[(0, "trend", "bear")]["n"] == 1
+    assert acc[(0, "vol", "high_vol")]["n"] == 2
+    assert acc[(0, "trend", "bull")]["model_ok"] == 2 and acc[(0, "trend", "bear")]["model_ok"] == 0
