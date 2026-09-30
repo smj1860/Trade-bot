@@ -911,3 +911,19 @@ def test_base_feature_dataset_unchanged_by_default(monkeypatch):
     result = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=_make_window_args(min_move=0.0))
     assert all(len(row) == len(FEATURE_ORDER) for row in result["X"])
     assert isinstance(result["barrier_pct"], float)
+
+
+def test_drop_features_removes_columns_only(monkeypatch):
+    import scripts.train_model as train_model
+    from scripts.train_model import EXTENDED_FEATURE_ORDER
+
+    monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: _synthetic_ohlc())
+    base_args = dict(min_move=0.0, extended_features=True, ema_long_window=200, vwap_window=24,
+                     atr_window=14, divergence_lookback=14, htf_factor=4)
+    full = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=_make_window_args(**base_args))
+    dropped = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60,
+                                  window_args=_make_window_args(drop_features="atr_pct,vwap_ratio", **base_args))
+    assert len(dropped["X"][0]) == len(EXTENDED_FEATURE_ORDER) - 2
+    assert dropped["y"] == full["y"] and dropped["indices"] == full["indices"]
+    k = EXTENDED_FEATURE_ORDER.index("rsi")
+    assert dropped["X"][5][EXTENDED_FEATURE_ORDER.index("rsi") - 0] is not None

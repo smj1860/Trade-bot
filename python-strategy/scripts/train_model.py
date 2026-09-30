@@ -1152,6 +1152,15 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
         extended=extended,
         barrier_fn=barrier_fn,
     )
+    drop = [n for n in (getattr(window_args, "drop_features", "") or "").split(",") if n.strip()]
+    if drop:
+        order = EXTENDED_FEATURE_ORDER if extended else FEATURE_ORDER
+        unknown = [n for n in drop if n.strip() not in order]
+        if unknown:
+            print(f"error: --drop-features names not in the active feature set: {unknown}", file=sys.stderr)
+            sys.exit(2)
+        keep = [k for k, n in enumerate(order) if n not in {d.strip() for d in drop}]
+        X = [[row[k] for k in keep] for row in X]
     barrier_pct_out = {i: barrier_fn(i) for i in indices} if barrier_fn is not None else min_move_threshold
     return {
         "symbol": symbol,
@@ -1478,6 +1487,7 @@ def add_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--atr-window", type=int, default=EXTENDED_DEFAULTS["atr_window"])
     parser.add_argument("--divergence-lookback", type=int, default=EXTENDED_DEFAULTS["divergence_lookback"])
     parser.add_argument("--htf-factor", type=int, default=EXTENDED_DEFAULTS["htf_factor"], help="Subsample factor for the coarser RSI-divergence view (4 = every 4th bar counting back from the latest).")
+    parser.add_argument("--drop-features", type=str, default="", help="Comma-separated feature names to remove from the model input (ablation). Applied after the dataset is built, so labels/rows are unchanged.")
     parser.add_argument("--barrier-mode", choices=["fixed", "atr"], default="fixed", help="triple-barrier width: fixed (the fee-derived width, default) or atr (k x ATR%%, floored at the fee-derived width).")
     parser.add_argument("--atr-barrier-mult", type=float, default=3.0, help="k in --barrier-mode atr.")
     parser.add_argument("--min-move", type=float, default=None, help="Drop rows whose |move| over --horizon is smaller than this fraction (e.g. 0.02 = 2%%) (--label-scheme fixed-horizon), or the triple-barrier width (--label-scheme triple-barrier). Default None = derive it from real trading costs (2x --taker-fee + --slippage + --profit-margin) instead of an arbitrary number.")
