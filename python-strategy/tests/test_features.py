@@ -1,5 +1,7 @@
 from decimal import Decimal
 
+import pytest
+
 from strategy.features import FeatureEngine
 
 
@@ -256,3 +258,44 @@ def test_williams_r_populates_once_window_completes():
         )
     assert features is not None
     assert features.williams_percent_r > 0
+
+
+def test_extended_features_live_matches_historical_features_at():
+    """Live FeatureEngine and the training script's features_at() must
+    agree on the extended features, bar for bar, when both read the same
+    completed-bar history (the parity guarantee the whole feature design
+    depends on)."""
+    import math
+
+    from scripts.train_model import EXTENDED_DEFAULTS, EXTENDED_FEATURES, features_at
+    from strategy.features import FeatureEngine
+
+    engine = FeatureEngine(momentum_window=5, bar_interval_seconds=3600)
+    ts = 1_700_000_000.0
+    last = None
+    for b in range(400):
+        base = 100.0 * (1.0 + 0.03 * math.sin(b / 9.0) + 0.0004 * b)
+        t0 = ts + b * 3600
+        engine.on_trade("X-USD", Decimal(str(base * 0.995)), Decimal("1.5"), timestamp=t0 + 10)
+        engine.on_trade("X-USD", Decimal(str(base * 1.004)), Decimal("2.0"), timestamp=t0 + 20)
+        engine.on_trade("X-USD", Decimal(str(base)), Decimal("1.0"), timestamp=t0 + 30)
+        last = engine.on_order_book_update(
+            "X-USD", Decimal(str(base)), Decimal("1"), Decimal(str(base * 1.0001)), Decimal("1"),
+            timestamp=t0 + 40,
+        )
+    bars = engine._bars
+    closes = bars.closes("X-USD")
+    assert len(closes) >= 200
+    # `last` was computed as-of the last order-book update, whose bar was still
+    # forming, so recompute live at the next bar boundary for a clean compare.
+    live = engine.on_order_book_update(
+        "X-USD", Decimal("100"), Decimal("1"), Decimal("100.01"), Decimal("1"),
+        timestamp=ts + 400 * 3600 + 5,
+    )
+    closes = bars.closes("X-USD")
+    hist = features_at(
+        closes, bars.midpoints("X-USD"), bars.highs("X-USD"), bars.lows("X-USD"), bars.volumes("X-USD"),
+        len(closes) - 1, 20, 12, 14, 20, 10, 20, 2.0, 5, 34, 12, 26, 9, 20, 14, EXTENDED_DEFAULTS,
+    )
+    for name in EXTENDED_FEATURES:
+        assert getattr(live, name) == pytest.approx(hist[name], abs=1e-9), name

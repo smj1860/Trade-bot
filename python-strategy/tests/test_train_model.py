@@ -846,3 +846,68 @@ def test_parse_intervals_rejects_bad_values():
         parse_intervals("")
     with pytest.raises(ValueError):
         parse_intervals("0")
+
+
+def _synthetic_ohlc(n=700):
+    import math
+
+    closes = [100.0 * (1.0 + 0.02 * math.sin(i / 7.0) + 0.0005 * i) for i in range(n)]
+    highs = [c * 1.006 for c in closes]
+    lows = [c * 0.994 for c in closes]
+    midpoints = [(h + l) / 2.0 for h, l in zip(highs, lows)]
+    volumes = [1.0 + (i % 5) for i in range(n)]
+    return closes, midpoints, highs, lows, volumes
+
+
+def test_extended_features_dataset_has_extra_columns(monkeypatch):
+    import scripts.train_model as train_model
+    from scripts.train_model import EXTENDED_FEATURE_ORDER
+
+    monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: _synthetic_ohlc())
+    args = _make_window_args(
+        min_move=0.0, extended_features=True, ema_long_window=200, vwap_window=24,
+        atr_window=14, divergence_lookback=14, htf_factor=4,
+    )
+    result = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=args)
+    assert result is not None
+    assert all(len(row) == len(EXTENDED_FEATURE_ORDER) for row in result["X"])
+    # extended warmup is at least the EMA-200 window
+    assert min(result["indices"]) >= 199
+
+
+def test_atr_barrier_mode_builds_per_bar_barriers_floored_at_min_move(monkeypatch):
+    import scripts.train_model as train_model
+
+    monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: _synthetic_ohlc())
+    args = _make_window_args(
+        min_move=0.005, label_scheme="triple-barrier", horizon=4, barrier_mode="atr",
+        atr_barrier_mult=0.8, atr_window=14,
+    )
+    result = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=args)
+    assert result is not None
+    barriers = result["barrier_pct"]
+    assert isinstance(barriers, dict)
+    assert set(barriers) == set(result["indices"])
+    assert all(b >= 0.005 for b in barriers.values())
+    # ATR of a constant ~1.2% high-low range x3 clears the 0.5% floor
+    assert max(barriers.values()) > 0.005
+
+
+def test_simulate_triple_barrier_accepts_per_bar_barrier_map():
+    from scripts.train_model import simulate_triple_barrier_net_pnl_series
+
+    closes = [100.0, 100.0, 100.0, 100.0]
+    highs = [100.0, 103.0, 100.0, 100.0]
+    lows = [100.0, 99.9, 100.0, 100.0]
+    fixed = simulate_triple_barrier_net_pnl_series(highs, lows, closes, [0], 2, 0.02, [1], 0.0)
+    mapped = simulate_triple_barrier_net_pnl_series(highs, lows, closes, [0], 2, {0: 0.02}, [1], 0.0)
+    assert fixed == mapped == [0.02]
+
+
+def test_base_feature_dataset_unchanged_by_default(monkeypatch):
+    import scripts.train_model as train_model
+
+    monkeypatch.setattr(train_model, "load_ohlc", lambda conn, symbol, interval: _synthetic_ohlc())
+    result = load_symbol_dataset(conn=None, symbol="BTC-USD", interval_minutes=60, window_args=_make_window_args(min_move=0.0))
+    assert all(len(row) == len(FEATURE_ORDER) for row in result["X"])
+    assert isinstance(result["barrier_pct"], float)

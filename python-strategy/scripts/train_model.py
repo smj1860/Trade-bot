@@ -248,6 +248,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from strategy.indicators import (
+    atr_pct,
     awesome_oscillator,
     bar_momentum,
     bollinger_bandwidth,
@@ -259,8 +260,11 @@ from strategy.indicators import (
     realized_vol,
     returns_zscore,
     rsi,
+    rsi_divergence,
     sma_ratio,
+    subsample_tail,
     volume_ratio,
+    vwap_ratio,
     williams_percent_r,
 )
 
@@ -291,6 +295,22 @@ FEATURE_ORDER = [
     # features above.
     "returns_zscore",
 ]
+
+
+# Opt-in extended feature set (--extended-features): a long-trend EMA ratio,
+# rolling volume-weighted-average-price ratio, ATR as a fraction of price,
+# and RSI/price divergence on the base timeframe plus a rolling 4x
+# subsampled ("4-hour view" on hourly bars) timeframe. Appended after the
+# base features so the base list above stays the untouched control.
+EXTENDED_FEATURES = ["ema_long_ratio", "vwap_ratio", "atr_pct", "rsi_divergence", "rsi_divergence_htf"]
+EXTENDED_FEATURE_ORDER = FEATURE_ORDER + EXTENDED_FEATURES
+EXTENDED_DEFAULTS = {
+    "ema_long_window": 200,
+    "vwap_window": 24,
+    "atr_window": 14,
+    "divergence_lookback": 14,
+    "htf_factor": 4,
+}
 
 
 class MissingCredentials(RuntimeError):
@@ -428,6 +448,7 @@ def features_at(
     macd_signal_window: int,
     cci_window: int,
     williams_r_window: int,
+    extended: dict | None = None,
 ) -> dict[str, float]:
     """The feature vector as of bar `i`, using the same window-slicing
     convention strategy/features.py's FeatureEngine applies live via
@@ -457,7 +478,7 @@ def features_at(
     volume_win = volumes[max(0, i - vol_window + 1) : i + 1]
     parkinson_highs = highs[max(0, i - vol_window + 1) : i + 1]
     parkinson_lows = lows[max(0, i - vol_window + 1) : i + 1]
-    return {
+    out = {
         "sma_ratio": sma_ratio(sma_win),
         "ema_ratio": ema_ratio(ema_win),
         "rsi": rsi(rsi_win),
@@ -475,6 +496,24 @@ def features_at(
         # docstring for why this needs the identical log-return series.
         "returns_zscore": returns_zscore(vol_win),
     }
+    if extended:
+        ew = extended["ema_long_window"]
+        vw = extended["vwap_window"]
+        aw = extended["atr_window"]
+        lb = extended["divergence_lookback"]
+        hf = extended["htf_factor"]
+        v0 = max(0, i - vw + 1)
+        a0 = max(0, i - aw)
+        # Divergence needs rsi_window + lookback + 1 closes at its own
+        # timeframe; the coarser view needs htf_factor x as many raw bars.
+        div_need = rsi_window + lb + 1
+        out["ema_long_ratio"] = ema_ratio(closes[max(0, i - ew + 1) : i + 1])
+        out["vwap_ratio"] = vwap_ratio(closes[v0 : i + 1], midpoints[v0 : i + 1], volumes[v0 : i + 1])
+        out["atr_pct"] = atr_pct(closes[a0 : i + 1], highs[a0 : i + 1], lows[a0 : i + 1])
+        out["rsi_divergence"] = rsi_divergence(closes[max(0, i - div_need + 1) : i + 1], rsi_window, lb)
+        htf_raw = closes[max(0, i - div_need * hf + 1) : i + 1]
+        out["rsi_divergence_htf"] = rsi_divergence(subsample_tail(htf_raw, hf), rsi_window, lb)
+    return out
 
 
 def dataset_warmup(
@@ -489,12 +528,13 @@ def dataset_warmup(
     macd_signal_window: int,
     cci_window: int,
     williams_r_window: int,
+    extended: dict | None = None,
 ) -> int:
     """The number of bars needed before every indicator's window has a
     full history — shared by build_dataset (to know where to start) and
     load_symbol_dataset (to know whether a symbol has enough history at
     all)."""
-    return max(
+    base = max(
         sma_window,
         ema_window,
         rsi_window + 1,
@@ -505,6 +545,16 @@ def dataset_warmup(
         macd_slow_window + macd_signal_window,
         cci_window,
         williams_r_window,
+    )
+    if not extended:
+        return base
+    div_need = rsi_window + extended["divergence_lookback"] + 1
+    return max(
+        base,
+        extended["ema_long_window"],
+        extended["vwap_window"],
+        extended["atr_window"] + 1,
+        div_need * extended["htf_factor"],
     )
 
 
@@ -694,7 +744,8 @@ def simulate_triple_barrier_net_pnl_series(
     unresolved are skipped, same as simulate_triple_barrier_net_pnl."""
     out = []
     for i, pred in zip(indices, predictions):
-        pnl = triple_barrier_net_pnl(highs, lows, closes, i, horizon, barrier_pct, predicted_up=bool(pred), round_trip_cost=round_trip_cost)
+        row_barrier = barrier_pct[i] if isinstance(barrier_pct, dict) else barrier_pct
+        pnl = triple_barrier_net_pnl(highs, lows, closes, i, horizon, row_barrier, predicted_up=bool(pred), round_trip_cost=round_trip_cost)
         if pnl is not None:
             out.append(pnl)
     return out
@@ -768,6 +819,8 @@ def build_dataset(
     horizon: int = 1,
     min_move_threshold: float = 0.0,
     label_scheme: str = "fixed-horizon",
+    extended: dict | None = None,
+    barrier_fn=None,
 ) -> tuple[list[list[float]], list[int], list[int]]:
     """Builds (X, y, indices) — X rows in FEATURE_ORDER, `indices` is the
     bar index `i` each row was computed as-of (needed by callers to score a
@@ -795,8 +848,9 @@ def build_dataset(
     warmup = dataset_warmup(
         sma_window, ema_window, rsi_window, vol_window, bar_momentum_window,
         bollinger_window, ao_slow_window, macd_slow_window, macd_signal_window,
-        cci_window, williams_r_window,
+        cci_window, williams_r_window, extended,
     )
+    feature_order = EXTENDED_FEATURE_ORDER if extended else FEATURE_ORDER
     X: list[list[float]] = []
     y: list[int] = []
     indices: list[int] = []
@@ -804,7 +858,8 @@ def build_dataset(
     # (fixed-horizon) or the vertical barrier (triple-barrier).
     for i in range(warmup - 1, len(closes) - horizon):
         if label_scheme == "triple-barrier":
-            label = triple_barrier_label(highs, lows, closes, i, horizon, min_move_threshold)
+            barrier = barrier_fn(i) if barrier_fn is not None else min_move_threshold
+            label = triple_barrier_label(highs, lows, closes, i, horizon, barrier)
             if label is None:
                 continue
         else:
@@ -833,8 +888,9 @@ def build_dataset(
             macd_signal_window,
             cci_window,
             williams_r_window,
+            extended,
         )
-        X.append([feats[name] for name in FEATURE_ORDER])
+        X.append([feats[name] for name in feature_order])
         y.append(label)
         indices.append(i)
     return X, y, indices
@@ -1014,6 +1070,18 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
     slippage = getattr(window_args, "slippage", 0.0005)
     profit_margin = getattr(window_args, "profit_margin", 0.0)
     label_scheme = getattr(window_args, "label_scheme", "fixed-horizon")
+    extended = None
+    if getattr(window_args, "extended_features", False):
+        extended = {
+            "ema_long_window": window_args.ema_long_window,
+            "vwap_window": window_args.vwap_window,
+            "atr_window": window_args.atr_window,
+            "divergence_lookback": window_args.divergence_lookback,
+            "htf_factor": window_args.htf_factor,
+        }
+    barrier_mode = getattr(window_args, "barrier_mode", "fixed")
+    atr_mult = getattr(window_args, "atr_barrier_mult", 3.0)
+    atr_window = getattr(window_args, "atr_window", 14)
     # Both legs' fee + slippage — a label or a simulated trade that only
     # subtracted fees would be optimistic about what a live order actually
     # fills at (see --slippage's help text).
@@ -1033,6 +1101,7 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
         window_args.macd_signal_window,
         window_args.cci_window,
         window_args.williams_r_window,
+        extended,
     )
     min_required = warmup + horizon + 10  # a little slack beyond bare warmup so there's an actual dataset, not one row
     if len(closes) < min_required:
@@ -1046,6 +1115,16 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
 
     quantile_threshold = per_symbol_move_threshold(closes, warmup, horizon, top_fraction)
     min_move_threshold = max(min_move, quantile_threshold)
+
+    barrier_fn = None
+    if barrier_mode == "atr":
+        # Per-bar barrier width: k x ATR(as % of price), floored at the
+        # fee-derived cost-clearing width so a touch is always an
+        # executable, cost-clearing move. Uses only bars up to and
+        # including i, so it never looks ahead.
+        def barrier_fn(i, _floor=max(min_move, 0.0), _k=atr_mult, _w=atr_window):
+            a0 = max(0, i - _w)
+            return max(_floor, _k * atr_pct(closes[a0 : i + 1], highs[a0 : i + 1], lows[a0 : i + 1]))
 
     X, y, indices = build_dataset(
         closes,
@@ -1070,7 +1149,10 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
         horizon=horizon,
         min_move_threshold=min_move_threshold,
         label_scheme=label_scheme,
+        extended=extended,
+        barrier_fn=barrier_fn,
     )
+    barrier_pct_out = {i: barrier_fn(i) for i in indices} if barrier_fn is not None else min_move_threshold
     return {
         "symbol": symbol,
         "closes": closes,
@@ -1079,7 +1161,7 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
         "warmup": warmup,
         "horizon": horizon,
         "min_move_threshold": min_move_threshold,
-        "barrier_pct": min_move_threshold,  # same fee-derived quantity, used as the barrier width in triple-barrier mode
+        "barrier_pct": barrier_pct_out,  # fee-derived width (scalar), or a per-bar {index: width} map with --barrier-mode atr
         "label_scheme": label_scheme,
         "round_trip_cost": round_trip_cost,
         "X": X,
@@ -1390,6 +1472,14 @@ def add_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cci-window", type=int, default=20)
     parser.add_argument("--williams-r-window", type=int, default=14)
     parser.add_argument("--horizon", type=int, default=1, help="Label bar i by the direction of the move to bar i+horizon (default 1 = next-bar direction).")
+    parser.add_argument("--extended-features", action="store_true", help="Add the extended feature set (EMA-200 ratio, rolling VWAP ratio, ATR%%, RSI divergence on the base timeframe and a rolling 4x-subsampled timeframe). Off by default so the base feature set stays the control.")
+    parser.add_argument("--ema-long-window", type=int, default=EXTENDED_DEFAULTS["ema_long_window"])
+    parser.add_argument("--vwap-window", type=int, default=EXTENDED_DEFAULTS["vwap_window"])
+    parser.add_argument("--atr-window", type=int, default=EXTENDED_DEFAULTS["atr_window"])
+    parser.add_argument("--divergence-lookback", type=int, default=EXTENDED_DEFAULTS["divergence_lookback"])
+    parser.add_argument("--htf-factor", type=int, default=EXTENDED_DEFAULTS["htf_factor"], help="Subsample factor for the coarser RSI-divergence view (4 = every 4th bar counting back from the latest).")
+    parser.add_argument("--barrier-mode", choices=["fixed", "atr"], default="fixed", help="triple-barrier width: fixed (the fee-derived width, default) or atr (k x ATR%%, floored at the fee-derived width).")
+    parser.add_argument("--atr-barrier-mult", type=float, default=3.0, help="k in --barrier-mode atr.")
     parser.add_argument("--min-move", type=float, default=None, help="Drop rows whose |move| over --horizon is smaller than this fraction (e.g. 0.02 = 2%%) (--label-scheme fixed-horizon), or the triple-barrier width (--label-scheme triple-barrier). Default None = derive it from real trading costs (2x --taker-fee + --slippage + --profit-margin) instead of an arbitrary number.")
     parser.add_argument("--top-fraction", type=float, default=1.0, help="Keep only the most extreme fraction of each symbol's moves (e.g. 0.3 = top/bottom 30%%), computed per symbol. Default 1.0 = no filtering. Combined with --min-move (or its derived default) via max() when both are set.")
     parser.add_argument("--taker-fee", type=float, default=0.008, help="Kraken's spot taker fee as a fraction (default 0.008 = 0.80%%, the entry 30-day-volume tier). Doubled for a round trip, used to derive --min-move's default.")
@@ -1645,7 +1735,7 @@ def main() -> None:
     print(f"  majority-class baseline:     {majority_mean_pnl:+.4f} ({majority_pnl_count} trades, total {majority_pnl_total:+.4f})", file=sys.stderr)
     print(f"  persistence baseline:        {persistence_mean_pnl:+.4f} ({persistence_pnl_count} trades, total {persistence_pnl_total:+.4f})", file=sys.stderr)
     print(f"  saved model to:              {model_out}", file=sys.stderr)
-    print(f"  feature_order for strategy_config.toml: {FEATURE_ORDER}", file=sys.stderr)
+    print(f"  feature_order for strategy_config.toml: {EXTENDED_FEATURE_ORDER if args.extended_features else FEATURE_ORDER}", file=sys.stderr)
     if model_accuracy <= max(baseline_accuracy, persistence_baseline):
         print(
             "  WARNING: model did not beat both naive baselines on this test split — "

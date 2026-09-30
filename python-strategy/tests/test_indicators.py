@@ -398,3 +398,44 @@ def test_parkinson_vol_scale_invariant_across_price_levels():
     altcoin_highs, altcoin_lows = [1.02, 1.02], [0.98, 0.98]
     btc_highs, btc_lows = [61_200.0, 61_200.0], [58_800.0, 58_800.0]
     assert parkinson_vol(altcoin_highs, altcoin_lows) == pytest.approx(parkinson_vol(btc_highs, btc_lows), rel=1e-3)
+
+
+def test_vwap_ratio_and_degenerate_inputs():
+    from strategy.indicators import vwap_ratio
+
+    # price above where volume traded -> positive
+    assert vwap_ratio([10, 12], [10, 10], [1, 1]) == pytest.approx(0.2)
+    assert vwap_ratio([10, 12], [10, 10], [0, 0]) == 0.0
+    assert vwap_ratio([], [], []) == 0.0
+    assert vwap_ratio([1, 2], [1], [1, 1]) == 0.0
+
+
+def test_atr_pct_constant_range():
+    from strategy.indicators import atr_pct
+
+    closes = [100.0, 100.0, 100.0]
+    highs = [101.0, 101.0, 101.0]
+    lows = [99.0, 99.0, 99.0]
+    assert atr_pct(closes, highs, lows) == pytest.approx(0.02)
+    assert atr_pct([100.0], [101.0], [99.0]) == 0.0
+
+
+def test_subsample_tail_anchors_on_latest():
+    from strategy.indicators import subsample_tail
+
+    assert subsample_tail([1, 2, 3, 4, 5, 6, 7, 8, 9], 4) == [1, 5, 9]
+    assert subsample_tail([1, 2, 3], 1) == [1, 2, 3]
+
+
+def test_rsi_divergence_bearish_and_bullish():
+    from strategy.indicators import rsi_divergence
+
+    # Strong rally to a high, pullback, then a weak drift to a marginally
+    # higher high: price makes a new high with lower RSI -> bearish (-1).
+    up = [100 + 2 * k for k in range(15)]  # high at 128, RSI ~ max
+    down = [126 - 3 * k for k in range(1, 6)]  # pullback
+    series = up + down + [down[-1] + 6, down[-1] + 12, down[-1] + 15, 129.5]
+    assert rsi_divergence(series, rsi_window=5, lookback=10) == -1.0
+    mirror = [200 - x for x in series]
+    assert rsi_divergence(mirror, rsi_window=5, lookback=10) == 1.0
+    assert rsi_divergence([1.0, 2.0], 14, 14) == 0.0

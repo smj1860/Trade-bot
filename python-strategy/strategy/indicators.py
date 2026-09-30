@@ -387,3 +387,82 @@ def awesome_oscillator(midpoints: Sequence[float], fast_window: int = 5, slow_wi
     if slow == 0:
         return 0.0
     return (fast - slow) / slow
+
+
+def vwap_ratio(closes: Sequence[float], midpoints: Sequence[float], volumes: Sequence[float]) -> float:
+    """(most recent close / rolling VWAP of the window) - 1. Rolling VWAP
+    here is sum(midpoint_i * volume_i) / sum(volume_i) over the window,
+    where a bar's midpoint is its own VWAP whenever it saw real trade
+    volume (see strategy/bars.py) — so this is a genuine volume-weighted
+    average price, not an approximation, on both the live and historical
+    paths. Dimensionless like sma_ratio(): positive means price is above
+    where the volume actually traded. The three windows must be the same
+    length and aligned bar-for-bar. Returns 0.0 with no data, mismatched
+    lengths, or zero total volume (no real trade feed yet)."""
+    if not closes or len(closes) != len(midpoints) or len(closes) != len(volumes):
+        return 0.0
+    total_volume = sum(volumes)
+    if total_volume <= 0:
+        return 0.0
+    vwap = sum(m * v for m, v in zip(midpoints, volumes)) / total_volume
+    if vwap == 0:
+        return 0.0
+    return (closes[-1] / vwap) - 1.0
+
+
+def atr_pct(closes: Sequence[float], highs: Sequence[float], lows: Sequence[float]) -> float:
+    """Average True Range as a fraction of the latest close. The window
+    must hold N+1 bars to average N true ranges (each true range needs the
+    previous bar's close: max(high-low, |high-prev_close|,
+    |low-prev_close|)). Scale-free like realized_vol()/parkinson_vol(), so
+    comparable across symbols. Returns 0.0 with fewer than 2 bars,
+    mismatched lengths, or a non-positive latest close."""
+    n = len(closes)
+    if n < 2 or len(highs) != n or len(lows) != n or closes[-1] <= 0:
+        return 0.0
+    true_ranges = []
+    for j in range(1, n):
+        prev_close = closes[j - 1]
+        true_ranges.append(max(highs[j] - lows[j], abs(highs[j] - prev_close), abs(lows[j] - prev_close)))
+    return (sum(true_ranges) / len(true_ranges)) / closes[-1]
+
+
+def rolling_rsi_series(closes: Sequence[float], rsi_window: int) -> list[float]:
+    """rsi() evaluated at every bar that has a full rsi_window of price
+    changes behind it (oldest first). Length is len(closes) - rsi_window."""
+    return [rsi(closes[j - rsi_window : j + 1]) for j in range(rsi_window, len(closes))]
+
+
+def rsi_divergence(closes: Sequence[float], rsi_window: int = 14, lookback: int = 14) -> float:
+    """Classic RSI/price divergence over a bounded lookback, as a signed
+    flag: -1.0 for bearish divergence (the latest close makes a new high
+    versus the previous `lookback` closes while RSI is *lower* than it was
+    at that prior high), +1.0 for bullish divergence (new low in price
+    while RSI is *higher* than at the prior low), otherwise 0.0. Needs
+    rsi_window + lookback + 1 closes; returns 0.0 with less."""
+    need = rsi_window + lookback + 1
+    if len(closes) < need:
+        return 0.0
+    window = closes[-need:]
+    rsis = rolling_rsi_series(window, rsi_window)  # len == lookback + 1
+    prior_closes = window[-(lookback + 1) : -1]
+    prior_rsis = rsis[:-1]
+    last_close, last_rsi = window[-1], rsis[-1]
+    hi = max(range(len(prior_closes)), key=lambda k: prior_closes[k])
+    lo = min(range(len(prior_closes)), key=lambda k: prior_closes[k])
+    if last_close > prior_closes[hi] and last_rsi < prior_rsis[hi]:
+        return -1.0
+    if last_close < prior_closes[lo] and last_rsi > prior_rsis[lo]:
+        return 1.0
+    return 0.0
+
+
+def subsample_tail(values: Sequence[float], factor: int) -> list[float]:
+    """Every `factor`-th value counting backwards from the latest one
+    (oldest first) — a rolling, non-calendar-aligned coarser-timeframe view
+    built from finer bars (factor=4 on hourly closes ~ a 4-hour view that
+    always ends on the latest bar). Computable identically live and
+    historically, unlike a calendar-aligned resample."""
+    if factor <= 1:
+        return list(values)
+    return list(values)[::-1][::factor][::-1]

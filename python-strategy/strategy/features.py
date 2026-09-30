@@ -30,6 +30,7 @@ from decimal import Decimal
 
 from strategy.bars import BarAggregator
 from strategy.indicators import (
+    atr_pct,
     awesome_oscillator,
     bar_momentum,
     bollinger_bandwidth,
@@ -41,8 +42,11 @@ from strategy.indicators import (
     realized_vol,
     returns_zscore,
     rsi,
+    rsi_divergence,
     sma_ratio,
+    subsample_tail,
     volume_ratio,
+    vwap_ratio,
     williams_percent_r,
 )
 
@@ -82,6 +86,13 @@ class Features:
     # bollinger_percent_b (a price Z-score) and bar_momentum (a raw,
     # non-standardized cumulative return). Same neutral-default convention.
     returns_zscore: float = 0.0
+    # Extended feature set (see scripts/train_model.py's EXTENDED_FEATURES;
+    # same indicator functions, same window conventions as features_at()).
+    ema_long_ratio: float = 0.0
+    vwap_ratio: float = 0.0
+    atr_pct: float = 0.0
+    rsi_divergence: float = 0.0
+    rsi_divergence_htf: float = 0.0
 
 
 class _SymbolState:
@@ -119,7 +130,17 @@ class FeatureEngine:
         macd_signal_window: int = 9,
         cci_window: int = 20,
         williams_r_window: int = 14,
+        ema_long_window: int = 200,
+        vwap_window: int = 24,
+        atr_window: int = 14,
+        divergence_lookback: int = 14,
+        htf_factor: int = 4,
     ) -> None:
+        self._ema_long_window = ema_long_window
+        self._vwap_window = vwap_window
+        self._atr_window = atr_window
+        self._divergence_lookback = divergence_lookback
+        self._htf_factor = htf_factor
         self._momentum_window = momentum_window
         self._state: dict[str, _SymbolState] = {}
 
@@ -156,6 +177,10 @@ class FeatureEngine:
                 macd_slow_window + macd_signal_window,
                 cci_window,
                 williams_r_window,
+                ema_long_window,
+                vwap_window,
+                atr_window + 1,
+                (rsi_window + divergence_lookback + 1) * htf_factor,
             )
             + 1
         )
@@ -242,6 +267,30 @@ class FeatureEngine:
                 self._bars.low_window(symbol, self._vol_window),
             ),
             returns_zscore=returns_zscore(self._bars.window(symbol, self._vol_window + 1)),
+            ema_long_ratio=ema_ratio(self._bars.window(symbol, self._ema_long_window)),
+            vwap_ratio=vwap_ratio(
+                self._bars.window(symbol, self._vwap_window),
+                self._bars.midpoint_window(symbol, self._vwap_window),
+                self._bars.volume_window(symbol, self._vwap_window),
+            ),
+            atr_pct=atr_pct(
+                self._bars.window(symbol, self._atr_window + 1),
+                self._bars.high_window(symbol, self._atr_window + 1),
+                self._bars.low_window(symbol, self._atr_window + 1),
+            ),
+            rsi_divergence=rsi_divergence(
+                self._bars.window(symbol, self._rsi_window + self._divergence_lookback + 1),
+                self._rsi_window,
+                self._divergence_lookback,
+            ),
+            rsi_divergence_htf=rsi_divergence(
+                subsample_tail(
+                    self._bars.window(symbol, (self._rsi_window + self._divergence_lookback + 1) * self._htf_factor),
+                    self._htf_factor,
+                ),
+                self._rsi_window,
+                self._divergence_lookback,
+            ),
         )
 
     def on_trade(
