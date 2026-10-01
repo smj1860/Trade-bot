@@ -167,3 +167,26 @@ def test_confidence_filter_helpers():
     wf = confidence_walk_forward(acc, thresholds=(0.0, 0.1), min_trades=1)
     assert wf["chosen"] == {1: 0.1} and wf["n"] == 1 and wf["mean"] == pytest.approx(0.01)
     assert wf["all_n"] == 2
+
+
+def test_unresolved_rows_and_pnl():
+    from scripts.train_model import build_dataset, unresolved_net_pnl
+
+    n = 80
+    closes = [100.0] * n
+    highs = [100.5] * n
+    lows = [99.5] * n
+    # bar 62 spikes both ways (ambiguous for entries before it); the rest never touches 3%.
+    highs[62], lows[62] = 105.0, 95.0
+    mids = [(h + l) / 2 for h, l in zip(highs, lows)]
+    vols = [1.0] * n
+    args = (closes, mids, highs, lows, vols, 5, 5, 5, 5, 5, 5, 2.0, 3, 5, 3, 5, 3, 5, 5)
+    kw = dict(horizon=3, min_move_threshold=0.03, label_scheme="triple-barrier")
+    Xr, yr, ir = build_dataset(*args, **kw)
+    Xu, yu, iu = build_dataset(*args, unresolved_only=True, **kw)
+    assert not set(ir) & set(iu) and set(iu) and all(v == -1 for v in yu)
+    assert 59 in iu and 20 in iu  # ambiguous and timeout rows both land in the unresolved set
+    assert unresolved_net_pnl(highs, lows, closes, 59, 3, 0.03, True, 0.01) == pytest.approx(-0.04)
+    assert unresolved_net_pnl(highs, lows, closes, 20, 3, 0.03, False, 0.01) == pytest.approx(-0.01)
+    resolved_i = next(iter(ir), None)
+    assert resolved_i is None or unresolved_net_pnl(highs, lows, closes, resolved_i, 3, 0.03, True, 0.01) is None

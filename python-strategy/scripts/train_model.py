@@ -1076,6 +1076,7 @@ def build_dataset(
     extended: dict | None = None,
     barrier_fn=None,
     fib: dict | None = None,
+    unresolved_only: bool = False,
 ) -> tuple[list[list[float]], list[int], list[int]]:
     """Builds (X, y, indices) — X rows in FEATURE_ORDER, `indices` is the
     bar index `i` each row was computed as-of (needed by callers to score a
@@ -1115,7 +1116,13 @@ def build_dataset(
         if label_scheme == "triple-barrier":
             barrier = barrier_fn(i) if barrier_fn is not None else min_move_threshold
             label = triple_barrier_label(highs, lows, closes, i, horizon, barrier)
-            if label is None:
+            if unresolved_only:
+                # Evaluation-only rows (--timeout-report): exactly the bars the
+                # normal dataset drops (timeout or same-bar double touch).
+                if label is not None:
+                    continue
+                label = -1
+            elif label is None:
                 continue
         else:
             bar_move = move(closes, i, horizon)
@@ -1411,6 +1418,18 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
         barrier_fn=barrier_fn,
         fib=fib,
     )
+    X_u, idx_u = [], []
+    if getattr(window_args, "timeout_report", False) and label_scheme == "triple-barrier":
+        X_u, _, idx_u = build_dataset(
+            closes, midpoints, highs, lows, volumes,
+            window_args.sma_window, window_args.ema_window, window_args.rsi_window, window_args.vol_window,
+            window_args.bar_momentum_window, window_args.bollinger_window, window_args.bollinger_num_std,
+            window_args.ao_fast_window, window_args.ao_slow_window, window_args.macd_fast_window,
+            window_args.macd_slow_window, window_args.macd_signal_window, window_args.cci_window,
+            window_args.williams_r_window,
+            horizon=horizon, min_move_threshold=min_move_threshold, label_scheme=label_scheme,
+            extended=extended, barrier_fn=barrier_fn, fib=fib, unresolved_only=True,
+        )
     drop = [n for n in (getattr(window_args, "drop_features", "") or "").split(",") if n.strip()]
     if drop:
         order = active_feature_order(extended, fib)
@@ -1420,6 +1439,7 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
             sys.exit(2)
         keep = [k for k, n in enumerate(order) if n not in {d.strip() for d in drop}]
         X = [[row[k] for k in keep] for row in X]
+        X_u = [[row[k] for k in keep] for row in X_u]
     barrier_pct_out = {i: barrier_fn(i) for i in indices} if barrier_fn is not None else min_move_threshold
     return {
         "symbol": symbol,
@@ -1435,6 +1455,8 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
         "X": X,
         "y": y,
         "indices": indices,
+        "X_u": X_u,  # unresolved bars, evaluation only (--timeout-report)
+        "idx_u": idx_u,
     }
 
 
@@ -1556,6 +1578,66 @@ def print_confidence_report(acc: dict, n_folds: int) -> None:
     print("  walk-forward threshold choice (picked on earlier folds only, applied to the next):", file=sys.stderr)
     print(f"    chosen thresholds by fold: { {f + 1: t for f, t in wf['chosen'].items()} }", file=sys.stderr)
     print(f"    selected trades: {wf['n']} at {wf['mean'] * 100:+.3f}% mean net   vs   all trades in those folds: {wf['all_n']} at {wf['all_mean'] * 100:+.3f}%", file=sys.stderr)
+
+
+def unresolved_net_pnl(
+    highs: list[float], lows: list[float], closes: list[float], i: int, horizon: int,
+    barrier_pct: float, predicted_up: bool, round_trip_cost: float,
+) -> float | None:
+    """Net return of a trade the normal backtest drops: a timeout is marked
+    at the vertical barrier's close; a same-bar double touch is charged as a
+    stop-out (the paper trader's rule). None if the bar actually resolved."""
+    touch, long_return = triple_barrier_touch(highs, lows, closes, i, horizon, barrier_pct)
+    if touch is None:
+        return -barrier_pct - round_trip_cost if closes[i] != 0 and i + horizon < len(closes) else None
+    if touch != "timeout":
+        return None
+    return (long_return if predicted_up else -long_return) - round_trip_cost
+
+
+def unresolved_trades(per_symbol_test: list[dict], model) -> list[tuple[float, float, int, str]]:
+    """(confidence, net_pnl, prediction, symbol) for every unresolved bar
+    inside each symbol's test window -- the trades a live system would have
+    taken but the headline backtest never scores."""
+    rows, meta = [], []
+    for e in per_symbol_test:
+        if not e.get("idx_test") or not e.get("X_u"):
+            continue
+        lo, hi = min(e["idx_test"]), max(e["idx_test"])
+        for x, i in zip(e["X_u"], e["idx_u"]):
+            if lo <= i <= hi:
+                rows.append(x)
+                meta.append((e, i))
+    if not rows:
+        return []
+    proba = model.predict_proba(rows)
+    col = list(model.classes_).index(1)
+    out = []
+    for row_p, (e, i) in zip(proba, meta):
+        p_up = row_p[col]
+        barrier = e["barrier_pct"][i] if isinstance(e["barrier_pct"], dict) else e["barrier_pct"]
+        pnl = unresolved_net_pnl(e["highs"], e["lows"], e["closes"], i, e["horizon"], barrier, p_up >= 0.5, e["round_trip_cost"])
+        if pnl is not None:
+            out.append((abs(p_up - 0.5), pnl, 1 if p_up >= 0.5 else 0, e["symbol"]))
+    return out
+
+
+def print_timeout_report(resolved: dict, unresolved: dict) -> None:
+    print("\n=== timeout-inclusive confidence filter (every signal a live system would take) ===", file=sys.stderr)
+    print("  resolved = a barrier was touched in time (the headline population); unresolved = timeouts and same-bar double touches", file=sys.stderr)
+    full = {f: list(resolved.get(f, [])) + list(unresolved.get(f, [])) for f in sorted(set(resolved) | set(unresolved))}
+    print("  thresh | resolved n / mean | unresolved n / mean | unresolved share | FULL n / mean | folds>0 (full)", file=sys.stderr)
+    r_rows = {r["threshold"]: r for r in confidence_table(resolved)}
+    u_rows = {r["threshold"]: r for r in confidence_table(unresolved)}
+    for r in confidence_table(full):
+        t = r["threshold"]
+        rn, un = r_rows[t]["n"], u_rows[t]["n"]
+        share = un / (rn + un) if rn + un else 0.0
+        print(f"  {t:<6.2f} | {rn:>7} / {r_rows[t]['mean'] * 100:+7.3f}% | {un:>8} / {u_rows[t]['mean'] * 100:+7.3f}% | {share * 100:6.1f}% | {r['n']:>7} / {r['mean'] * 100:+7.3f}% | {r['folds_positive']}/{len(full)}", file=sys.stderr)
+        print("           full per-fold: " + "  ".join(f"{n}/{m * 100:+.2f}%" for n, m in (r["per_fold"][f] for f in sorted(full))), file=sys.stderr)
+    wf = confidence_walk_forward(full)
+    print(f"  walk-forward threshold choice on FULL trades: chosen { {f + 1: t for f, t in wf['chosen'].items()} }", file=sys.stderr)
+    print(f"    selected: {wf['n']} trades at {wf['mean'] * 100:+.3f}% mean net   vs   all trades in those folds: {wf['all_n']} at {wf['all_mean'] * 100:+.3f}%", file=sys.stderr)
 
 
 def _train_and_evaluate(
@@ -1749,6 +1831,7 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
     fold_results = []
     regime_acc: dict = {}
     confidence_acc: dict = {}
+    unresolved_acc: dict = {}
     for fold_idx in range(args.folds):
         X_train, y_train, X_test, y_test = [], [], [], []
         persistence_correct = persistence_total = 0
@@ -1775,6 +1858,8 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
                 "start": test_start,
                 "end": len(X_test),
                 "regimes": d.get("regimes"),
+                "X_u": d.get("X_u"),
+                "idx_u": d.get("idx_u"),
             })
             if d["label_scheme"] == "triple-barrier":
                 correct, total = persistence_correct_and_total_from_labels(d["closes"], sym_idx_test, sym_y_test, d["horizon"])
@@ -1796,7 +1881,9 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
         )
         fold_results.append(metrics)
         _print_fold_report(fold_idx, args.folds, metrics)
-        if getattr(args, "confidence_report", False):
+        if getattr(args, "timeout_report", False):
+            unresolved_acc[fold_idx] = unresolved_trades(per_symbol_test, metrics["model"])
+        if getattr(args, "confidence_report", False) or getattr(args, "timeout_report", False):
             proba = metrics["model"].predict_proba(X_test)
             col = list(metrics["model"].classes_).index(1)
             confidence_acc[fold_idx] = confidence_trades(
@@ -1813,8 +1900,10 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
         sys.exit(1)
 
     _print_walk_forward_summary(fold_results)
-    if getattr(args, "confidence_report", False):
+    if getattr(args, "confidence_report", False) or getattr(args, "timeout_report", False):
         print_confidence_report(confidence_acc, args.folds)
+    if getattr(args, "timeout_report", False):
+        print_timeout_report(confidence_acc, unresolved_acc)
     if getattr(args, "regime_report", False):
         print_regime_report(regime_acc, args.folds)
         print_gating_report(regime_acc, args.folds)
@@ -1858,6 +1947,7 @@ def add_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--htf-factor", type=int, default=EXTENDED_DEFAULTS["htf_factor"], help="Subsample factor for the coarser RSI-divergence view (4 = every 4th bar counting back from the latest).")
     parser.add_argument("--regime-report", action="store_true", help="With --folds > 1: after the walk-forward summary, break the held-out results down by market regime (trend: bull/bear/range from price vs EMA-200 and its slope; volatility: ATR%% terciles), using only data available at each bar. Diagnostic only -- trains no extra models.")
     parser.add_argument("--confidence-report", action="store_true", help="With --folds > 1: after the summary, show net P&L per trade when only the model's most confident trades (|P(up)-0.5| >= threshold) are taken, per fold and pooled, plus a walk-forward threshold choice made on earlier folds only. Diagnostic only.")
+    parser.add_argument("--timeout-report", action="store_true", help="With --folds > 1 and --label-scheme triple-barrier: also score the bars the normal dataset drops (timeouts and same-bar double touches) as trades, so the confidence table shows what a live system taking every signal would see. Evaluation only -- training still uses resolved bars alone. Implies --confidence-report.")
     parser.add_argument("--drop-features", type=str, default="", help="Comma-separated feature names to remove from the model input (ablation). Applied after the dataset is built, so labels/rows are unchanged.")
     parser.add_argument("--barrier-mode", choices=["fixed", "atr"], default="fixed", help="triple-barrier width: fixed (the fee-derived width, default) or atr (k x ATR%%, floored at the fee-derived width).")
     parser.add_argument("--atr-barrier-mult", type=float, default=3.0, help="k in --barrier-mode atr.")
