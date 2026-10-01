@@ -145,3 +145,25 @@ def test_model_meta_roundtrips_into_a_valid_registration():
         validate_meta(bad)
     with pytest.raises(ValueError):
         validate_meta({k: v for k, v in meta.items() if k != "horizon"})
+
+
+def test_confidence_filter_helpers():
+    from scripts.train_model import confidence_table, confidence_trades, confidence_walk_forward
+
+    # 6 bars; entry at i=0 with barrier 3%: bar 1 high touches upper only.
+    entry = {
+        "symbol": "A", "label_scheme": "triple-barrier", "idx_test": [0, 2], "start": 0, "end": 2,
+        "highs": [100, 104, 100, 100, 100, 100], "lows": [100, 100, 99, 99, 99, 99],
+        "closes": [100, 100, 100, 100, 100, 100], "horizon": 2, "barrier_pct": 0.03, "round_trip_cost": 0.01,
+    }
+    trades = confidence_trades([entry], [0.9, 0.55], [1, 1])
+    assert trades[0][0] == pytest.approx(0.4) and trades[0][1] == pytest.approx(0.02)
+    assert len(trades) == 2 and trades[1][1] == pytest.approx(-0.01)  # timeout flat, minus cost
+
+    acc = {0: [(0.3, 0.02, 1, "A"), (0.01, -0.03, 0, "A")], 1: [(0.3, 0.01, 1, "A"), (0.02, -0.02, 0, "A")]}
+    rows = {r["threshold"]: r for r in confidence_table(acc, thresholds=(0.0, 0.1))}
+    assert rows[0.0]["n"] == 4 and rows[0.1]["n"] == 2 and rows[0.1]["mean"] == pytest.approx(0.015)
+    assert rows[0.1]["folds_positive"] == 2
+    wf = confidence_walk_forward(acc, thresholds=(0.0, 0.1), min_trades=1)
+    assert wf["chosen"] == {1: 0.1} and wf["n"] == 1 and wf["mean"] == pytest.approx(0.01)
+    assert wf["all_n"] == 2

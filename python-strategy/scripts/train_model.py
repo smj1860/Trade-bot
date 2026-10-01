@@ -1471,6 +1471,93 @@ def resolve_symbols(conn, symbol_arg: str, interval_minutes: int) -> list[str]:
     return [s.strip() for s in symbol_arg.split(",") if s.strip()]
 
 
+CONFIDENCE_THRESHOLDS = (0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30)
+
+
+def confidence_trades(per_symbol_test: list[dict], proba_up: list[float], predictions: list[int]) -> list[tuple[float, float, int, str]]:
+    """One (confidence, net_pnl, prediction, symbol) record per simulated
+    triple-barrier trade of a fold's test set, where confidence is
+    |P(up) - 0.5| (0 = coin flip, 0.5 = certain). Same rows and same P&L as
+    the headline simulation (unresolvable touches are skipped), just with
+    the model's confidence attached so trades can be filtered by it."""
+    out = []
+    for e in per_symbol_test:
+        if e.get("label_scheme") != "triple-barrier":
+            continue
+        for k, i in enumerate(e["idx_test"]):
+            row = e["start"] + k
+            barrier = e["barrier_pct"][i] if isinstance(e["barrier_pct"], dict) else e["barrier_pct"]
+            pnl = triple_barrier_net_pnl(
+                e["highs"], e["lows"], e["closes"], i, e["horizon"], barrier, bool(predictions[row]), e["round_trip_cost"]
+            )
+            if pnl is not None:
+                out.append((abs(proba_up[row] - 0.5), pnl, int(predictions[row]), e["symbol"]))
+    return out
+
+
+def _mean(xs: list[float]) -> float:
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def confidence_table(acc: dict, thresholds=CONFIDENCE_THRESHOLDS) -> list[dict]:
+    """Per confidence threshold: each fold's (trades, mean net P&L) when only
+    trades with confidence >= threshold are taken, plus the pooled figure."""
+    rows = []
+    for t in thresholds:
+        per_fold = {}
+        pooled = []
+        for fold, trades in sorted(acc.items()):
+            kept = [p for c, p, _, _ in trades if c >= t]
+            per_fold[fold] = (len(kept), _mean(kept))
+            pooled.extend(kept)
+        rows.append({"threshold": t, "per_fold": per_fold, "n": len(pooled), "mean": _mean(pooled),
+                     "folds_positive": sum(1 for n, m in per_fold.values() if n and m > 0)})
+    return rows
+
+
+def confidence_walk_forward(acc: dict, thresholds=CONFIDENCE_THRESHOLDS, min_trades: int = 100) -> dict:
+    """Honest version of 'only take confident trades': for each fold after
+    the first, pick the threshold with the best mean net P&L on EARLIER
+    folds only (at least `min_trades` kept there) and apply it to this fold.
+    Returns the pooled outcome next to taking every trade in the same folds."""
+    folds = sorted(acc)
+    chosen, selected, everything = {}, [], []
+    for pos, fold in enumerate(folds):
+        if pos == 0:
+            continue
+        past = [tr for f in folds[:pos] for tr in acc[f]]
+        best, best_mean = None, None
+        for t in thresholds:
+            kept = [p for c, p, _, _ in past if c >= t]
+            if len(kept) < min_trades:
+                continue
+            m = _mean(kept)
+            if best_mean is None or m > best_mean:
+                best, best_mean = t, m
+        everything.extend(p for _, p, _, _ in acc[fold])
+        if best is None:
+            continue
+        chosen[fold] = best
+        selected.extend(p for c, p, _, _ in acc[fold] if c >= best)
+    return {"chosen": chosen, "n": len(selected), "mean": _mean(selected),
+            "all_n": len(everything), "all_mean": _mean(everything)}
+
+
+def print_confidence_report(acc: dict, n_folds: int) -> None:
+    print("\n=== confidence filter: net P&L per trade when only trades with |P(up)-0.5| >= threshold are taken ===", file=sys.stderr)
+    print("  (resolvable-touch trades only, like the headline figure; per-fold cells are n / mean net %)", file=sys.stderr)
+    folds = sorted(acc)
+    header = "  thresh   pooled n   pooled mean  folds>0 | " + " | ".join(f"fold {f + 1:<9}" for f in folds)
+    print(header, file=sys.stderr)
+    for r in confidence_table(acc):
+        cells = " | ".join(f"{n:>5}/{m * 100:+6.2f}%" for n, m in (r["per_fold"][f] for f in folds))
+        print(f"  {r['threshold']:<6.2f} {r['n']:>9}   {r['mean'] * 100:+9.3f}%   {r['folds_positive']}/{len(folds)}    | {cells}", file=sys.stderr)
+    wf = confidence_walk_forward(acc)
+    print("  walk-forward threshold choice (picked on earlier folds only, applied to the next):", file=sys.stderr)
+    print(f"    chosen thresholds by fold: { {f + 1: t for f, t in wf['chosen'].items()} }", file=sys.stderr)
+    print(f"    selected trades: {wf['n']} at {wf['mean'] * 100:+.3f}% mean net   vs   all trades in those folds: {wf['all_n']} at {wf['all_mean'] * 100:+.3f}%", file=sys.stderr)
+
+
 def _train_and_evaluate(
     X_train: list,
     y_train: list,
@@ -1661,6 +1748,7 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
 
     fold_results = []
     regime_acc: dict = {}
+    confidence_acc: dict = {}
     for fold_idx in range(args.folds):
         X_train, y_train, X_test, y_test = [], [], [], []
         persistence_correct = persistence_total = 0
@@ -1708,6 +1796,12 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
         )
         fold_results.append(metrics)
         _print_fold_report(fold_idx, args.folds, metrics)
+        if getattr(args, "confidence_report", False):
+            proba = metrics["model"].predict_proba(X_test)
+            col = list(metrics["model"].classes_).index(1)
+            confidence_acc[fold_idx] = confidence_trades(
+                per_symbol_test, [row[col] for row in proba], list(metrics["model"].predict(X_test))
+            )
         if getattr(args, "regime_report", False):
             majority_class = 1 if sum(y_train) >= len(y_train) / 2 else 0
             accumulate_regime_stats(
@@ -1719,6 +1813,8 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
         sys.exit(1)
 
     _print_walk_forward_summary(fold_results)
+    if getattr(args, "confidence_report", False):
+        print_confidence_report(confidence_acc, args.folds)
     if getattr(args, "regime_report", False):
         print_regime_report(regime_acc, args.folds)
         print_gating_report(regime_acc, args.folds)
@@ -1761,6 +1857,7 @@ def add_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--divergence-lookback", type=int, default=EXTENDED_DEFAULTS["divergence_lookback"])
     parser.add_argument("--htf-factor", type=int, default=EXTENDED_DEFAULTS["htf_factor"], help="Subsample factor for the coarser RSI-divergence view (4 = every 4th bar counting back from the latest).")
     parser.add_argument("--regime-report", action="store_true", help="With --folds > 1: after the walk-forward summary, break the held-out results down by market regime (trend: bull/bear/range from price vs EMA-200 and its slope; volatility: ATR%% terciles), using only data available at each bar. Diagnostic only -- trains no extra models.")
+    parser.add_argument("--confidence-report", action="store_true", help="With --folds > 1: after the summary, show net P&L per trade when only the model's most confident trades (|P(up)-0.5| >= threshold) are taken, per fold and pooled, plus a walk-forward threshold choice made on earlier folds only. Diagnostic only.")
     parser.add_argument("--drop-features", type=str, default="", help="Comma-separated feature names to remove from the model input (ablation). Applied after the dataset is built, so labels/rows are unchanged.")
     parser.add_argument("--barrier-mode", choices=["fixed", "atr"], default="fixed", help="triple-barrier width: fixed (the fee-derived width, default) or atr (k x ATR%%, floored at the fee-derived width).")
     parser.add_argument("--atr-barrier-mult", type=float, default=3.0, help="k in --barrier-mode atr.")
