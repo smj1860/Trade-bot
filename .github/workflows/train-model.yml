@@ -53,6 +53,10 @@ on:
         description: "Refuse to save the model on a gate FAIL verdict (default: warn only)"
         required: false
         default: "false"
+      register_arm:
+        description: "folds=1 only: also register the saved model for forward paper trading under this arm name (blank = don't)"
+        required: false
+        default: ""
 
 jobs:
   train:
@@ -102,5 +106,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: model-${{ github.run_id }}
-          path: python-strategy/models/*.joblib
+          path: |
+            python-strategy/models/*.joblib
+            python-strategy/models/*.json
           if-no-files-found: ignore
+
+      - name: Register model for paper trading
+        if: ${{ github.event.inputs.register_arm != '' && github.event.inputs.folds == '1' }}
+        working-directory: python-strategy
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: python scripts/register_paper_model.py --arm "${{ github.event.inputs.register_arm }}" --model models/pooled_${{ github.event.inputs.kind }}.joblib

@@ -1797,6 +1797,61 @@ def add_dataset_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+WINDOW_ARG_NAMES = (
+    "sma_window", "ema_window", "rsi_window", "vol_window", "bar_momentum_window", "bollinger_window",
+    "bollinger_num_std", "ao_fast_window", "ao_slow_window", "macd_fast_window", "macd_slow_window",
+    "macd_signal_window", "cci_window", "williams_r_window",
+)
+
+
+def build_model_meta(args: argparse.Namespace, datasets: list[dict], metrics: dict) -> dict:
+    """Sidecar written next to a saved model (``<model>.json``) so a consumer
+    -- scripts/paper_trade.py -- can rebuild the exact feature vector and
+    barrier the model was trained for without guessing. Everything here is
+    already determined by the run's arguments and datasets."""
+    extended = None
+    if getattr(args, "extended_features", False):
+        extended = {
+            "ema_long_window": args.ema_long_window,
+            "vwap_window": args.vwap_window,
+            "atr_window": args.atr_window,
+            "divergence_lookback": args.divergence_lookback,
+            "htf_factor": args.htf_factor,
+        }
+    fib = {"windows": list(FIB_DEFAULTS["windows"])} if getattr(args, "fib_features", False) else None
+    drop = {n.strip() for n in (getattr(args, "drop_features", "") or "").split(",") if n.strip()}
+    order = [n for n in active_feature_order(extended, FIB_DEFAULTS if fib else None) if n not in drop]
+    barrier_by_symbol = {
+        d["symbol"]: (d["barrier_pct"] if not isinstance(d["barrier_pct"], dict) else None) for d in datasets
+    }
+    return {
+        "feature_order": order,
+        "windows": {k: getattr(args, k) for k in WINDOW_ARG_NAMES},
+        "extended": extended,
+        "fib": fib,
+        "interval_minutes": int(args.interval),
+        "horizon": args.horizon,
+        "label_scheme": args.label_scheme,
+        "barrier_mode": getattr(args, "barrier_mode", "fixed"),
+        "barrier_by_symbol": barrier_by_symbol,
+        "round_trip_cost": datasets[0]["round_trip_cost"],
+        "taker_fee": args.taker_fee,
+        "slippage": args.slippage,
+        "profit_margin": args.profit_margin,
+        "kind": args.kind,
+        "sklearn_version": __import__("sklearn").__version__,
+        "holdout_days": args.holdout_days,
+        "test_fraction": args.test_fraction,
+        "symbols": [d["symbol"] for d in datasets],
+        "backtest": {
+            "accuracy": metrics["model_accuracy"],
+            "majority_baseline": metrics["baseline_accuracy"],
+            "mean_net_pnl": metrics["model_mean_pnl"],
+            "trades": metrics["model_pnl_count"],
+        },
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_dataset_args(parser)
@@ -2007,8 +2062,11 @@ def main() -> None:
         model_out = f"models/{datasets[0]['symbol'].lower().replace('-', '_')}_{args.kind}.joblib"
     Path(model_out).parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, model_out)
+    meta_out = str(Path(model_out).with_suffix(".json"))
+    with open(meta_out, "w") as f:
+        json.dump(build_model_meta(args, datasets, metrics), f, indent=2)
 
-    label = f"pooled across {len(datasets)} symbols" if pooling else datasets[0]["symbol"]
+    label =f"pooled across {len(datasets)} symbols" if pooling else datasets[0]["symbol"]
     print(f"[{label}] interval={args.interval}min, "
           f"{len(X_train)} train / {len(X_test)} test rows total (time-ordered split)", file=sys.stderr)
     print(f"  model accuracy:              {model_accuracy:.3f}", file=sys.stderr)

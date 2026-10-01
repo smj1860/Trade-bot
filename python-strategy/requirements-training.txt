@@ -4,3 +4,4 @@
 # needs. Also install requirements-ml.txt (scikit-learn, joblib) alongside
 # this — train_model.py needs both.
 psycopg2-binary
+requests
