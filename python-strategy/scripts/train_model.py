@@ -907,7 +907,7 @@ def accumulate_regime_stats(acc: dict, fold_idx: int, model_predictions: list[in
                 else:
                     pnls[name] = net_pnl(closes, i, horizon, bool(pred), entry["round_trip_cost"])
             side = "long" if preds["model"] == 1 else "short"
-            for dim, label in (("trend", reg[0]), ("vol", reg[1]), ("side", side), ("all", "all")):
+            for dim, label in (("trend", reg[0]), ("vol", reg[1]), ("side", side), ("cell", f"{reg[0]}|{reg[1]}"), ("all", "all")):
                 b = acc.setdefault((fold_idx, dim, label), _regime_new_bucket())
                 b["n"] += 1
                 b["model_ok"] += int(preds["model"] == actual)
@@ -955,6 +955,76 @@ def print_regime_report(acc: dict, n_folds: int) -> None:
                 f"  {dim + ':' + label if dim != 'all' else 'ALL':<14}{n:>8}{n / total_rows:>7.0%}  {ma:>6.3f}{xa:>7.3f}{pa:>8.3f}  {100 * (ma - max(xa, pa)):>+8.1f}p   {mp:>+10.4f}{pp:>+10.4f}{100 * (mp - max(pp, tot['pnl_maj'] / pn)):>+9.2f}p  {beat_acc}/{cells} , {beat_pnl}/{cells}",
                 file=sys.stderr,
             )
+
+
+def gating_evaluation(acc: dict, n_folds: int, min_rows: int = 200) -> dict:
+    """Walk-forward regime gating, evaluated honestly: for each fold k >= 1,
+    choose which trend|volatility cells to trade using ONLY folds < k (a
+    cell is selected when, pooled over those earlier folds, it has at least
+    `min_rows` rows with net-P&L and the model's mean net P&L beat the
+    better of the two baselines' mean net P&L in that cell), then score
+    fold k on just the selected cells. Fold 0 has no history to select from
+    and is skipped. Every number in the result for fold k used no
+    information from fold k or later. Returns {"folds": [per-fold dicts],
+    "gated": totals, "ungated": totals over the same evaluated folds}."""
+    cells = sorted({label for (f, dim, label) in acc if dim == "cell"})
+    def _tot():
+        return {"n": 0, "model_ok": 0, "per_ok": 0, "maj_ok": 0, "pnl_n": 0, "pnl_m": 0.0, "pnl_per": 0.0, "pnl_maj": 0.0}
+    def _add(t, b):
+        for k in t:
+            t[k] += b[k]
+    out_folds = []
+    gated, ungated = _tot(), _tot()
+    for k in range(1, n_folds):
+        prior = {}
+        for c in cells:
+            t = _tot()
+            for f in range(k):
+                b = acc.get((f, "cell", c))
+                if b:
+                    _add(t, b)
+            prior[c] = t
+        chosen = []
+        for c, t in prior.items():
+            if t["pnl_n"] >= min_rows:
+                m = t["pnl_m"] / t["pnl_n"]
+                best = max(t["pnl_per"], t["pnl_maj"]) / t["pnl_n"]
+                if m > best:
+                    chosen.append(c)
+        g, u = _tot(), _tot()
+        for c in cells:
+            b = acc.get((k, "cell", c))
+            if not b:
+                continue
+            _add(u, b)
+            if c in chosen:
+                _add(g, b)
+        _add(gated, g)
+        _add(ungated, u)
+        out_folds.append({"fold": k, "chosen": chosen, "gated": g, "ungated": u})
+    return {"folds": out_folds, "gated": gated, "ungated": ungated}
+
+
+def print_gating_report(acc: dict, n_folds: int, min_rows: int = 200) -> None:
+    res = gating_evaluation(acc, n_folds, min_rows)
+    def _line(label, t):
+        if t["n"] == 0:
+            return f"  {label:<22}{'no trades':>10}"
+        pn = max(t["pnl_n"], 1)
+        return (
+            f"  {label:<22}{t['n']:>8} rows  acc {t['model_ok'] / t['n']:.3f} (persist {t['per_ok'] / t['n']:.3f})"
+            f"  P&L/trade {t['pnl_m'] / pn:+.4f} (persist {t['pnl_per'] / pn:+.4f}, majority {t['pnl_maj'] / pn:+.4f})"
+        )
+    print(f"\n--- walk-forward regime gating (cells chosen on earlier folds only; min {min_rows} rows) ---", file=sys.stderr)
+    for f in res["folds"]:
+        print(f"[fold {f['fold'] + 1}/{n_folds}] trade cells: {', '.join(f['chosen']) or 'none'}", file=sys.stderr)
+        print(_line("  gated", f["gated"]), file=sys.stderr)
+        print(_line("  ungated (all cells)", f["ungated"]), file=sys.stderr)
+    print("  pooled over evaluated folds:", file=sys.stderr)
+    print(_line("gated", res["gated"]), file=sys.stderr)
+    print(_line("ungated", res["ungated"]), file=sys.stderr)
+    if res["ungated"]["n"]:
+        print(f"  coverage: {100 * res['gated']['n'] / res['ungated']['n']:.0f}% of rows traded", file=sys.stderr)
 
 
 def persistence_correct_and_total_from_labels(
@@ -1651,6 +1721,7 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
     _print_walk_forward_summary(fold_results)
     if getattr(args, "regime_report", False):
         print_regime_report(regime_acc, args.folds)
+        print_gating_report(regime_acc, args.folds)
 
 
 def add_dataset_args(parser: argparse.ArgumentParser) -> None:

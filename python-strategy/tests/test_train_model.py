@@ -999,3 +999,28 @@ def test_regime_stats_include_model_side_buckets():
     accumulate_regime_stats(acc, 0, [1, 0, 0], [1, 1, 1], 1, [entry])
     assert acc[(0, "side", "long")]["n"] == 1 and acc[(0, "side", "short")]["n"] == 2
     assert acc[(0, "side", "long")]["model_ok"] == 1 and acc[(0, "side", "short")]["model_ok"] == 0
+
+
+def _cell(n, model_ok, per_ok, maj_ok, pm, pper, pmaj):
+    return {"n": n, "model_ok": model_ok, "per_ok": per_ok, "maj_ok": maj_ok, "pnl_n": n,
+            "pnl_m": pm * n, "pnl_per": pper * n, "pnl_maj": pmaj * n}
+
+
+def test_gating_selects_on_prior_folds_only():
+    from scripts.train_model import gating_evaluation
+
+    acc = {}
+    # Cell A: model beats baselines in folds 0-1, and in fold 2 collapses.
+    # Cell B: model loses to baselines in every fold.
+    for f in range(3):
+        acc[(f, "cell", "bear|high_vol")] = _cell(300, 190, 160, 150, -0.005, -0.012, -0.013) if f < 2 else _cell(300, 120, 160, 150, -0.030, -0.012, -0.013)
+        acc[(f, "cell", "bull|low_vol")] = _cell(300, 140, 160, 150, -0.02, -0.01, -0.012)
+    res = gating_evaluation(acc, 3, min_rows=200)
+    assert [f["fold"] for f in res["folds"]] == [1, 2]
+    assert res["folds"][0]["chosen"] == ["bear|high_vol"]  # chosen from fold 0 alone
+    assert res["folds"][1]["chosen"] == ["bear|high_vol"]
+    # fold 2's collapse is what the gate gets scored on -- no peeking
+    assert res["folds"][1]["gated"]["n"] == 300 and res["folds"][1]["gated"]["model_ok"] == 120
+    assert res["ungated"]["n"] == 1200
+    # min_rows blocks selection from thin history
+    assert gating_evaluation(acc, 3, min_rows=10_000)["folds"][0]["chosen"] == []
