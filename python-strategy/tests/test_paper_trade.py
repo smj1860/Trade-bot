@@ -190,3 +190,36 @@ def test_unresolved_rows_and_pnl():
     assert unresolved_net_pnl(highs, lows, closes, 20, 3, 0.03, False, 0.01) == pytest.approx(-0.01)
     resolved_i = next(iter(ir), None)
     assert resolved_i is None or unresolved_net_pnl(highs, lows, closes, resolved_i, 3, 0.03, True, 0.01) is None
+
+
+def test_two_stage_trades_and_variants():
+    from scripts.train_model import confidence_table, two_stage_trades, two_stage_variants
+
+    class M:
+        def __init__(self, classes, col1):
+            self.classes_ = classes
+            self.col1 = col1
+
+        def predict_proba(self, X):
+            return [[1 - r[self.col1], r[self.col1]] for r in X]
+
+    n = 30
+    highs = [100.0] * n; lows = [100.0] * n; closes = [100.0] * n
+    highs[6] = 104.0  # entry 5 (long) hits the 3% target next bar
+    e = {
+        "symbol": "A", "label_scheme": "triple-barrier", "idx_test": [5, 15], "start": 0, "end": 2,
+        "highs": highs, "lows": lows, "closes": closes, "horizon": 2, "barrier_pct": 0.03, "round_trip_cost": 0.01,
+        "X_u": [[0.1, 0.2]], "idx_u": [10], "u_move": [0],
+    }
+    X_test = [[0.9, 0.8], [0.9, 0.8]]  # column 0 -> P(up)=0.9 ; column 1 -> P(move)=0.8 for the fakes below
+    dir_model, move_model = M([0, 1], 0), M([0, 1], 1)
+    recs = two_stage_trades([e], X_test, dir_model, move_model)
+    assert len(recs) == 3  # two test rows + one unresolved row inside the window
+    resolved = max(recs, key=lambda r: r[1])
+    assert resolved[0] == pytest.approx(0.8) and resolved[1] == pytest.approx(0.02) and resolved[2] == 1
+    flat = next(r for r in recs if r[5] == 0)
+    assert flat[1] == pytest.approx(-0.01)  # timeout: flat price, minus cost
+    assert two_stage_variants({0: recs}, 0.45)[0][0][0] == -1.0  # below the direction floor -> excluded
+    acc = two_stage_variants({0: recs}, min_direction_confidence=0.35)
+    rows = {r["threshold"]: r for r in confidence_table(acc, (0.0, 0.5))}
+    assert rows[0.0]["n"] == 3 and rows[0.5]["n"] == 2

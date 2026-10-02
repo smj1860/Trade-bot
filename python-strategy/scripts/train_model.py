@@ -1419,7 +1419,7 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
         fib=fib,
     )
     X_u, idx_u = [], []
-    if getattr(window_args, "timeout_report", False) and label_scheme == "triple-barrier":
+    if (getattr(window_args, "timeout_report", False) or getattr(window_args, "two_stage_report", False)) and label_scheme == "triple-barrier":
         X_u, _, idx_u = build_dataset(
             closes, midpoints, highs, lows, volumes,
             window_args.sma_window, window_args.ema_window, window_args.rsi_window, window_args.vol_window,
@@ -1430,6 +1430,11 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
             horizon=horizon, min_move_threshold=min_move_threshold, label_scheme=label_scheme,
             extended=extended, barrier_fn=barrier_fn, fib=fib, unresolved_only=True,
         )
+    u_move = []
+    for i in idx_u:
+        b = barrier_fn(i) if barrier_fn is not None else min_move_threshold
+        touch, _ = triple_barrier_touch(highs, lows, closes, i, horizon, b)
+        u_move.append(1 if touch is None else 0)  # same-bar double touch = a big move happened; timeout = no
     drop = [n for n in (getattr(window_args, "drop_features", "") or "").split(",") if n.strip()]
     if drop:
         order = active_feature_order(extended, fib)
@@ -1457,6 +1462,7 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
         "indices": indices,
         "X_u": X_u,  # unresolved bars, evaluation only (--timeout-report)
         "idx_u": idx_u,
+        "u_move": u_move,
     }
 
 
@@ -1638,6 +1644,76 @@ def print_timeout_report(resolved: dict, unresolved: dict) -> None:
     wf = confidence_walk_forward(full)
     print(f"  walk-forward threshold choice on FULL trades: chosen { {f + 1: t for f, t in wf['chosen'].items()} }", file=sys.stderr)
     print(f"    selected: {wf['n']} trades at {wf['mean'] * 100:+.3f}% mean net   vs   all trades in those folds: {wf['all_n']} at {wf['all_mean'] * 100:+.3f}%", file=sys.stderr)
+
+
+TWO_STAGE_THRESHOLDS = (0.0, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70)
+
+
+def two_stage_trades(per_symbol_test: list[dict], X_test: list, dir_model, move_model) -> list[tuple]:
+    """Scores every bar of each symbol's test window -- resolved AND
+    unresolved -- with both stages. Returns (p_move, net_pnl, prediction,
+    symbol, direction_confidence, moved) per bar, where p_move is stage 1's
+    P(a barrier is hit in time), prediction/direction_confidence come from
+    stage 2 (the direction model), and `moved` is the true stage-1 label."""
+    rows, meta = [], []
+    for e in per_symbol_test:
+        if e.get("label_scheme") != "triple-barrier":
+            continue
+        for k, i in enumerate(e["idx_test"]):
+            rows.append(X_test[e["start"] + k])
+            meta.append((e, i, True, 1))
+        if e.get("idx_test") and e.get("X_u"):
+            lo, hi = min(e["idx_test"]), max(e["idx_test"])
+            for x, i, m in zip(e["X_u"], e["idx_u"], e["u_move"]):
+                if lo <= i <= hi:
+                    rows.append(x)
+                    meta.append((e, i, False, m))
+    if not rows:
+        return []
+    up_col = list(dir_model.classes_).index(1)
+    mv_col = list(move_model.classes_).index(1)
+    p_up = [r[up_col] for r in dir_model.predict_proba(rows)]
+    p_mv = [r[mv_col] for r in move_model.predict_proba(rows)]
+    out = []
+    for pu, pm, (e, i, resolved, moved) in zip(p_up, p_mv, meta):
+        barrier = e["barrier_pct"][i] if isinstance(e["barrier_pct"], dict) else e["barrier_pct"]
+        up = pu >= 0.5
+        if resolved:
+            pnl = triple_barrier_net_pnl(e["highs"], e["lows"], e["closes"], i, e["horizon"], barrier, up, e["round_trip_cost"])
+        else:
+            pnl = unresolved_net_pnl(e["highs"], e["lows"], e["closes"], i, e["horizon"], barrier, up, e["round_trip_cost"])
+        if pnl is not None:
+            out.append((pm, pnl, 1 if up else 0, e["symbol"], abs(pu - 0.5), moved))
+    return out
+
+
+def two_stage_variants(recs_by_fold: dict, min_direction_confidence: float) -> dict:
+    """Re-keys each fold's records for confidence_table/confidence_walk_forward,
+    with the stage-1 probability as the 'confidence' and trades below the
+    stage-2 direction-confidence floor pushed out of every threshold."""
+    return {
+        f: [(pm if dc >= min_direction_confidence else -1.0, pnl, pred, sym) for pm, pnl, pred, sym, dc, _ in recs]
+        for f, recs in recs_by_fold.items()
+    }
+
+
+def print_two_stage_report(recs_by_fold: dict, auc_by_fold: dict) -> None:
+    folds = sorted(recs_by_fold)
+    print("\n=== two-stage model: stage 1 = P(a barrier is hit in time), stage 2 = direction; all bars scored incl. timeouts ===", file=sys.stderr)
+    for f in folds:
+        recs = recs_by_fold[f]
+        base = sum(r[5] for r in recs) / len(recs) if recs else 0.0
+        auc = auc_by_fold.get(f)
+        print(f"  fold {f + 1}: {len(recs)} bars, true move rate {base * 100:.1f}%, stage-1 AUC {auc:.3f}" if auc is not None else f"  fold {f + 1}: {len(recs)} bars, true move rate {base * 100:.1f}%", file=sys.stderr)
+    for floor in (0.0, 0.10):
+        acc = two_stage_variants(recs_by_fold, floor)
+        print(f"  -- trade when P(move) >= threshold AND direction confidence >= {floor:.2f} --", file=sys.stderr)
+        print("  thresh |  n trades | mean net | folds>0 | per-fold n/mean", file=sys.stderr)
+        for r in confidence_table(acc, TWO_STAGE_THRESHOLDS):
+            cells = "  ".join(f"{n}/{m * 100:+.2f}%" for n, m in (r["per_fold"][f] for f in folds))
+            print(f"  {r['threshold']:<6.2f} | {r['n']:>9} | {r['mean'] * 100:+7.3f}% | {r['folds_positive']}/{len(folds)}     | {cells}", file=sys.stderr)
+        wf = confidence_walk_forward(acc, TWO_STAGE_THRESHOLDS)
+        print(f"  walk-forward threshold choice (earlier folds only): { {f + 1: t for f, t in wf['chosen'].items()} } -> {wf['n']} trades at {wf['mean'] * 100:+.3f}%  vs all bars in those folds {wf['all_n']} at {wf['all_mean'] * 100:+.3f}%", file=sys.stderr)
 
 
 def _train_and_evaluate(
@@ -1832,7 +1908,11 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
     regime_acc: dict = {}
     confidence_acc: dict = {}
     unresolved_acc: dict = {}
+    two_stage_recs: dict = {}
+    two_stage_auc: dict = {}
+    two_stage = getattr(args, "two_stage_report", False)
     for fold_idx in range(args.folds):
+        X1, y1 = [], []  # stage-1 training set: every pre-boundary bar, labeled "a barrier was hit in time"
         X_train, y_train, X_test, y_test = [], [], [], []
         persistence_correct = persistence_total = 0
         per_symbol_test: list[dict] = []
@@ -1840,6 +1920,14 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
             if fold_idx >= len(folds):
                 continue  # this symbol ran out of usable folds before the others did
             sym_X_train, sym_y_train, _sym_idx_train, sym_X_test, sym_y_test, sym_idx_test = folds[fold_idx]
+            if two_stage and d.get("X_u") is not None:
+                cut = _sym_idx_train[-1] if _sym_idx_train else -1
+                for x, i, m in zip(d["X_u"], d["idx_u"], d["u_move"]):
+                    if i <= cut:
+                        X1.append(x)
+                        y1.append(m)
+                X1.extend(sym_X_train)
+                y1.extend([1] * len(sym_X_train))
             X_train.extend(sym_X_train)
             y_train.extend(sym_y_train)
             test_start = len(X_test)
@@ -1860,6 +1948,7 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
                 "regimes": d.get("regimes"),
                 "X_u": d.get("X_u"),
                 "idx_u": d.get("idx_u"),
+                "u_move": d.get("u_move"),
             })
             if d["label_scheme"] == "triple-barrier":
                 correct, total = persistence_correct_and_total_from_labels(d["closes"], sym_idx_test, sym_y_test, d["horizon"])
@@ -1883,6 +1972,16 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
         _print_fold_report(fold_idx, args.folds, metrics)
         if getattr(args, "timeout_report", False):
             unresolved_acc[fold_idx] = unresolved_trades(per_symbol_test, metrics["model"])
+        if two_stage and len(set(y1)) == 2:
+            from sklearn.ensemble import HistGradientBoostingClassifier
+            from sklearn.metrics import roc_auc_score
+
+            move_model = HistGradientBoostingClassifier(max_iter=150, random_state=0).fit(X1, y1)
+            recs = two_stage_trades(per_symbol_test, X_test, metrics["model"], move_model)
+            two_stage_recs[fold_idx] = recs
+            labels = [r[5] for r in recs]
+            if len(set(labels)) == 2:
+                two_stage_auc[fold_idx] = roc_auc_score(labels, [r[0] for r in recs])
         if getattr(args, "confidence_report", False) or getattr(args, "timeout_report", False):
             proba = metrics["model"].predict_proba(X_test)
             col = list(metrics["model"].classes_).index(1)
@@ -1904,6 +2003,8 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
         print_confidence_report(confidence_acc, args.folds)
     if getattr(args, "timeout_report", False):
         print_timeout_report(confidence_acc, unresolved_acc)
+    if two_stage and two_stage_recs:
+        print_two_stage_report(two_stage_recs, two_stage_auc)
     if getattr(args, "regime_report", False):
         print_regime_report(regime_acc, args.folds)
         print_gating_report(regime_acc, args.folds)
@@ -1948,6 +2049,7 @@ def add_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--regime-report", action="store_true", help="With --folds > 1: after the walk-forward summary, break the held-out results down by market regime (trend: bull/bear/range from price vs EMA-200 and its slope; volatility: ATR%% terciles), using only data available at each bar. Diagnostic only -- trains no extra models.")
     parser.add_argument("--confidence-report", action="store_true", help="With --folds > 1: after the summary, show net P&L per trade when only the model's most confident trades (|P(up)-0.5| >= threshold) are taken, per fold and pooled, plus a walk-forward threshold choice made on earlier folds only. Diagnostic only.")
     parser.add_argument("--timeout-report", action="store_true", help="With --folds > 1 and --label-scheme triple-barrier: also score the bars the normal dataset drops (timeouts and same-bar double touches) as trades, so the confidence table shows what a live system taking every signal would see. Evaluation only -- training still uses resolved bars alone. Implies --confidence-report.")
+    parser.add_argument("--two-stage-report", action="store_true", help="With --folds > 1 and --label-scheme triple-barrier: add a stage-1 model predicting whether a barrier will be hit in time (trained on every pre-boundary bar), combine it with the direction model, and report net P&L over ALL bars (timeouts included) when only high-P(move) bars are traded. Evaluation only.")
     parser.add_argument("--drop-features", type=str, default="", help="Comma-separated feature names to remove from the model input (ablation). Applied after the dataset is built, so labels/rows are unchanged.")
     parser.add_argument("--barrier-mode", choices=["fixed", "atr"], default="fixed", help="triple-barrier width: fixed (the fee-derived width, default) or atr (k x ATR%%, floored at the fee-derived width).")
     parser.add_argument("--atr-barrier-mult", type=float, default=3.0, help="k in --barrier-mode atr.")
