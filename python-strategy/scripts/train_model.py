@@ -256,6 +256,8 @@ from strategy.indicators import (
     cci,
     ema_ratio,
     fib_level_distance,
+    daily_context,
+    CONTEXT_FEATURES,
     macd_histogram,
     parkinson_vol,
     realized_vol,
@@ -314,8 +316,21 @@ FIB_FEATURES = ["fib_pos_55", "fib_pos_89", "fib_pos_144", "fib_dist_89", "fib_d
 FIB_DEFAULTS = {"windows": (55, 89, 144)}
 
 
-def active_feature_order(extended: dict | None, fib: dict | None) -> list[str]:
-    return FEATURE_ORDER + (EXTENDED_FEATURES if extended else []) + (FIB_FEATURES if fib else [])
+CONTEXT_DEFAULTS = {"ema_window": 50, "rsi_window": 14, "atr_window": 14, "range_window": 20, "mom_days": 7}
+
+
+def active_feature_order(extended: dict | None, fib: dict | None, context: dict | None = None) -> list[str]:
+    return (
+        FEATURE_ORDER
+        + (EXTENDED_FEATURES if extended else [])
+        + (FIB_FEATURES if fib else [])
+        + (CONTEXT_FEATURES if context else [])
+    )
+
+
+def context_blocks_needed(context: dict) -> int:
+    return max(context["ema_window"], context["rsi_window"] + 1, context["atr_window"] + 1,
+               context["range_window"], context["mom_days"] + 1)
 
 
 EXTENDED_DEFAULTS = {
@@ -464,6 +479,7 @@ def features_at(
     williams_r_window: int,
     extended: dict | None = None,
     fib: dict | None = None,
+    context: dict | None = None,
 ) -> dict[str, float]:
     """The feature vector as of bar `i`, using the same window-slicing
     convention strategy/features.py's FeatureEngine applies live via
@@ -538,6 +554,14 @@ def features_at(
         out["fib_pos_144"] = range_position(*_rng(w144))
         out["fib_dist_89"] = fib_level_distance(*_rng(w89))
         out["fib_dist_144"] = fib_level_distance(*_rng(w144))
+    if context:
+        f = context["factor"]
+        c0 = max(0, i - context_blocks_needed(context) * f + 1)
+        out.update(daily_context(
+            closes[c0 : i + 1], highs[c0 : i + 1], lows[c0 : i + 1], f,
+            context["ema_window"], context["rsi_window"], context["atr_window"],
+            context["range_window"], context["mom_days"],
+        ))
     return out
 
 
@@ -555,6 +579,7 @@ def dataset_warmup(
     williams_r_window: int,
     extended: dict | None = None,
     fib: dict | None = None,
+    context: dict | None = None,
 ) -> int:
     """The number of bars needed before every indicator's window has a
     full history — shared by build_dataset (to know where to start) and
@@ -574,6 +599,8 @@ def dataset_warmup(
     )
     if fib:
         base = max(base, max(fib["windows"]))
+    if context:
+        base = max(base, context_blocks_needed(context) * context["factor"])
     if not extended:
         return base
     div_need = rsi_window + extended["divergence_lookback"] + 1
@@ -1077,6 +1104,7 @@ def build_dataset(
     barrier_fn=None,
     fib: dict | None = None,
     unresolved_only: bool = False,
+    context: dict | None = None,
 ) -> tuple[list[list[float]], list[int], list[int]]:
     """Builds (X, y, indices) — X rows in FEATURE_ORDER, `indices` is the
     bar index `i` each row was computed as-of (needed by callers to score a
@@ -1104,9 +1132,9 @@ def build_dataset(
     warmup = dataset_warmup(
         sma_window, ema_window, rsi_window, vol_window, bar_momentum_window,
         bollinger_window, ao_slow_window, macd_slow_window, macd_signal_window,
-        cci_window, williams_r_window, extended, fib,
+        cci_window, williams_r_window, extended, fib, context,
     )
-    feature_order = active_feature_order(extended, fib)
+    feature_order = active_feature_order(extended, fib, context)
     X: list[list[float]] = []
     y: list[int] = []
     indices: list[int] = []
@@ -1152,6 +1180,7 @@ def build_dataset(
             williams_r_window,
             extended,
             fib,
+            context,
         )
         X.append([feats[name] for name in feature_order])
         y.append(label)
@@ -1343,6 +1372,9 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
             "htf_factor": window_args.htf_factor,
         }
     fib = {"windows": FIB_DEFAULTS["windows"]} if getattr(window_args, "fib_features", False) else None
+    context = None
+    if getattr(window_args, "context_features", False):
+        context = dict(CONTEXT_DEFAULTS, ema_window=window_args.context_ema_window, factor=max(1, 1440 // interval_minutes))
     barrier_mode = getattr(window_args, "barrier_mode", "fixed")
     atr_mult = getattr(window_args, "atr_barrier_mult", 3.0)
     atr_window = getattr(window_args, "atr_window", 14)
@@ -1367,6 +1399,7 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
         window_args.williams_r_window,
         extended,
         fib,
+        context,
     )
     min_required = warmup + horizon + 10  # a little slack beyond bare warmup so there's an actual dataset, not one row
     if len(closes) < min_required:
@@ -1417,6 +1450,7 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
         extended=extended,
         barrier_fn=barrier_fn,
         fib=fib,
+        context=context,
     )
     X_u, idx_u = [], []
     if (getattr(window_args, "timeout_report", False) or getattr(window_args, "two_stage_report", False)) and label_scheme == "triple-barrier":
@@ -1428,7 +1462,7 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
             window_args.macd_slow_window, window_args.macd_signal_window, window_args.cci_window,
             window_args.williams_r_window,
             horizon=horizon, min_move_threshold=min_move_threshold, label_scheme=label_scheme,
-            extended=extended, barrier_fn=barrier_fn, fib=fib, unresolved_only=True,
+            extended=extended, barrier_fn=barrier_fn, fib=fib, unresolved_only=True, context=context,
         )
     u_move = []
     for i in idx_u:
@@ -1437,7 +1471,7 @@ def load_symbol_dataset(conn, symbol: str, interval_minutes: int, window_args: a
         u_move.append(1 if touch is None else 0)  # same-bar double touch = a big move happened; timeout = no
     drop = [n for n in (getattr(window_args, "drop_features", "") or "").split(",") if n.strip()]
     if drop:
-        order = active_feature_order(extended, fib)
+        order = active_feature_order(extended, fib, context)
         unknown = [n for n in drop if n.strip() not in order]
         if unknown:
             print(f"error: --drop-features names not in the active feature set: {unknown}", file=sys.stderr)
@@ -2041,6 +2075,8 @@ def add_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--horizon", type=int, default=1, help="Label bar i by the direction of the move to bar i+horizon (default 1 = next-bar direction).")
     parser.add_argument("--extended-features", action="store_true", help="Add the extended feature set (EMA-200 ratio, rolling VWAP ratio, ATR%%, RSI divergence on the base timeframe and a rolling 4x-subsampled timeframe). Off by default so the base feature set stays the control.")
     parser.add_argument("--fib-features", action="store_true", help="Add Fibonacci range features (position within the rolling 55/89/144-bar high-low range, plus signed distance to the nearest Fibonacci retracement level of the 89/144-bar range). Combinable with --extended-features.")
+    parser.add_argument("--context-features", action="store_true", help="Add daily-scale trend/regime context computed causally from the base bars (rolling 1440/interval-bar blocks): EMA ratio, RSI, ATR%%, 20-day range position and 7-day momentum of the daily series. Combinable with --extended-features/--fib-features.")
+    parser.add_argument("--context-ema-window", type=int, default=CONTEXT_DEFAULTS["ema_window"], help="EMA length (in days) for the daily context EMA ratio.")
     parser.add_argument("--ema-long-window", type=int, default=EXTENDED_DEFAULTS["ema_long_window"])
     parser.add_argument("--vwap-window", type=int, default=EXTENDED_DEFAULTS["vwap_window"])
     parser.add_argument("--atr-window", type=int, default=EXTENDED_DEFAULTS["atr_window"])
@@ -2109,7 +2145,10 @@ def build_model_meta(args: argparse.Namespace, datasets: list[dict], metrics: di
         }
     fib = {"windows": list(FIB_DEFAULTS["windows"])} if getattr(args, "fib_features", False) else None
     drop = {n.strip() for n in (getattr(args, "drop_features", "") or "").split(",") if n.strip()}
-    order = [n for n in active_feature_order(extended, FIB_DEFAULTS if fib else None) if n not in drop]
+    context = None
+    if getattr(args, "context_features", False):
+        context = dict(CONTEXT_DEFAULTS, ema_window=args.context_ema_window, factor=max(1, 1440 // int(args.interval)))
+    order = [n for n in active_feature_order(extended, FIB_DEFAULTS if fib else None, context) if n not in drop]
     barrier_by_symbol = {
         d["symbol"]: (d["barrier_pct"] if not isinstance(d["barrier_pct"], dict) else None) for d in datasets
     }
@@ -2118,6 +2157,7 @@ def build_model_meta(args: argparse.Namespace, datasets: list[dict], metrics: di
         "windows": {k: getattr(args, k) for k in WINDOW_ARG_NAMES},
         "extended": extended,
         "fib": fib,
+        "context": context,
         "interval_minutes": int(args.interval),
         "horizon": args.horizon,
         "label_scheme": args.label_scheme,

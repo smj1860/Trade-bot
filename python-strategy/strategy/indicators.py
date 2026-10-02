@@ -498,3 +498,54 @@ def fib_level_distance(closes: Sequence[float], highs: Sequence[float], lows: Se
     pos = range_position(closes, highs, lows)
     nearest = min(FIB_LEVELS, key=lambda lv: abs(pos - lv))
     return pos - nearest
+
+
+def rolling_blocks(
+    closes: Sequence[float], highs: Sequence[float], lows: Sequence[float], factor: int, n_blocks: int
+) -> tuple[list[float], list[float], list[float]]:
+    """Causal coarser-timeframe view built from the base bars alone: the last
+    `n_blocks` blocks of `factor` bars each, counting back from the LATEST bar
+    (so the newest block always ends at the current bar and a block is never
+    partial). A block's close is its last close, high the max of its highs,
+    low the min of its lows. Oldest block first. Returns shorter lists when
+    there is not enough history. No timestamps, so it is identical in
+    training and live and independent of where a calendar day starts."""
+    n = len(closes)
+    if factor < 1 or n == 0 or len(highs) != n or len(lows) != n:
+        return [], [], []
+    k = min(n_blocks, n // factor)
+    bc, bh, bl = [], [], []
+    for b in range(k - 1, -1, -1):
+        end = n - b * factor
+        start = end - factor
+        bc.append(closes[end - 1])
+        bh.append(max(highs[start:end]))
+        bl.append(min(lows[start:end]))
+    return bc, bh, bl
+
+
+CONTEXT_FEATURES = ["d_ema_ratio", "d_rsi", "d_atr_pct", "d_range_pos", "d_momentum"]
+
+
+def daily_context(
+    closes: Sequence[float], highs: Sequence[float], lows: Sequence[float], factor: int,
+    ema_window: int = 50, rsi_window: int = 14, atr_window: int = 14, range_window: int = 20, mom_days: int = 7,
+) -> dict[str, float]:
+    """Trend/regime context from rolling `factor`-bar blocks (factor = bars
+    per day when the blocks are meant to be days). Neutral defaults (0.0, range
+    position 0.5; RSI here is scaled to [-1, 1] so neutral is 0.0) when the history is too short, matching how the
+    other indicators here report 'no opinion'."""
+    need = max(ema_window, rsi_window + 1, atr_window + 1, range_window, mom_days + 1)
+    bc, bh, bl = rolling_blocks(closes, highs, lows, factor, need)
+    out = {"d_ema_ratio": 0.0, "d_rsi": 0.0, "d_atr_pct": 0.0, "d_range_pos": 0.5, "d_momentum": 0.0}
+    if len(bc) >= ema_window:
+        out["d_ema_ratio"] = ema_ratio(bc[-ema_window:])
+    if len(bc) >= rsi_window + 1:
+        out["d_rsi"] = rsi(bc[-(rsi_window + 1):])
+    if len(bc) >= atr_window + 1:
+        out["d_atr_pct"] = atr_pct(bc[-(atr_window + 1):], bh[-(atr_window + 1):], bl[-(atr_window + 1):])
+    if len(bc) >= range_window:
+        out["d_range_pos"] = range_position(bc[-range_window:], bh[-range_window:], bl[-range_window:])
+    if len(bc) >= mom_days + 1 and bc[-(mom_days + 1)] > 0:
+        out["d_momentum"] = bc[-1] / bc[-(mom_days + 1)] - 1.0
+    return out

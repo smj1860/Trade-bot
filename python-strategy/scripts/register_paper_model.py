@@ -32,6 +32,8 @@ def validate_meta(meta: dict) -> None:
         raise ValueError("paper trading supports only fixed barriers (--barrier-mode fixed)")
     if meta.get("label_scheme") != "triple-barrier":
         raise ValueError("paper trading supports only --label-scheme triple-barrier models")
+    if meta.get("context"):
+        raise ValueError("paper trading does not support --context-features models yet (needs 1200+ candles and live parity)")
     if any(v is None for v in meta["barrier_by_symbol"].values()):
         raise ValueError("barrier_by_symbol has a symbol without a fixed barrier")
 
