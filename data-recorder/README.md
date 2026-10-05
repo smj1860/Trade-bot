@@ -25,11 +25,20 @@ for fresh snapshots. Treat data between a `checksum_mismatch` and the next `snap
 ## Run
 
     pip install -r data-recorder/requirements.txt
-    cd data-recorder && python -m recorder.main --out ./data            # forever, depth 100
+    cd data-recorder && python -m recorder.main --out ./data            # forever, depth 25
     python -m recorder.main --out ./data --duration 120 --symbols BTC/USD,ETH/USD   # quick test
 
-Depth 100 is the default (10, 25, 100, 500, 1000 are valid). Deeper is more data; the checksum only
-covers the top 10 either way. Tardis captures depth 1000 if you later want to compare.
+Depth 25 is the default (10, 25, 100, 500, 1000 are valid). The checksum only covers the top 10 either
+way. Measured on live Kraken, all 14 symbols, 3-minute evening (UTC) windows, so treat as order of magnitude:
+
+| depth | compressed | per hour | per day | per month |
+|---|---|---|---|---|
+| 10  | 2.5 MB / 3 min | ~50 MB  | ~1.2 GB | ~36 GB |
+| 25  | 3.6 MB / 3 min | ~72 MB  | ~1.7 GB | ~52 GB |
+| 100 | 5.4 MB / 3 min | ~107 MB | ~2.6 GB | ~77 GB |
+
+About 1,000 messages per second across the 14 symbols. Checksum pass rate was 100% in all three runs
+(81,800 / 123,968 / 186,330 checks, zero reconnects). Tardis captures depth 1000 for deeper research.
 
 ## Run it 24/7
 

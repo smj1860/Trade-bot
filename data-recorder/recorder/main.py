@@ -1,6 +1,6 @@
 """Kraken spot order-book and trade recorder.
 
-    python -m recorder.main --out ./data [--depth 100] [--duration 120]
+    python -m recorder.main --out ./data [--depth 25] [--duration 120]
 
 Subscribes to the v2 `book` (level 2) and `trade` channels for every symbol in
 config/config.example.toml and appends every message, as received, to hourly
@@ -189,7 +189,7 @@ class Recorder:
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out", default=os.environ.get("RECORDER_OUT", "./data"), help="directory for the hourly files")
-    p.add_argument("--depth", type=int, default=100, choices=[10, 25, 100, 500, 1000], help="book depth to subscribe to")
+    p.add_argument("--depth", type=int, default=25, choices=[10, 25, 100, 500, 1000], help="book depth to subscribe to")
     p.add_argument("--config", default=None, help="config TOML with [[symbols]] (default: repo config/config.example.toml)")
     p.add_argument("--symbols", default="", help="comma-separated subset, e.g. BTC/USD,ETH/USD (default: all enabled)")
     p.add_argument("--duration", type=float, default=None, help="stop after this many seconds (smoke tests); default run forever")
