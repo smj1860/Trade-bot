@@ -1,0 +1,49 @@
+name: Recorder smoke test
+
+# Records a short window of LIVE Kraken order book + trade data on a GitHub runner,
+# then reports message counts, checksum pass rate and data volume. Not the production
+# host (scheduled runs here are unreliable); see data-recorder/README.md for 24/7 use.
+
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "How long to record"
+        required: false
+        default: "180"
+      depth:
+        description: "Book depth (10, 25, 100, 500, 1000)"
+        required: false
+        default: "100"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install websockets pytest
+      - name: Unit tests
+        working-directory: data-recorder
+        run: python -m pytest tests -q
+      - name: Record live data
+        working-directory: data-recorder
+        run: |
+          python -m recorder.main --out /tmp/rec --duration "${{ github.event.inputs.seconds || '180' }}" --depth "${{ github.event.inputs.depth || '100' }}" | tee /tmp/summary.json
+          python - <<'PY'
+          import json
+          s = json.load(open("/tmp/summary.json"))
+          checks, bad = s["checksum_checks"], s["checksum_mismatches"]
+          print(f"checksum pass rate: {100 * (1 - bad / checks):.3f}% ({checks - bad}/{checks})" if checks else "no checksum checks ran")
+          mb = s["compressed_bytes"] / 1e6
+          print(f"compressed {mb:.2f} MB for this window; uncompressed {s['uncompressed_bytes'] / 1e6:.2f} MB")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recorder-sample
+          path: /tmp/rec
+          retention-days: 3
