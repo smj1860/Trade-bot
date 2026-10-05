@@ -1620,6 +1620,54 @@ def print_confidence_report(acc: dict, n_folds: int) -> None:
     print(f"    selected trades: {wf['n']} at {wf['mean'] * 100:+.3f}% mean net   vs   all trades in those folds: {wf['all_n']} at {wf['all_mean'] * 100:+.3f}%", file=sys.stderr)
 
 
+def limit_entry_trade(
+    highs: list[float], lows: list[float], closes: list[float], i: int, horizon: int,
+    barrier_pct: float, predicted_up: bool, maker_fee: float, taker_fee: float, slippage: float,
+) -> tuple[float | None, str]:
+    """Net return of one trade executed with a resting limit entry and a
+    resting limit target instead of two market orders (the --limit-fee-scenarios
+    report). Signal at bar i's close P. A limit at P is placed for bar i+1 and
+    fills only if that bar trades back to P (low <= P for a long, high >= P for
+    a short); if not, the trade is missed (returns (None, "unfilled")) -- so
+    adverse selection is built in, since fills cluster where price moved against
+    the entry. Barriers sit at P*(1 -/+ barrier_pct) as in the labels. In the
+    fill bar only the adverse barrier counts (the order of fill vs target
+    inside one bar is unknowable). Afterwards a bar touching both barriers is a
+    stop. Exits: target = resting limit (maker fee, no slippage, filled when
+    the bar touches it -- optimistic about queue position); stop = stop-market
+    and timeout = market at bar i+horizon's close, both taker fee + slippage.
+    Returns (net_return, reason), reason in target/stop/timeout/unfilled."""
+    if i + max(horizon, 2) >= len(closes):
+        return None, "nodata"
+    entry = closes[i]
+    if entry == 0:
+        return None, "nodata"
+    sign = 1.0 if predicted_up else -1.0
+    up_level, dn_level = entry * (1.0 + barrier_pct), entry * (1.0 - barrier_pct)
+    target, stop = (up_level, dn_level) if predicted_up else (dn_level, up_level)
+
+    def hit_target(j: int) -> bool:
+        return highs[j] >= target if predicted_up else lows[j] <= target
+
+    def hit_stop(j: int) -> bool:
+        return lows[j] <= stop if predicted_up else highs[j] >= stop
+
+    j = i + 1
+    filled = lows[j] <= entry if predicted_up else highs[j] >= entry
+    if not filled:
+        return None, "unfilled"
+    if hit_stop(j):
+        return -barrier_pct - (maker_fee + taker_fee + slippage), "stop"
+    for j in range(i + 2, i + max(horizon, 2) + 1):
+        t, st = hit_target(j), hit_stop(j)
+        if st:  # includes the both-touched case
+            return -barrier_pct - (maker_fee + taker_fee + slippage), "stop"
+        if t:
+            return barrier_pct - 2.0 * maker_fee, "target"
+    final = sign * (closes[i + max(horizon, 2)] - entry) / entry
+    return final - (maker_fee + taker_fee + slippage), "timeout"
+
+
 def unresolved_net_pnl(
     highs: list[float], lows: list[float], closes: list[float], i: int, horizon: int,
     barrier_pct: float, predicted_up: bool, round_trip_cost: float,
@@ -1683,12 +1731,9 @@ def print_timeout_report(resolved: dict, unresolved: dict) -> None:
 TWO_STAGE_THRESHOLDS = (0.0, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70)
 
 
-def two_stage_trades(per_symbol_test: list[dict], X_test: list, dir_model, move_model) -> list[tuple]:
-    """Scores every bar of each symbol's test window -- resolved AND
-    unresolved -- with both stages. Returns (p_move, net_pnl, prediction,
-    symbol, direction_confidence, moved) per bar, where p_move is stage 1's
-    P(a barrier is hit in time), prediction/direction_confidence come from
-    stage 2 (the direction model), and `moved` is the true stage-1 label."""
+def _two_stage_scores(per_symbol_test: list[dict], X_test: list, dir_model, move_model) -> list[tuple]:
+    """(e, i, resolved, moved, p_up, p_move) for every scored bar of each
+    symbol's test window -- resolved AND unresolved."""
     rows, meta = [], []
     for e in per_symbol_test:
         if e.get("label_scheme") != "triple-barrier":
@@ -1708,10 +1753,17 @@ def two_stage_trades(per_symbol_test: list[dict], X_test: list, dir_model, move_
     mv_col = list(move_model.classes_).index(1)
     p_up = [r[up_col] for r in dir_model.predict_proba(rows)]
     p_mv = [r[mv_col] for r in move_model.predict_proba(rows)]
+    return [(e, i, resolved, moved, pu, pm) for (e, i, resolved, moved), pu, pm in zip(meta, p_up, p_mv)]
+
+
+def _barrier_at(e: dict, i: int) -> float:
+    return e["barrier_pct"][i] if isinstance(e["barrier_pct"], dict) else e["barrier_pct"]
+
+
+def two_stage_records(scores: list[tuple]) -> list[tuple]:
     out = []
-    for pu, pm, (e, i, resolved, moved) in zip(p_up, p_mv, meta):
-        barrier = e["barrier_pct"][i] if isinstance(e["barrier_pct"], dict) else e["barrier_pct"]
-        up = pu >= 0.5
+    for e, i, resolved, moved, pu, pm in scores:
+        barrier, up = _barrier_at(e, i), pu >= 0.5
         if resolved:
             pnl = triple_barrier_net_pnl(e["highs"], e["lows"], e["closes"], i, e["horizon"], barrier, up, e["round_trip_cost"])
         else:
@@ -1719,6 +1771,32 @@ def two_stage_trades(per_symbol_test: list[dict], X_test: list, dir_model, move_
         if pnl is not None:
             out.append((pm, pnl, 1 if up else 0, e["symbol"], abs(pu - 0.5), moved))
     return out
+
+
+def two_stage_limit_records(scores: list[tuple], maker_fee: float, taker_fee: float, slippage: float) -> tuple[list[tuple], int, int]:
+    """Same records, but P&L comes from limit_entry_trade. Returns
+    (records, n_unfilled, n_scored): unfilled signals are not trades."""
+    out, unfilled, scored = [], 0, 0
+    for e, i, resolved, moved, pu, pm in scores:
+        up = pu >= 0.5
+        pnl, reason = limit_entry_trade(e["highs"], e["lows"], e["closes"], i, e["horizon"], _barrier_at(e, i), up, maker_fee, taker_fee, slippage)
+        if reason == "nodata":
+            continue
+        scored += 1
+        if pnl is None:
+            unfilled += 1
+            continue
+        out.append((pm, pnl, 1 if up else 0, e["symbol"], abs(pu - 0.5), moved))
+    return out, unfilled, scored
+
+
+def two_stage_trades(per_symbol_test: list[dict], X_test: list, dir_model, move_model) -> list[tuple]:
+    """Scores every bar of each symbol's test window -- resolved AND
+    unresolved -- with both stages. Returns (p_move, net_pnl, prediction,
+    symbol, direction_confidence, moved) per bar, where p_move is stage 1's
+    P(a barrier is hit in time), prediction/direction_confidence come from
+    stage 2 (the direction model), and `moved` is the true stage-1 label."""
+    return two_stage_records(_two_stage_scores(per_symbol_test, X_test, dir_model, move_model))
 
 
 def two_stage_variants(recs_by_fold: dict, min_direction_confidence: float) -> dict:
@@ -1748,6 +1826,35 @@ def print_two_stage_report(recs_by_fold: dict, auc_by_fold: dict) -> None:
             print(f"  {r['threshold']:<6.2f} | {r['n']:>9} | {r['mean'] * 100:+7.3f}% | {r['folds_positive']}/{len(folds)}     | {cells}", file=sys.stderr)
         wf = confidence_walk_forward(acc, TWO_STAGE_THRESHOLDS)
         print(f"  walk-forward threshold choice (earlier folds only): { {f + 1: t for f, t in wf['chosen'].items()} } -> {wf['n']} trades at {wf['mean'] * 100:+.3f}%  vs all bars in those folds {wf['all_n']} at {wf['all_mean'] * 100:+.3f}%", file=sys.stderr)
+
+
+def parse_fee_scenarios(text: str) -> list[tuple[float, float]]:
+    """"0.004:0.008,0.003:0.006" -> [(maker, taker), ...]"""
+    out = []
+    for part in (text or "").split(","):
+        part = part.strip()
+        if part:
+            m, t = part.split(":")
+            out.append((float(m), float(t)))
+    return out
+
+
+def print_limit_scenario_report(scenario_recs: dict, folds: list[int]) -> None:
+    """scenario_recs: {(maker, taker): ({fold: records}, {fold: (unfilled, scored)})}"""
+    print("\n=== limit-entry execution: resting limit entry + limit target, market stop/timeout ===", file=sys.stderr)
+    print("  (entry fills only if the next bar trades back to the signal close; unfilled signals are skipped)", file=sys.stderr)
+    for (maker, taker), (recs_by_fold, fills) in scenario_recs.items():
+        unfilled = sum(u for u, _ in fills.values())
+        scored = sum(n for _, n in fills.values())
+        print(f"  -- maker {maker * 100:.2f}% / taker {taker * 100:.2f}% per leg; fill rate {100 * (1 - unfilled / scored) if scored else 0:.1f}% ({scored - unfilled}/{scored}) --", file=sys.stderr)
+        for floor in (0.0, 0.10):
+            acc = two_stage_variants(recs_by_fold, floor)
+            print(f"  direction confidence >= {floor:.2f}:  thresh |  n trades | mean net | folds>0 | per-fold n/mean", file=sys.stderr)
+            for r in confidence_table(acc, TWO_STAGE_THRESHOLDS):
+                cells = "  ".join(f"{n}/{m * 100:+.2f}%" for n, m in (r["per_fold"][f] for f in folds))
+                print(f"      {r['threshold']:<6.2f} | {r['n']:>9} | {r['mean'] * 100:+7.3f}% | {r['folds_positive']}/{len(folds)}     | {cells}", file=sys.stderr)
+            wf = confidence_walk_forward(acc, TWO_STAGE_THRESHOLDS)
+            print(f"      walk-forward threshold choice: { {f + 1: t for f, t in wf['chosen'].items()} } -> {wf['n']} trades at {wf['mean'] * 100:+.3f}%  vs all filled in those folds {wf['all_n']} at {wf['all_mean'] * 100:+.3f}%", file=sys.stderr)
 
 
 def _train_and_evaluate(
@@ -1944,6 +2051,7 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
     unresolved_acc: dict = {}
     two_stage_recs: dict = {}
     two_stage_auc: dict = {}
+    limit_scenarios: dict = {}
     two_stage = getattr(args, "two_stage_report", False)
     for fold_idx in range(args.folds):
         X1, y1 = [], []  # stage-1 training set: every pre-boundary bar, labeled "a barrier was hit in time"
@@ -2011,8 +2119,14 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
             from sklearn.metrics import roc_auc_score
 
             move_model = HistGradientBoostingClassifier(max_iter=150, random_state=0).fit(X1, y1)
-            recs = two_stage_trades(per_symbol_test, X_test, metrics["model"], move_model)
+            scores = _two_stage_scores(per_symbol_test, X_test, metrics["model"], move_model)
+            recs = two_stage_records(scores)
             two_stage_recs[fold_idx] = recs
+            for mk, tk in parse_fee_scenarios(getattr(args, "limit_fee_scenarios", "")):
+                lrecs, unf, n_sc = two_stage_limit_records(scores, mk, tk, getattr(args, "slippage", 0.0005))
+                bucket = limit_scenarios.setdefault((mk, tk), ({}, {}))
+                bucket[0][fold_idx] = lrecs
+                bucket[1][fold_idx] = (unf, n_sc)
             labels = [r[5] for r in recs]
             if len(set(labels)) == 2:
                 two_stage_auc[fold_idx] = roc_auc_score(labels, [r[0] for r in recs])
@@ -2039,6 +2153,8 @@ def run_walk_forward(datasets: list[dict], args: argparse.Namespace) -> None:
         print_timeout_report(confidence_acc, unresolved_acc)
     if two_stage and two_stage_recs:
         print_two_stage_report(two_stage_recs, two_stage_auc)
+        if limit_scenarios:
+            print_limit_scenario_report(limit_scenarios, sorted(two_stage_recs))
     if getattr(args, "regime_report", False):
         print_regime_report(regime_acc, args.folds)
         print_gating_report(regime_acc, args.folds)
@@ -2086,6 +2202,7 @@ def add_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--confidence-report", action="store_true", help="With --folds > 1: after the summary, show net P&L per trade when only the model's most confident trades (|P(up)-0.5| >= threshold) are taken, per fold and pooled, plus a walk-forward threshold choice made on earlier folds only. Diagnostic only.")
     parser.add_argument("--timeout-report", action="store_true", help="With --folds > 1 and --label-scheme triple-barrier: also score the bars the normal dataset drops (timeouts and same-bar double touches) as trades, so the confidence table shows what a live system taking every signal would see. Evaluation only -- training still uses resolved bars alone. Implies --confidence-report.")
     parser.add_argument("--two-stage-report", action="store_true", help="With --folds > 1 and --label-scheme triple-barrier: add a stage-1 model predicting whether a barrier will be hit in time (trained on every pre-boundary bar), combine it with the direction model, and report net P&L over ALL bars (timeouts included) when only high-P(move) bars are traded. Evaluation only.")
+    parser.add_argument("--limit-fee-scenarios", type=str, default="", help="With --two-stage-report: also score every trade with limit-order execution (resting limit entry, limit target, market stop/timeout) for each comma-separated maker:taker per-leg fee pair, e.g. 0.004:0.008,0.003:0.006,0.0022:0.0038. Evaluation only; labels and barriers are unchanged.")
     parser.add_argument("--drop-features", type=str, default="", help="Comma-separated feature names to remove from the model input (ablation). Applied after the dataset is built, so labels/rows are unchanged.")
     parser.add_argument("--barrier-mode", choices=["fixed", "atr"], default="fixed", help="triple-barrier width: fixed (the fee-derived width, default) or atr (k x ATR%%, floored at the fee-derived width).")
     parser.add_argument("--atr-barrier-mult", type=float, default=3.0, help="k in --barrier-mode atr.")
