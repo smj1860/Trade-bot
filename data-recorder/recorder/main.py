@@ -57,6 +57,7 @@ class Recorder:
         self.stall_seconds = stall_seconds
         self.max_consecutive_mismatches = max_consecutive_mismatches
         self.stop = False
+        self._started = time.monotonic()
         self.books: dict[str, LocalBook] = {}
         self._bad_streak: dict[str, int] = {}
         self.stats = {
@@ -182,6 +183,8 @@ class Recorder:
             "uncompressed_bytes": self.writer.bytes_in,
             "compressed_bytes": sum(f.stat().st_size for f in files),
             "files": len(files),
+            "cpu_seconds": round(time.process_time(), 2),
+            "wall_seconds": round(time.monotonic() - self._started, 2),
             "book_msgs_by_symbol": dict(sorted(self.per_symbol_book_msgs.items())),
         }
 

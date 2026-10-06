@@ -39,6 +39,7 @@ jobs:
           s = json.load(open("/tmp/summary.json"))
           checks, bad = s["checksum_checks"], s["checksum_mismatches"]
           print(f"checksum pass rate: {100 * (1 - bad / checks):.3f}% ({checks - bad}/{checks})" if checks else "no checksum checks ran")
+          print(f"cpu {s['cpu_seconds']}s over {s['wall_seconds']}s wall = {100 * s['cpu_seconds'] / s['wall_seconds']:.1f}% of one core")
           mb = s["compressed_bytes"] / 1e6
           print(f"compressed {mb:.2f} MB for this window; uncompressed {s['uncompressed_bytes'] / 1e6:.2f} MB")
           PY
