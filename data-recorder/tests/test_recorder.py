@@ -157,3 +157,43 @@ def test_end_to_end_against_a_local_fake_feed_with_reconnect(tmp_path):
     text = "\n".join(gzip.open(p, "rt").read() for p in tmp_path.rglob("*.tsv.gz"))
     assert '"_event":"connect"' in text and '"_event":"disconnect"' in text and '"channel": "trade"' in text
     assert r.summary(tmp_path)["files"] >= 1
+
+
+def test_recompress_to_xz_is_lossless_and_smaller(tmp_path):
+    import lzma
+
+    from recorder.uploader import recompress_xz
+
+    w = RotatingWriter(tmp_path, "x")
+    base = 1_700_000_000 * 10**9
+    for i in range(3000):
+        w.write(base + i, '{"channel":"book","type":"update","data":[{"symbol":"BTC/USD","bids":[{"price":100.0,"qty":1.5}],"asks":[],"checksum":123}]}')
+    w.close()
+    gz = w.closed_paths[0]
+    original = gzip.open(gz, "rb").read()
+    xz = recompress_xz(gz)
+    assert not gz.exists() and xz.name.endswith(".tsv.xz") and not list(tmp_path.rglob("*.tmp"))
+    assert lzma.open(xz, "rb").read() == original
+
+
+def test_uploader_recompresses_then_uploads_and_deletes(tmp_path, monkeypatch):
+    import lzma
+
+    from recorder.uploader import Uploader
+
+    class FakeClient:
+        def __init__(self):
+            self.sent = []
+
+        def upload_file(self, filename, bucket, key):
+            self.sent.append((key, lzma.open(filename, "rb").read()))
+
+    up = Uploader.__new__(Uploader)
+    up.root, up.bucket, up.prefix, up.client = tmp_path, "b", "kraken-l2", FakeClient()
+    w = RotatingWriter(tmp_path, "u")
+    w.write(1_700_000_000 * 10**9, "hello")
+    w.close()
+    assert up.sweep(skip=set()) == 1
+    assert up.client.sent[0][0].startswith("kraken-l2/2023/") and up.client.sent[0][0].endswith(".tsv.xz")
+    assert up.client.sent[0][1].endswith(b"hello\n")
+    assert not list(tmp_path.rglob("*.tsv.*"))

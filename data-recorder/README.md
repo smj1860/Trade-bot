@@ -37,6 +37,9 @@ way. Measured on live Kraken, all 14 symbols, 3-minute evening (UTC) windows, so
 | 25  | 3.6 MB / 3 min | ~72 MB  | ~1.7 GB | ~52 GB |
 | 100 | 5.4 MB / 3 min | ~107 MB | ~2.6 GB | ~77 GB |
 
+Local files are gzip (cheap to write); uploaded files are xz, roughly 0.64x the sizes above
+(measured 1.30 MB vs 2.03 MB on a live sample), so about 33 GB/month at depth 25.
+
 About 1,000 messages per second across the 14 symbols. Checksum pass rate was 100% in all three runs
 (81,800 / 123,968 / 186,330 checks, zero reconnects). Tardis captures depth 1000 for deeper research.
 
@@ -50,8 +53,10 @@ A small VPS is enough (1 vCPU, 1 GB RAM; disk depends on how long you keep files
       --env-file recorder.env kraken-recorder
 
 `recorder.env` (all optional) enables upload of finished hourly files to any S3-compatible
-bucket (AWS S3, Cloudflare R2, Backblaze B2, Supabase Storage's S3 endpoint). A local file is deleted
-only after it uploaded successfully:
+bucket (AWS S3, DigitalOcean Spaces, Cloudflare R2, Backblaze B2, Supabase Storage's S3 endpoint).
+Before upload each hourly file is recompressed from gzip to xz (preset 6, about 95 MiB of memory), so
+the bucket holds `.tsv.xz` (same line format) and is about 36% smaller than gzip. A local file is
+deleted only after it uploaded successfully:
 
     RECORDER_S3_BUCKET=my-bucket
     RECORDER_S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com
