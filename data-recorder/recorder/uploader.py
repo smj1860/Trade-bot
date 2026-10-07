@@ -15,12 +15,42 @@ import logging
 import lzma
 import os
 import shutil
+import threading
 from pathlib import Path
 
 log = logging.getLogger("recorder.upload")
 
 
 XZ_PRESET = 6  # ~95 MiB of encoder memory; preset 9 needs ~670 MiB, too much for a 1 GB server
+
+
+def _compress(path: Path, tmp: Path) -> None:
+    with gzip.open(path, "rb") as src, lzma.open(tmp, "wb", preset=XZ_PRESET) as dst:
+        shutil.copyfileobj(src, dst, 1 << 20)
+
+
+def _compress_low_priority(path: Path, tmp: Path) -> None:
+    """Run the compression in its own short-lived thread at nice 19, so on a
+    one-core server the live recorder always gets the CPU first. Linux nice is
+    per thread, and an unprivileged thread cannot raise its priority back, so
+    this must be a throwaway thread rather than a pool worker."""
+    err: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 19)
+        except (AttributeError, OSError):
+            pass  # not Linux, or not permitted: just run at normal priority
+        try:
+            _compress(path, tmp)
+        except BaseException as e:  # re-raised in the caller
+            err.append(e)
+
+    t = threading.Thread(target=run, name="xz-recompress")
+    t.start()
+    t.join()
+    if err:
+        raise err[0]
 
 
 def recompress_xz(path: Path) -> Path:
@@ -30,8 +60,7 @@ def recompress_xz(path: Path) -> Path:
     inside is unchanged."""
     out = path.with_name(path.name[: -len(".gz")] + ".xz")
     tmp = out.with_name(out.name + ".tmp")
-    with gzip.open(path, "rb") as src, lzma.open(tmp, "wb", preset=XZ_PRESET) as dst:
-        shutil.copyfileobj(src, dst, 1 << 20)
+    _compress_low_priority(path, tmp)
     tmp.replace(out)
     path.unlink()
     return out

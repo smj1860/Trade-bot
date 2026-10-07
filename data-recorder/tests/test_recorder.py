@@ -197,3 +197,26 @@ def test_uploader_recompresses_then_uploads_and_deletes(tmp_path, monkeypatch):
     assert up.client.sent[0][0].startswith("kraken-l2/2023/") and up.client.sent[0][0].endswith(".tsv.xz")
     assert up.client.sent[0][1].endswith(b"hello\n")
     assert not list(tmp_path.rglob("*.tsv.*"))
+
+
+def test_recompress_runs_at_low_priority(tmp_path, monkeypatch):
+    import gzip, os, threading
+    from recorder import uploader
+
+    seen = {}
+    real = uploader._compress
+
+    def spy(path, tmp):
+        seen["nice"] = os.getpriority(os.PRIO_PROCESS, threading.get_native_id())
+        seen["thread"] = threading.current_thread().name
+        real(path, tmp)
+
+    monkeypatch.setattr(uploader, "_compress", spy)
+    src = tmp_path / "00-x.tsv.gz"
+    with gzip.open(src, "wb") as f:
+        f.write(b"1\t{}\n" * 1000)
+    out = uploader.recompress_xz(src)
+    assert out.exists() and not src.exists()
+    assert seen["thread"] == "xz-recompress"
+    assert seen["nice"] == 19
+    assert os.getpriority(os.PRIO_PROCESS, threading.get_native_id()) != 19  # caller unaffected

@@ -56,7 +56,8 @@ A small VPS is enough (1 vCPU, 1 GB RAM; disk depends on how long you keep files
 bucket (AWS S3, DigitalOcean Spaces, Cloudflare R2, Backblaze B2, Supabase Storage's S3 endpoint).
 Before upload each hourly file is recompressed from gzip to xz (preset 6, about 95 MiB of memory), so
 the bucket holds `.tsv.xz` (same line format) and is about 36% smaller than gzip. A local file is
-deleted only after it uploaded successfully:
+deleted only after it uploaded successfully. The recompression runs in its own thread at nice 19, so the live
+recorder always gets the CPU first (about 160 s of CPU per hour at depth 25):
 
     RECORDER_S3_BUCKET=my-bucket
     RECORDER_S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com
