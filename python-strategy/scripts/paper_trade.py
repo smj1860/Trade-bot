@@ -257,6 +257,13 @@ def main() -> None:
             run_arm(conn, arm, pairs, now, args.dry_run)
     finally:
         conn.close()
+        try:
+            import resource  # Linux/macOS only; a cheap check that the job fits a small server
+
+            peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0  # KB on Linux
+            print(f"peak memory {peak_mb:.0f} MB")
+        except Exception:  # noqa: BLE001 -- diagnostics only
+            pass
 
 
 if __name__ == "__main__":
