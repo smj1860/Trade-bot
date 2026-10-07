@@ -96,8 +96,10 @@ class Uploader:
         try:
             if path.name.endswith(".tsv.gz"):
                 path = recompress_xz(path)
+            size = path.stat().st_size
             self.client.upload_file(str(path), self.bucket, self.key_for(path))
             path.unlink()
+            log.info("uploaded %s (%.1f MB)", self.key_for(path), size / 1e6)
             return True
         except Exception as exc:  # noqa: BLE001 - keep the file, retry later
             log.warning("upload of %s failed: %s", path, exc)
