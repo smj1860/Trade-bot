@@ -51,6 +51,7 @@ jobs:
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
+          set -o pipefail
           python scripts/train_model.py \
             --symbol all --interval 60 --horizon 4 \
             --label-scheme triple-barrier --kind gboost --folds 1 \
