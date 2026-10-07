@@ -1,0 +1,86 @@
+name: Weekly challenger
+
+# Once a week: retrain the champion's recipe on the latest candles, register
+# the result as a NEW paper-trading arm (ch-YYYYMMDD-m<margin>), retire all but
+# the newest few challengers, and write a paired comparison against the
+# champion to the run summary.
+#
+# This only adds paper arms. It never touches the champion and nothing here
+# can place a real order. The hourly droplet job (deploy/paper-trader) picks
+# the new arm up on its own because it runs every registered arm.
+#
+# Needs the SUPABASE_DB_URL repository secret, like train-model.yml.
+
+on:
+  schedule:
+    - cron: "17 3 * * 0"   # Sundays 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      profit_margin:
+        description: "Required edge above breakeven (champion ext-fib-m4 uses 0.04)"
+        required: false
+        default: "0.04"
+      keep:
+        description: "Active challengers to keep"
+        required: false
+        default: "4"
+
+concurrency:
+  group: weekly-challenger
+  cancel-in-progress: false
+
+jobs:
+  challenger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: python-strategy
+        run: |
+          pip install -r requirements-training.txt
+          pip install -r requirements-ml.txt
+
+      - name: Train challenger (champion recipe, no sealed holdout so it sees recent data)
+        working-directory: python-strategy
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          python scripts/train_model.py \
+            --symbol all --interval 60 --horizon 4 \
+            --label-scheme triple-barrier --kind gboost --folds 1 \
+            --extended-features --fib-features \
+            --profit-margin "${{ github.event.inputs.profit_margin || '0.04' }}" \
+            --test-fraction 0.1 --holdout-days 0 \
+            2>&1 | tee train_output.log
+
+      - name: Register as a new arm
+        working-directory: python-strategy
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          MARGIN="${{ github.event.inputs.profit_margin || '0.04' }}"
+          ARM="ch-$(date -u +%Y%m%d)-m$(python -c "print(round(float('$MARGIN')*100))")"
+          echo "arm=$ARM" >> "$GITHUB_STEP_SUMMARY"
+          python scripts/register_paper_model.py --arm "$ARM" --model models/pooled_gboost.joblib
+
+      - name: Retire old challengers and compare with the champion
+        working-directory: python-strategy
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          python scripts/challenger.py retire --keep "${{ github.event.inputs.keep || '4' }}"
+          python scripts/challenger.py report --champion ext-fib-m4
+
+      - name: Upload training log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: challenger-train-${{ github.run_id }}
+          path: python-strategy/train_output.log
+          if-no-files-found: ignore

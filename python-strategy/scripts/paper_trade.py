@@ -156,6 +156,16 @@ def load_model(conn, arm: str):
     return joblib.load(io.BytesIO(bytes(row[0]))), row[1]
 
 
+def load_meta(conn, arm: str) -> dict:
+    """The arm's meta JSON without pulling the model blob."""
+    with conn.cursor() as cur:
+        cur.execute("select meta from paper_models where arm = %s", (arm,))
+        row = cur.fetchone()
+    if row is None:
+        raise SystemExit(f"error: no model registered for arm {arm!r} (run register_paper_model.py)")
+    return row[0]
+
+
 def list_arms(conn) -> list[str]:
     with conn.cursor() as cur:
         cur.execute("select arm from paper_models order by arm")
@@ -180,8 +190,19 @@ def _ts(unix: int) -> datetime:
     return datetime.fromtimestamp(unix, tz=timezone.utc)
 
 
-def run_arm(conn, arm: str, pairs: dict[str, str], now: int, dry_run: bool) -> None:
-    model, meta = load_model(conn, arm)
+def run_arm(conn, arm: str, pairs: dict[str, str], now: int, dry_run: bool, cache: dict | None = None) -> None:
+    """``cache`` (shared across arms in one run) avoids refetching the same
+    candles for every arm. A retired arm (meta["retired"], set by
+    scripts/challenger.py) opens no new trades but keeps resolving its open
+    ones, so its history stays complete."""
+    meta = load_meta(conn, arm)
+    retired = bool(meta.get("retired"))
+    open_trades = load_open_trades(conn, arm)
+    if retired and not open_trades:
+        print(f"[{arm}] retired, nothing open -- skipped")
+        return
+    model = None if retired else load_model(conn, arm)[0]
+    cache = cache if cache is not None else {}
     interval_minutes = int(meta["interval_minutes"])
     candles: dict[str, list[list]] = {}
     observed: dict[str, float | None] = {}
@@ -192,15 +213,21 @@ def run_arm(conn, arm: str, pairs: dict[str, str], now: int, dry_run: bool) -> N
             fetch_notes.append(f"{symbol}: not in config -- skipped")
             continue
         try:
-            closed, forming_price = prepare(fetch_candles(pair, interval_minutes), interval_minutes * 60, now)
+            key = (pair, interval_minutes)
+            if key not in cache:
+                cache[key] = fetch_candles(pair, interval_minutes)
+            closed, forming_price = prepare(cache[key], interval_minutes * 60, now)
         except RuntimeError as e:
             fetch_notes.append(str(e))
             continue
         candles[symbol] = closed
         observed[symbol] = forming_price
 
-    resolved = resolve_open(load_open_trades(conn, arm), candles)
-    signals, notes = decide_signals(model, meta, candles, observed, now)
+    resolved = resolve_open(open_trades, candles)
+    if retired:
+        signals, notes = [], []
+    else:
+        signals, notes = decide_signals(model, meta, candles, observed, now)
     notes = fetch_notes + notes
 
     print(f"[{arm}] resolved {len(resolved)} trade(s), {len(signals)} new signal(s), {len(notes)} note(s)")
@@ -253,8 +280,9 @@ def main() -> None:
         if not arms:
             print("no arms registered -- nothing to do")
             return
+        cache: dict = {}
         for arm in arms:
-            run_arm(conn, arm, pairs, now, args.dry_run)
+            run_arm(conn, arm, pairs, now, args.dry_run, cache)
     finally:
         conn.close()
         try:
