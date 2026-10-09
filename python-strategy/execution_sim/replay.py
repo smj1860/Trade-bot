@@ -121,15 +121,18 @@ class GapEvent:
     reason: str
 
 
-class Replayer:
-    def __init__(self, paths: Iterable[str | Path], symbol: str, depth: int = 25):
-        self.files = find_recordings(paths)
-        self.symbol = symbol
-        self.book = SymbolBook(depth)
-        self._sym = f'"{symbol}"'.encode()
+class MultiReplayer:
+    """One pass over the files for several symbols at once. Yields
+    ``(symbol, event)``; ``books[symbol]`` is that symbol's live book."""
 
-    def events(self, start_ns: int | None = None, end_ns: int | None = None) -> Iterator[BookEvent | TradeEvent | GapEvent]:
-        sym, book = self.symbol, self.book
+    def __init__(self, paths: Iterable[str | Path], symbols: Iterable[str], depth: int = 25):
+        self.files = find_recordings(paths)
+        self.symbols = list(symbols)
+        self.books = {s: SymbolBook(depth) for s in self.symbols}
+        self._needles = [(s, f'"{s}"'.encode()) for s in self.symbols]
+
+    def events(self, start_ns: int | None = None, end_ns: int | None = None) -> Iterator[tuple[str, BookEvent | TradeEvent | GapEvent]]:
+        books, needles = self.books, self._needles
         for path in self.files:
             with open_recording(path) as f:
                 for line in f:
@@ -138,7 +141,7 @@ class Replayer:
                         continue
                     payload = line[tab + 1:]
                     is_event = b'"_event"' in payload
-                    if not is_event and self._sym not in payload:
+                    if not is_event and not any(n in payload for _, n in needles):
                         continue
                     t = int(line[:tab])
                     if end_ns is not None and t > end_ns:
@@ -150,22 +153,26 @@ class Replayer:
                     if is_event:
                         name = msg.get("_event")
                         if name == "connect":
-                            book.reset()
                             d = msg.get("depth")
-                            if d:
-                                book.depth = int(d)
+                            for b in books.values():
+                                b.reset()
+                                if d:
+                                    b.depth = int(d)
                         elif name == "disconnect":
-                            book.reset()
-                            yield GapEvent(t, "disconnect")
-                        elif name == "checksum_mismatch" and msg.get("symbol") == sym:
-                            book.reset()
-                            yield GapEvent(t, "checksum_mismatch")
+                            for sym, b in books.items():
+                                b.reset()
+                                yield sym, GapEvent(t, "disconnect")
+                        elif name == "checksum_mismatch" and msg.get("symbol") in books:
+                            books[msg["symbol"]].reset()
+                            yield msg["symbol"], GapEvent(t, "checksum_mismatch")
                         continue
                     channel = msg.get("channel")
                     if channel == "book":
                         snapshot = msg.get("type") == "snapshot"
                         for item in msg.get("data", ()):
-                            if item.get("symbol") != sym:
+                            sym = item.get("symbol")
+                            book = books.get(sym)
+                            if book is None:
                                 continue
                             if not snapshot and not book.valid:
                                 continue  # state unknown until a snapshot arrives
@@ -173,8 +180,22 @@ class Replayer:
                             asks = [(l["price"], l["qty"]) for l in item.get("asks", ())]
                             changes = book.apply(bids, asks, snapshot)
                             if start_ns is None or t >= start_ns:
-                                yield BookEvent(t, changes, snapshot)
+                                yield sym, BookEvent(t, changes, snapshot)
                     elif channel == "trade" and msg.get("type") == "update" and (start_ns is None or t >= start_ns):
                         for tr in msg.get("data", ()):
-                            if tr.get("symbol") == sym:
-                                yield TradeEvent(t, tr.get("side") == "buy", float(tr["price"]), float(tr["qty"]))
+                            if tr.get("symbol") in books:
+                                yield tr["symbol"], TradeEvent(t, tr.get("side") == "buy", float(tr["price"]), float(tr["qty"]))
+
+
+class Replayer:
+    """Single-symbol convenience wrapper around MultiReplayer."""
+
+    def __init__(self, paths: Iterable[str | Path], symbol: str, depth: int = 25):
+        self.symbol = symbol
+        self._multi = MultiReplayer(paths, [symbol], depth)
+        self.files = self._multi.files
+        self.book = self._multi.books[symbol]
+
+    def events(self, start_ns: int | None = None, end_ns: int | None = None) -> Iterator[BookEvent | TradeEvent | GapEvent]:
+        for _, ev in self._multi.events(start_ns, end_ns):
+            yield ev

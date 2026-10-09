@@ -166,7 +166,7 @@ class _Order:
 
 class Episode:
     def __init__(self, spec_id: int, side: str, notional: float, start_ns: int, deadline_ns: int,
-                 policy, cfg: SimConfig, book: SymbolBook):
+                 policy, cfg: SimConfig, book: SymbolBook, qty: float | None = None):
         self.spec_id, self.side, self.notional = spec_id, side, notional
         self.start_ns, self.deadline_ns = start_ns, deadline_ns
         self.policy, self.cfg = policy, cfg
@@ -174,7 +174,7 @@ class Episode:
         self.opp = ASK if side == "buy" else BID
         bb, ba = book.best(BID), book.best(ASK)
         self.arrival_mid = (bb[0] + ba[0]) / 2.0
-        self.qty_total = notional / self.arrival_mid
+        self.qty_total = qty if qty is not None else notional / self.arrival_mid
         self.remaining = self.qty_total
         self.fills: list[Fill] = []
         self.order: _Order | None = None
