@@ -134,6 +134,7 @@ class Trade:
     reason: str  # target | stop | timeout
     gross: float
     bars: int
+    score: float = 0.0
 
 
 def simulate_exit(h, l, c, i: int, direction: int, tp: float, sl: float, hold: int) -> tuple[str, float, int] | None:
@@ -183,7 +184,7 @@ def backtest_symbol(symbol: str, ts, h, l, c, v, cfg: dict, interval_s: int = 36
                 d = 1 if s[i] > 0 else -1
                 res = simulate_exit(h, l, c, i, d, cfg["tp"][t - 1], cfg["sl"][t - 1], cfg["hold"])
                 if res is not None:
-                    trades.append(Trade(symbol, int(ts[i]), i, d, t, *res))
+                    trades.append(Trade(symbol, int(ts[i]), i, d, t, *res, float(s[i])))
                     entries.append((i, t, s[i]))
                     i += max(res[2], 1)
                     continue
@@ -246,10 +247,15 @@ def row(label: str, trades: list[Trade], stop_slip: float) -> str:
             f"{gross:>+7.0f}  " + "  ".join(cells))
 
 
-def report(name: str, cfg: dict, by_symbol: dict, controls: dict, stop_slip: float) -> str:
+def report(name: str, cfg: dict, by_symbol: dict, controls: dict, stop_slip: float, n_bars: int = 0) -> str:
     trades = [t for ts_ in by_symbol.values() for t in ts_]
     head = f"{'':<22}{'n':>6} {'tgt/stp/tmo%':>13} {'gross':>7}  " + "  ".join(f"{'net bps @ ' + n:<24}" for n, _ in COSTS)
-    out = [f"== config {name} ==", head, row("all trades", trades, stop_slip)]
+    out = [f"== config {name} =="]
+    if n_bars and trades:
+        days = n_bars / 24 / max(len(by_symbol), 1)
+        out.append(f"activity: {len(trades) / len(by_symbol) / days:.2f} trades per symbol per day; in a position {100 * sum(t.bars for t in trades) / n_bars:.0f}% of bars; "
+                   f"average hold {sum(t.bars for t in trades) / len(trades):.1f} bars")
+    out += [head, row("all trades", trades, stop_slip)]
     for tier in (1, 2, 3):
         tt = [t for t in trades if t.tier == tier]
         be = (cfg["sl"][tier - 1]) / (cfg["tp"][tier - 1] + cfg["sl"][tier - 1])
@@ -263,6 +269,10 @@ def report(name: str, cfg: dict, by_symbol: dict, controls: dict, stop_slip: flo
         for k in range(3):
             part = [t for t in trades if lo_ts + k * span <= t.ts <= lo_ts + (k + 1) * span]
             out.append(row(f"period {k + 1} of 3", part, stop_slip))
+    out.append("-- by |score| at entry (is a stricter filter better?) --")
+    edges = (0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 9.0)
+    for lo, hi in zip(edges, edges[1:]):
+        out.append(row(f"|score| {lo:.2f}-{hi:.2f}" if hi < 9 else f"|score| >= {lo:.2f}", [t for t in trades if lo <= abs(t.score) < hi], stop_slip))
     out.append("-- controls on the same entry bars --")
     out.append(row("reversed direction", controls["reverse"], stop_slip))
     for k, rt in enumerate(controls["random"]):
@@ -315,7 +325,7 @@ def run(data: dict[str, tuple], interval_s: int, stop_slip: float, n_random: int
             rev += control_trades(sym, ts, h, l, c, entries, cfg, "reverse", sign=signs)
             for k in range(n_random):
                 rnd[k] += control_trades(sym, ts, h, l, c, entries, cfg, "random", seed=k + 1, sign=signs)
-        sections.append(report(name, cfg, by_symbol, {"reverse": rev, "random": rnd}, stop_slip))
+        sections.append(report(name, cfg, by_symbol, {"reverse": rev, "random": rnd}, stop_slip, sum(len(v[0]) for v in data.values())))
     return "\n\n".join(sections)
 
 
