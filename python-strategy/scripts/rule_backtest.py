@@ -114,8 +114,14 @@ def features(h: np.ndarray, l: np.ndarray, c: np.ndarray, v: np.ndarray) -> dict
         cci = (tp - tp_ma) / (0.015 * md)
         vr = v / rolling(v, 20, np.mean)
     slope = np.concatenate((np.zeros(10), e50[10:] - e50[:-10]))
+    prev_h = np.concatenate(([0.0], hist[:-1]))
+    cross = np.where((prev_h <= 0) & (hist > 0), 1, np.where((prev_h >= 0) & (hist < 0), -1, 0))  # MACD crossed its signal line on this bar
+    xdir = cross.copy()
+    for k in (1, 2):  # a cross counts for this bar and the next two
+        shifted = np.concatenate((np.zeros(k, dtype=int), cross[:-k]))
+        xdir = np.where(xdir == 0, shifted, xdir)
     regime = np.sign(rolling(c, 50, np.mean) - rolling(c, 200, np.mean))  # +1 golden-cross regime, -1 death-cross regime
-    return {"regime": regime, "e12": e12, "e26": e26, "e50": e50, "slope": slope, "rsi": rsi(c), "hist": hist, "atr": atr,
+    return {"xdir": xdir, "regime": regime, "e12": e12, "e26": e26, "e50": e50, "slope": slope, "rsi": rsi(c), "hist": hist, "atr": atr,
             "atr_pct": atr / c, "pctb": pctb, "willr": willr, "cci": cci, "vr": vr}
 
 
@@ -182,7 +188,7 @@ def contiguous_flags(ts: np.ndarray, interval_s: int, back: int, ahead: int) -> 
 
 
 def backtest_symbol(symbol: str, ts, h, l, c, v, cfg: dict, interval_s: int = 3600, min_score: float = 0.0,
-                    regime: bool = False) -> tuple[list[Trade], list[tuple]]:
+                    regime: bool = False, macd_cross: bool = False) -> tuple[list[Trade], list[tuple]]:
     """Trades taken by the rules, plus the entry bars (i, tier, score) for the controls."""
     f = features(h, l, c, v)
     s = score(f, c)
@@ -198,6 +204,8 @@ def backtest_symbol(symbol: str, ts, h, l, c, v, cfg: dict, interval_s: int = 36
             d = 1 if s[i] > 0 else -1
             if regime and f["regime"][i] != d:
                 t = 0
+            if macd_cross and f["xdir"][i] != d:
+                t = 0  # needs a fresh MACD/signal crossover (this bar or the previous two) in the trade direction
             if t > 0:
                 res = simulate_exit(h, l, c, i, d, cfg["tp"][t - 1], cfg["sl"][t - 1], cfg["hold"])
                 if res is not None:
@@ -331,14 +339,14 @@ def load_csv(folder: str) -> dict[str, tuple]:
 
 
 def run(data: dict[str, tuple], interval_s: int, stop_slip: float, n_random: int = 3, min_score: float = 0.0,
-        regime: bool = False) -> str:
+        regime: bool = False, macd_cross: bool = False) -> str:
     sections = [f"{len(data)} symbols, {sum(len(v[0]) for v in data.values())} bars; costs are round-trip, plus {stop_slip * 100:.2f}% extra on stop exits",
                 f"tier thresholds on |score|: {TIER_THRESHOLDS}; weights {WEIGHTS}; skip if ATR% < {MIN_ATR_PCT * 100:.2f}%"]
-    sections.append(f"variant: min |score| {min_score:g}, regime filter (trade only in the direction of SMA50 vs SMA200) {'on' if regime else 'off'}; bar = {interval_s // 60} min")
+    sections.append(f"variant: min |score| {min_score:g}, regime filter (trade only in the direction of SMA50 vs SMA200) {'on' if regime else 'off'}, fresh MACD cross required {'yes' if macd_cross else 'no'}; bar = {interval_s // 60} min")
     for name, cfg in configs_for(interval_s // 60).items():
         by_symbol, rev, rnd = {}, [], [[] for _ in range(n_random)]
         for sym, (ts, h, l, c, v) in data.items():
-            tr, entries = backtest_symbol(sym, ts, h, l, c, v, cfg, interval_s, min_score, regime)
+            tr, entries = backtest_symbol(sym, ts, h, l, c, v, cfg, interval_s, min_score, regime, macd_cross)
             by_symbol[sym] = tr
             signs = [t.direction for t in tr]
             rev += control_trades(sym, ts, h, l, c, entries, cfg, "reverse", sign=signs)
@@ -355,13 +363,14 @@ def main(argv=None) -> None:
     p.add_argument("--stop-slip", type=float, default=0.001)
     p.add_argument("--symbols", default="", help="comma-separated subset")
     p.add_argument("--min-score", type=float, default=0.0, help="only enter when |score| is at least this (tiers start at 0.35)")
+    p.add_argument("--macd-cross", action="store_true", help="only enter on a fresh MACD / signal-line crossover (this bar or the previous two) in the trade direction")
     p.add_argument("--regime", action="store_true", help="only trade in the direction of SMA50 vs SMA200 (golden / death cross regime)")
     args = p.parse_args(argv)
     data = load_csv(args.csv_dir) if args.csv_dir else load_db(args.interval)
     if args.symbols:
         keep = set(args.symbols.split(","))
         data = {k: v for k, v in data.items() if k in keep}
-    text = run(data, args.interval * 60, args.stop_slip, min_score=args.min_score, regime=args.regime)
+    text = run(data, args.interval * 60, args.stop_slip, min_score=args.min_score, regime=args.regime, macd_cross=args.macd_cross)
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:

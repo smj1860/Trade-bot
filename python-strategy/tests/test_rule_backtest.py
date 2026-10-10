@@ -84,3 +84,16 @@ def test_regime_and_min_score_filters_and_daily_holds():
     assert [c_["hold"] for c_ in rb.configs_for(1440).values()] == [20, 40, 20]
     assert [c_["hold"] for c_ in rb.configs_for(240).values()] == [48, 96, 48]
     assert "variant: min |score| 0.75" in rb.run({"X": (ts, h, l, c, v)}, 3600, 0.001, n_random=1, min_score=0.75, regime=True)
+
+
+def test_macd_cross_trigger_only_enters_on_fresh_crosses():
+    ts, h, l, c, v = walk(n=5000, drift=0.0003)
+    cfg = next(iter(rb.configs_for(60).values()))
+    base, _ = rb.backtest_symbol("X", ts, h, l, c, v, cfg)
+    cx, _ = rb.backtest_symbol("X", ts, h, l, c, v, cfg, macd_cross=True)
+    f = rb.features(h, l, c, v)
+    assert 0 < len(cx) < len(base) and all(f["xdir"][t.i] == t.direction for t in cx)
+    # xdir is +1/-1 only within two bars after the histogram changes sign
+    hist = f["hist"]
+    i = next(k for k in range(60, 4000) if hist[k - 1] <= 0 < hist[k])
+    assert f["xdir"][i] == 1 and f["xdir"][i + 2] in (1, -1)

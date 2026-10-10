@@ -5,6 +5,11 @@ name: Rule-based strategy backtest
 
 on:
   workflow_dispatch:
+    inputs:
+      suite:
+        description: "main (score / regime / timeframes) or macd (fresh MACD crossover trigger)"
+        required: false
+        default: "macd"
 
 jobs:
   backtest:
@@ -29,8 +34,15 @@ jobs:
         run: |
           set -o pipefail
           : > rule_backtest.txt
-          for iv in 60 240 1440; do
-            for v in "" "--min-score 0.95" "--min-score 0.95 --regime"; do
+          if [ "${{ github.event.inputs.suite || 'macd' }}" = "main" ]; then
+            INTERVALS="60 240 1440"
+            VARIANTS=("" "--min-score 0.95" "--min-score 0.95 --regime")
+          else
+            INTERVALS="60 240"
+            VARIANTS=("--macd-cross" "--macd-cross --min-score 0.55" "--macd-cross --min-score 0.95" "--macd-cross --regime")
+          fi
+          for iv in $INTERVALS; do
+            for v in "${VARIANTS[@]}"; do
               echo "######## interval ${iv} min | variant: ${v:-base}" | tee -a rule_backtest.txt
               python scripts/rule_backtest.py --interval "$iv" $v 2>&1 | tee -a rule_backtest.txt
             done
