@@ -48,12 +48,24 @@ WARMUP = 60
 MIN_ATR_PCT = 0.0035
 TIER_THRESHOLDS = (0.35, 0.55, 0.75)
 WEIGHTS = {"trend": 0.30, "momentum": 0.30, "osc": 0.20, "bands": 0.20}
-CONFIGS = {
-    "A (tp 2/3.5/5%, sl 1/1.5/2%, 48 bars)": {"tp": (0.02, 0.035, 0.05), "sl": (0.01, 0.015, 0.02), "hold": 48},
-    "B (tp 3/5/8%, sl 1.5/2.5/3.5%, 96 bars)": {"tp": (0.03, 0.05, 0.08), "sl": (0.015, 0.025, 0.035), "hold": 96},
+_BARRIERS = {
+    "A (tp 2/3.5/5%, sl 1/1.5/2%": {"tp": (0.02, 0.035, 0.05), "sl": (0.01, 0.015, 0.02), "hold": 48},
+    "B (tp 3/5/8%, sl 1.5/2.5/3.5%": {"tp": (0.03, 0.05, 0.08), "sl": (0.015, 0.025, 0.035), "hold": 96},
     # Stephen's tiers: wider target AND tighter stop as confidence rises
-    "C (tp 2.5/4/5%, sl 3/2/1.75%, 48 bars)": {"tp": (0.025, 0.04, 0.05), "sl": (0.03, 0.02, 0.0175), "hold": 48},
+    "C (tp 2.5/4/5%, sl 3/2/1.75%": {"tp": (0.025, 0.04, 0.05), "sl": (0.03, 0.02, 0.0175), "hold": 48},
 }
+
+
+def configs_for(interval_minutes: int) -> dict[str, dict]:
+    """Hold times are 48/96 bars on hourly and 4h bars (2/4 days, 8/16 days); daily bars use 20/40."""
+    out = {}
+    for name, c in _BARRIERS.items():
+        hold = c["hold"] if interval_minutes < 1440 else (20 if c["hold"] == 48 else 40)
+        out[f"{name}, {hold} bars)"] = {**c, "hold": hold}
+    return out
+
+
+CONFIGS = configs_for(60)
 COSTS = (("taker 1.7%", 0.017), ("passive 1.0%", 0.010), ("maker 0.8%", 0.008))
 
 
@@ -102,7 +114,8 @@ def features(h: np.ndarray, l: np.ndarray, c: np.ndarray, v: np.ndarray) -> dict
         cci = (tp - tp_ma) / (0.015 * md)
         vr = v / rolling(v, 20, np.mean)
     slope = np.concatenate((np.zeros(10), e50[10:] - e50[:-10]))
-    return {"e12": e12, "e26": e26, "e50": e50, "slope": slope, "rsi": rsi(c), "hist": hist, "atr": atr,
+    regime = np.sign(rolling(c, 50, np.mean) - rolling(c, 200, np.mean))  # +1 golden-cross regime, -1 death-cross regime
+    return {"regime": regime, "e12": e12, "e26": e26, "e50": e50, "slope": slope, "rsi": rsi(c), "hist": hist, "atr": atr,
             "atr_pct": atr / c, "pctb": pctb, "willr": willr, "cci": cci, "vr": vr}
 
 
@@ -168,20 +181,24 @@ def contiguous_flags(ts: np.ndarray, interval_s: int, back: int, ahead: int) -> 
     return ok
 
 
-def backtest_symbol(symbol: str, ts, h, l, c, v, cfg: dict, interval_s: int = 3600) -> tuple[list[Trade], list[tuple]]:
+def backtest_symbol(symbol: str, ts, h, l, c, v, cfg: dict, interval_s: int = 3600, min_score: float = 0.0,
+                    regime: bool = False) -> tuple[list[Trade], list[tuple]]:
     """Trades taken by the rules, plus the entry bars (i, tier, score) for the controls."""
     f = features(h, l, c, v)
     s = score(f, c)
-    ok = contiguous_flags(ts, interval_s, WARMUP, cfg["hold"])
+    warm = 200 if regime else WARMUP
+    ok = contiguous_flags(ts, interval_s, warm, cfg["hold"])
     trades: list[Trade] = []
     entries: list[tuple] = []
-    i = WARMUP
+    i = warm
     n = len(c)
     while i < n - cfg["hold"]:
         if ok[i] and np.isfinite(s[i]) and f["atr_pct"][i] >= MIN_ATR_PCT:
-            t = tier_of(s[i])
+            t = tier_of(s[i]) if abs(s[i]) >= min_score else 0
+            d = 1 if s[i] > 0 else -1
+            if regime and f["regime"][i] != d:
+                t = 0
             if t > 0:
-                d = 1 if s[i] > 0 else -1
                 res = simulate_exit(h, l, c, i, d, cfg["tp"][t - 1], cfg["sl"][t - 1], cfg["hold"])
                 if res is not None:
                     trades.append(Trade(symbol, int(ts[i]), i, d, t, *res, float(s[i])))
@@ -247,12 +264,12 @@ def row(label: str, trades: list[Trade], stop_slip: float) -> str:
             f"{gross:>+7.0f}  " + "  ".join(cells))
 
 
-def report(name: str, cfg: dict, by_symbol: dict, controls: dict, stop_slip: float, n_bars: int = 0) -> str:
+def report(name: str, cfg: dict, by_symbol: dict, controls: dict, stop_slip: float, n_bars: int = 0, bars_hours: float = 1.0) -> str:
     trades = [t for ts_ in by_symbol.values() for t in ts_]
     head = f"{'':<22}{'n':>6} {'tgt/stp/tmo%':>13} {'gross':>7}  " + "  ".join(f"{'net bps @ ' + n:<24}" for n, _ in COSTS)
     out = [f"== config {name} =="]
     if n_bars and trades:
-        days = n_bars / 24 / max(len(by_symbol), 1)
+        days = n_bars * bars_hours / 24 / max(len(by_symbol), 1)
         out.append(f"activity: {len(trades) / len(by_symbol) / days:.2f} trades per symbol per day; in a position {100 * sum(t.bars for t in trades) / n_bars:.0f}% of bars; "
                    f"average hold {sum(t.bars for t in trades) / len(trades):.1f} bars")
     out += [head, row("all trades", trades, stop_slip)]
@@ -313,19 +330,21 @@ def load_csv(folder: str) -> dict[str, tuple]:
     return out
 
 
-def run(data: dict[str, tuple], interval_s: int, stop_slip: float, n_random: int = 3) -> str:
+def run(data: dict[str, tuple], interval_s: int, stop_slip: float, n_random: int = 3, min_score: float = 0.0,
+        regime: bool = False) -> str:
     sections = [f"{len(data)} symbols, {sum(len(v[0]) for v in data.values())} bars; costs are round-trip, plus {stop_slip * 100:.2f}% extra on stop exits",
                 f"tier thresholds on |score|: {TIER_THRESHOLDS}; weights {WEIGHTS}; skip if ATR% < {MIN_ATR_PCT * 100:.2f}%"]
-    for name, cfg in CONFIGS.items():
+    sections.append(f"variant: min |score| {min_score:g}, regime filter (trade only in the direction of SMA50 vs SMA200) {'on' if regime else 'off'}; bar = {interval_s // 60} min")
+    for name, cfg in configs_for(interval_s // 60).items():
         by_symbol, rev, rnd = {}, [], [[] for _ in range(n_random)]
         for sym, (ts, h, l, c, v) in data.items():
-            tr, entries = backtest_symbol(sym, ts, h, l, c, v, cfg, interval_s)
+            tr, entries = backtest_symbol(sym, ts, h, l, c, v, cfg, interval_s, min_score, regime)
             by_symbol[sym] = tr
             signs = [t.direction for t in tr]
             rev += control_trades(sym, ts, h, l, c, entries, cfg, "reverse", sign=signs)
             for k in range(n_random):
                 rnd[k] += control_trades(sym, ts, h, l, c, entries, cfg, "random", seed=k + 1, sign=signs)
-        sections.append(report(name, cfg, by_symbol, {"reverse": rev, "random": rnd}, stop_slip, sum(len(v[0]) for v in data.values())))
+        sections.append(report(name, cfg, by_symbol, {"reverse": rev, "random": rnd}, stop_slip, sum(len(v[0]) for v in data.values()), interval_s / 3600))
     return "\n\n".join(sections)
 
 
@@ -335,12 +354,14 @@ def main(argv=None) -> None:
     p.add_argument("--csv-dir", default=None)
     p.add_argument("--stop-slip", type=float, default=0.001)
     p.add_argument("--symbols", default="", help="comma-separated subset")
+    p.add_argument("--min-score", type=float, default=0.0, help="only enter when |score| is at least this (tiers start at 0.35)")
+    p.add_argument("--regime", action="store_true", help="only trade in the direction of SMA50 vs SMA200 (golden / death cross regime)")
     args = p.parse_args(argv)
     data = load_csv(args.csv_dir) if args.csv_dir else load_db(args.interval)
     if args.symbols:
         keep = set(args.symbols.split(","))
         data = {k: v for k, v in data.items() if k in keep}
-    text = run(data, args.interval * 60, args.stop_slip)
+    text = run(data, args.interval * 60, args.stop_slip, min_score=args.min_score, regime=args.regime)
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:

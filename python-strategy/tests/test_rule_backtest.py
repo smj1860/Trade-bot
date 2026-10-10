@@ -70,3 +70,17 @@ def test_backtest_runs_and_controls_match_entries():
 def test_full_report_text():
     text = rb.run({"X-USD": walk(n=3000, drift=0.0002)}, 3600, 0.001, n_random=2)
     assert "config A" in text and "config B" in text and "reversed direction" in text and "random direction #2" in text
+
+
+def test_regime_and_min_score_filters_and_daily_holds():
+    ts, h, l, c, v = walk(n=5000, drift=0.0003)
+    cfg = next(iter(rb.configs_for(60).values()))
+    base, _ = rb.backtest_symbol("X", ts, h, l, c, v, cfg)
+    strict, _ = rb.backtest_symbol("X", ts, h, l, c, v, cfg, min_score=0.75)
+    assert 0 < len(strict) < len(base) and all(abs(t.score) >= 0.75 for t in strict)
+    reg, _ = rb.backtest_symbol("X", ts, h, l, c, v, cfg, regime=True)
+    f = rb.features(h, l, c, v)
+    assert reg and all(f["regime"][t.i] == t.direction for t in reg)
+    assert [c_["hold"] for c_ in rb.configs_for(1440).values()] == [20, 40, 20]
+    assert [c_["hold"] for c_ in rb.configs_for(240).values()] == [48, 96, 48]
+    assert "variant: min |score| 0.75" in rb.run({"X": (ts, h, l, c, v)}, 3600, 0.001, n_random=1, min_score=0.75, regime=True)

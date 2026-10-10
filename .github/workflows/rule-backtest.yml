@@ -5,11 +5,6 @@ name: Rule-based strategy backtest
 
 on:
   workflow_dispatch:
-    inputs:
-      interval:
-        description: "Candle minutes"
-        required: false
-        default: "60"
 
 jobs:
   backtest:
@@ -33,7 +28,13 @@ jobs:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
           set -o pipefail
-          python scripts/rule_backtest.py --interval "${{ github.event.inputs.interval || '60' }}" 2>&1 | tee rule_backtest.txt
+          : > rule_backtest.txt
+          for iv in 60 240 1440; do
+            for v in "" "--min-score 0.95" "--min-score 0.95 --regime"; do
+              echo "######## interval ${iv} min | variant: ${v:-base}" | tee -a rule_backtest.txt
+              python scripts/rule_backtest.py --interval "$iv" $v 2>&1 | tee -a rule_backtest.txt
+            done
+          done
       - name: Publish the report to the research-reports branch (read-only text, never touches main)
         run: |
           cp python-strategy/rule_backtest.txt /tmp/report.txt
