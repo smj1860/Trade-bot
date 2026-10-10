@@ -1,0 +1,40 @@
+name: Rule-based strategy backtest
+
+# Manual only. Runs scripts/rule_backtest.py on the stored hourly candles (read-only
+# queries) and writes the report to the run summary. Nothing here trades.
+
+on:
+  workflow_dispatch:
+    inputs:
+      interval:
+        description: "Candle minutes"
+        required: false
+        default: "60"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        working-directory: python-strategy
+        run: |
+          pip install -r requirements-training.txt
+          pip install numpy
+      - name: Backtest
+        working-directory: python-strategy
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -o pipefail
+          python scripts/rule_backtest.py --interval "${{ github.event.inputs.interval || '60' }}" 2>&1 | tee rule_backtest.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rule-backtest-${{ github.run_id }}
+          path: python-strategy/rule_backtest.txt
+          if-no-files-found: ignore
