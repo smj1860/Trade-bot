@@ -14,10 +14,10 @@ No model. Each bar close, five readings are combined into one score (about -1 to
               percent away is out of reach there
 
 The sign of the score is the direction and |score| picks a confidence tier. Higher
-tiers get a wider take-profit and a smaller (but still wider-with-confidence) stop.
+tiers get a wider take-profit; the stop is a per-config table.
 One position per symbol at a time. Exits use each later bar's real high/low; a bar
 that touches both barriers counts as a stop; otherwise the position is closed at the
-vertical barrier. Everything below is fixed in advance (no tuning on results); two
+vertical barrier. Everything below is fixed in advance (no tuning on results); three
 barrier configs are reported, and that is the whole search.
 
 The report also runs two controls on the SAME entry bars: the reversed direction and
@@ -51,6 +51,8 @@ WEIGHTS = {"trend": 0.30, "momentum": 0.30, "osc": 0.20, "bands": 0.20}
 CONFIGS = {
     "A (tp 2/3.5/5%, sl 1/1.5/2%, 48 bars)": {"tp": (0.02, 0.035, 0.05), "sl": (0.01, 0.015, 0.02), "hold": 48},
     "B (tp 3/5/8%, sl 1.5/2.5/3.5%, 96 bars)": {"tp": (0.03, 0.05, 0.08), "sl": (0.015, 0.025, 0.035), "hold": 96},
+    # Stephen's tiers: wider target AND tighter stop as confidence rises
+    "C (tp 2.5/4/5%, sl 3/2/1.75%, 48 bars)": {"tp": (0.025, 0.04, 0.05), "sl": (0.03, 0.02, 0.0175), "hold": 48},
 }
 COSTS = (("taker 1.7%", 0.017), ("passive 1.0%", 0.010), ("maker 0.8%", 0.008))
 
