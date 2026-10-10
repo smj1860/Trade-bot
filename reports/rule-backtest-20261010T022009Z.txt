@@ -1,0 +1,783 @@
+######## interval 60 min | variant: base
+14 symbols, 353606 bars; costs are round-trip, plus 0.10% extra on stop exits
+
+tier thresholds on |score|: (0.35, 0.55, 0.75); weights {'trend': 0.3, 'momentum': 0.3, 'osc': 0.2, 'bands': 0.2}; skip if ATR% < 0.35%
+
+variant: min |score| 0, regime filter (trade only in the direction of SMA50 vs SMA200) off; bar = 60 min
+
+== config A (tp 2/3.5/5%, sl 1/1.5/2%, 48 bars) ==
+activity: 2.48 trades per symbol per day; in a position 76% of bars; average hold 7.4 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades             36490   31/ 66/  3      +6     -171 [ -175, -165]     -101 [ -105,  -95]      -81 [  -85,  -75]
+tier 1 (tp 2/sl 1)     16390   34/ 66/  0      +3     -174 [ -176, -170]     -104 [ -106, -100]      -84 [  -86,  -80]   gross break-even target rate 33%
+tier 2 (tp 3.5/sl 1.5)  8536   30/ 68/  2      +4     -172 [ -179, -166]     -102 [ -109,  -96]      -82 [  -89,  -76]   gross break-even target rate 30%
+tier 3 (tp 5/sl 2)     11564   28/ 66/  6     +12     -165 [ -176, -153]      -95 [ -106,  -83]      -75 [  -86,  -63]   gross break-even target rate 29%
+long                   18418   31/ 66/  2      +7     -170 [ -176, -162]     -100 [ -106,  -92]      -80 [  -86,  -72]
+short                  18072   31/ 66/  3      +5     -171 [ -180, -164]     -101 [ -110,  -94]      -81 [  -90,  -74]
+period 1 of 3          11045   31/ 66/  2      +7     -169 [ -177, -161]      -99 [ -107,  -91]      -79 [  -87,  -71]
+period 2 of 3          14425   32/ 67/  2      +7     -169 [ -178, -161]      -99 [ -108,  -91]      -79 [  -88,  -71]
+period 3 of 3          11020   30/ 66/  4      +3     -174 [ -183, -164]     -104 [ -113,  -94]      -84 [  -93,  -74]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45       9548   34/ 66/  0      +3     -174 [ -177, -170]     -104 [ -107, -100]      -84 [  -87,  -80]
+|score| 0.45-0.55       6842   34/ 66/  0      +3     -174 [ -178, -170]     -104 [ -108, -100]      -84 [  -88,  -80]
+|score| 0.55-0.65       4622   30/ 68/  2      +5     -172 [ -181, -164]     -102 [ -111,  -94]      -82 [  -91,  -74]
+|score| 0.65-0.75       3914   30/ 68/  2      +3     -173 [ -183, -164]     -103 [ -113,  -94]      -83 [  -93,  -74]
+|score| 0.75-0.85       3254   27/ 67/  7      +6     -171 [ -185, -156]     -101 [ -115,  -86]      -81 [  -95,  -66]
+|score| 0.85-0.95       3237   28/ 66/  6     +14     -162 [ -176, -145]      -92 [ -106,  -75]      -72 [  -86,  -55]
+|score| >= 0.95         5073   28/ 66/  6     +14     -163 [ -177, -146]      -93 [ -107,  -76]      -73 [  -87,  -56]
+-- controls on the same entry bars --
+reversed direction     36490   30/ 68/  3      -2     -178 [ -183, -174]     -108 [ -113, -104]      -88 [  -93,  -84]
+random direction #1    36490   31/ 67/  3      +3     -174 [ -176, -171]     -104 [ -106, -101]      -84 [  -86,  -81]
+random direction #2    36490   30/ 67/  3      +2     -174 [ -177, -172]     -104 [ -107, -102]      -84 [  -87,  -82]
+random direction #3    36490   30/ 67/  3      +2     -174 [ -177, -171]     -104 [ -107, -101]      -84 [  -87,  -81]
+by symbol (net bps @ passive 1.00%): PENDLE-USD -97 (n=1337), ADA-USD -97 (n=2711), ETH-USD -98 (n=1752), SOL-USD -98 (n=2601), BTC-USD -98 (n=1086), AVAX-USD -99 (n=2841), LINK-USD -100 (n=2661), SUI-USD -100 (n=3424), DOGE-USD -101 (n=2851), NEAR-USD -101 (n=3710), XRP-USD -102 (n=2249), AAVE-USD -102 (n=2988), TAO-USD -104 (n=3159), UNI-USD -107 (n=3120)
+
+== config B (tp 3/5/8%, sl 1.5/2.5/3.5%, 96 bars) ==
+activity: 1.11 trades per symbol per day; in a position 84% of bars; average hold 18.2 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades             16348   31/ 65/  4      +7     -170 [ -180, -158]     -100 [ -110,  -88]      -80 [  -90,  -68]
+tier 1 (tp 3/sl 1.5)    6379   33/ 67/  0      -3     -180 [ -188, -173]     -110 [ -118, -103]      -90 [  -98,  -83]   gross break-even target rate 33%
+tier 2 (tp 5/sl 2.5)    3523   34/ 64/  2      +9     -167 [ -182, -151]      -97 [ -112,  -81]      -77 [  -92,  -61]   gross break-even target rate 33%
+tier 3 (tp 8/sl 3.5)    6446   28/ 63/  9     +15     -161 [ -185, -137]      -91 [ -115,  -67]      -71 [  -95,  -47]   gross break-even target rate 30%
+long                    8312   32/ 64/  4     +14     -162 [ -178, -147]      -92 [ -108,  -77]      -72 [  -88,  -57]
+short                   8036   30/ 65/  5      -1     -177 [ -194, -158]     -107 [ -124,  -88]      -87 [ -104,  -68]
+period 1 of 3           5011   31/ 65/  4      +9     -167 [ -183, -149]      -97 [ -113,  -79]      -77 [  -93,  -59]
+period 2 of 3           6462   32/ 66/  3      +9     -168 [ -188, -144]      -98 [ -118,  -74]      -78 [  -98,  -54]
+period 3 of 3           4875   30/ 64/  6      +2     -174 [ -196, -152]     -104 [ -126,  -82]      -84 [ -106,  -62]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45       3725   33/ 67/  0      -1     -178 [ -186, -171]     -108 [ -116, -101]      -88 [  -96,  -81]
+|score| 0.45-0.55       2654   32/ 68/  0      -5     -182 [ -192, -172]     -112 [ -122, -102]      -92 [ -102,  -82]
+|score| 0.55-0.65       1832   34/ 64/  2      +9     -167 [ -185, -150]      -97 [ -115,  -80]      -77 [  -95,  -60]
+|score| 0.65-0.75       1691   34/ 64/  2      +9     -167 [ -187, -148]      -97 [ -117,  -78]      -77 [  -97,  -58]
+|score| 0.75-0.85       1522   28/ 63/  9     +20     -156 [ -190, -125]      -86 [ -120,  -55]      -66 [ -100,  -35]
+|score| 0.85-0.95       1666   26/ 64/  9      -4     -181 [ -207, -149]     -111 [ -137,  -79]      -91 [ -117,  -59]
+|score| >= 0.95         3258   28/ 62/ 10     +23     -153 [ -185, -119]      -83 [ -115,  -49]      -63 [  -95,  -29]
+-- controls on the same entry bars --
+reversed direction     16348   30/ 65/  5      -0     -176 [ -186, -167]     -106 [ -116,  -97]      -86 [  -96,  -77]
+random direction #1    16348   31/ 65/  4      +4     -172 [ -178, -165]     -102 [ -108,  -95]      -82 [  -88,  -75]
+random direction #2    16348   31/ 64/  5      +7     -169 [ -175, -163]      -99 [ -105,  -93]      -79 [  -85,  -73]
+random direction #3    16348   31/ 64/  5      +7     -170 [ -177, -163]     -100 [ -107,  -93]      -80 [  -87,  -73]
+by symbol (net bps @ passive 1.00%): TAO-USD -92 (n=1430), AVAX-USD -92 (n=1326), LINK-USD -93 (n=1147), ADA-USD -94 (n=1224), NEAR-USD -94 (n=1775), SUI-USD -95 (n=1520), DOGE-USD -97 (n=1231), XRP-USD -97 (n=952), SOL-USD -98 (n=1100), ETH-USD -108 (n=747), BTC-USD -110 (n=487), AAVE-USD -113 (n=1383), UNI-USD -113 (n=1470), PENDLE-USD -115 (n=556)
+
+== config C (tp 2.5/4/5%, sl 3/2/1.75%, 48 bars) ==
+activity: 1.89 trades per symbol per day; in a position 83% of bars; average hold 10.5 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades             27783   36/ 60/  4      +2     -174 [ -182, -166]     -104 [ -112,  -96]      -84 [  -92,  -76]
+tier 1 (tp 2.5/sl 3)    9957   51/ 45/  4      -9     -183 [ -191, -175]     -113 [ -121, -105]      -93 [ -101,  -85]   gross break-even target rate 55%
+tier 2 (tp 4/sl 2)      6501   32/ 64/  3      +3     -174 [ -184, -164]     -104 [ -114,  -94]      -84 [  -94,  -74]   gross break-even target rate 33%
+tier 3 (tp 5/sl 1.75)  11325   26/ 70/  5     +12     -165 [ -177, -154]      -95 [ -107,  -84]      -75 [  -87,  -64]   gross break-even target rate 26%
+long                   14217   36/ 60/  4      +4     -172 [ -181, -161]     -102 [ -111,  -91]      -82 [  -91,  -71]
+short                  13566   36/ 60/  4      +1     -175 [ -187, -163]     -105 [ -117,  -93]      -85 [  -97,  -73]
+period 1 of 3           8425   37/ 60/  4      +3     -173 [ -183, -162]     -103 [ -113,  -92]      -83 [  -93,  -72]
+period 2 of 3          10984   37/ 60/  3      +4     -172 [ -185, -159]     -102 [ -115,  -89]      -82 [  -95,  -69]
+period 3 of 3           8374   35/ 59/  6      -0     -176 [ -189, -162]     -106 [ -119,  -92]      -86 [  -99,  -72]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45       5495   51/ 45/  4     -10     -184 [ -194, -175]     -114 [ -124, -105]      -94 [ -104,  -85]
+|score| 0.45-0.55       4462   52/ 45/  3      -7     -182 [ -191, -171]     -112 [ -121, -101]      -92 [ -101,  -81]
+|score| 0.55-0.65       3341   33/ 64/  3      +5     -171 [ -182, -158]     -101 [ -112,  -88]      -81 [  -92,  -68]
+|score| 0.65-0.75       3160   32/ 65/  4      -0     -177 [ -189, -163]     -107 [ -119,  -93]      -87 [  -99,  -73]
+|score| 0.75-0.85       2945   25/ 70/  5      +7     -170 [ -183, -157]     -100 [ -113,  -87]      -80 [  -93,  -67]
+|score| 0.85-0.95       3146   25/ 71/  4      +8     -169 [ -183, -152]      -99 [ -113,  -82]      -79 [  -93,  -62]
+|score| >= 0.95         5234   26/ 69/  5     +16     -161 [ -175, -144]      -91 [ -105,  -74]      -71 [  -85,  -54]
+-- controls on the same entry bars --
+reversed direction     27783   36/ 60/  5      -1     -177 [ -184, -169]     -107 [ -114,  -99]      -87 [  -94,  -79]
+random direction #1    27783   36/ 60/  4      +0     -176 [ -179, -172]     -106 [ -109, -102]      -86 [  -89,  -82]
+random direction #2    27783   36/ 60/  4      +2     -174 [ -178, -171]     -104 [ -108, -101]      -84 [  -88,  -81]
+random direction #3    27783   36/ 60/  4      +1     -175 [ -179, -172]     -105 [ -109, -102]      -85 [  -89,  -82]
+by symbol (net bps @ passive 1.00%): LINK-USD -99 (n=1972), DOGE-USD -100 (n=2189), SOL-USD -100 (n=2038), ETH-USD -100 (n=1319), AAVE-USD -100 (n=2236), TAO-USD -102 (n=2363), ADA-USD -102 (n=2017), BTC-USD -105 (n=900), PENDLE-USD -105 (n=1038), AVAX-USD -105 (n=2163), NEAR-USD -106 (n=2831), SUI-USD -107 (n=2572), XRP-USD -108 (n=1745), UNI-USD -111 (n=2400)
+######## interval 60 min | variant: --min-score 0.95
+14 symbols, 353606 bars; costs are round-trip, plus 0.10% extra on stop exits
+
+tier thresholds on |score|: (0.35, 0.55, 0.75); weights {'trend': 0.3, 'momentum': 0.3, 'osc': 0.2, 'bands': 0.2}; skip if ATR% < 0.35%
+
+variant: min |score| 0.95, regime filter (trade only in the direction of SMA50 vs SMA200) off; bar = 60 min
+
+== config A (tp 2/3.5/5%, sl 1/1.5/2%, 48 bars) ==
+activity: 0.57 trades per symbol per day; in a position 32% of bars; average hold 13.6 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades              8439   27/ 66/  8     +10     -166 [ -180, -153]      -96 [ -110,  -83]      -76 [  -90,  -63]
+tier 1 (tp 2/sl 1)         0   gross break-even target rate 33%
+tier 2 (tp 3.5/sl 1.5)     0   gross break-even target rate 30%
+tier 3 (tp 5/sl 2)      8439   27/ 66/  8     +10     -166 [ -180, -153]      -96 [ -110,  -83]      -76 [  -90,  -63]   gross break-even target rate 29%
+long                    4498   28/ 65/  8     +17     -159 [ -176, -144]      -89 [ -106,  -74]      -69 [  -86,  -54]
+short                   3941   25/ 66/  8      +2     -174 [ -194, -153]     -104 [ -124,  -83]      -84 [ -104,  -63]
+period 1 of 3           2484   26/ 66/  8      +9     -168 [ -186, -145]      -98 [ -116,  -75]      -78 [  -96,  -55]
+period 2 of 3           3199   28/ 66/  6     +16     -161 [ -183, -135]      -91 [ -113,  -65]      -71 [  -93,  -45]
+period 3 of 3           2756   25/ 65/ 10      +5     -171 [ -194, -146]     -101 [ -124,  -76]      -81 [ -104,  -56]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95         8439   27/ 66/  8     +10     -166 [ -180, -153]      -96 [ -110,  -83]      -76 [  -90,  -63]
+-- controls on the same entry bars --
+reversed direction      8439   23/ 68/ 10      -9     -186 [ -196, -173]     -116 [ -126, -103]      -96 [ -106,  -83]
+random direction #1     8439   24/ 67/  9      -2     -179 [ -186, -172]     -109 [ -116, -102]      -89 [  -96,  -82]
+random direction #2     8439   25/ 67/  8      +1     -176 [ -182, -168]     -106 [ -112,  -98]      -86 [  -92,  -78]
+random direction #3     8439   25/ 67/  9      +0     -176 [ -183, -168]     -106 [ -113,  -98]      -86 [  -93,  -78]
+by symbol (net bps @ passive 1.00%): NEAR-USD -76 (n=715), SOL-USD -84 (n=647), ETH-USD -86 (n=575), ADA-USD -91 (n=642), LINK-USD -91 (n=639), DOGE-USD -92 (n=684), UNI-USD -97 (n=678), SUI-USD -98 (n=640), PENDLE-USD -99 (n=221), BTC-USD -100 (n=495), AVAX-USD -102 (n=663), AAVE-USD -103 (n=641), XRP-USD -108 (n=628), TAO-USD -127 (n=571)
+
+== config B (tp 3/5/8%, sl 1.5/2.5/3.5%, 96 bars) ==
+activity: 0.39 trades per symbol per day; in a position 53% of bars; average hold 32.9 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades              5726   27/ 61/ 11     +23     -153 [ -180, -125]      -83 [ -110,  -55]      -63 [  -90,  -35]
+tier 1 (tp 3/sl 1.5)       0   gross break-even target rate 33%
+tier 2 (tp 5/sl 2.5)       0   gross break-even target rate 33%
+tier 3 (tp 8/sl 3.5)    5726   27/ 61/ 11     +23     -153 [ -180, -125]      -83 [ -110,  -55]      -63 [  -90,  -35]   gross break-even target rate 30%
+long                    3057   29/ 61/ 10     +32     -144 [ -178, -110]      -74 [ -108,  -40]      -54 [  -88,  -20]
+short                   2669   26/ 62/ 12     +13     -163 [ -206, -116]      -93 [ -136,  -46]      -73 [ -116,  -26]
+period 1 of 3           1678   27/ 62/ 11     +18     -158 [ -195, -117]      -88 [ -125,  -47]      -68 [ -105,  -27]
+period 2 of 3           2166   30/ 62/  8     +37     -139 [ -193,  -90]      -69 [ -123,  -20]      -49 [ -103,   +0]
+period 3 of 3           1882   25/ 60/ 15     +12     -164 [ -212, -114]      -94 [ -142,  -44]      -74 [ -122,  -24]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95         5726   27/ 61/ 11     +23     -153 [ -180, -125]      -83 [ -110,  -55]      -63 [  -90,  -35]
+-- controls on the same entry bars --
+reversed direction      5726   23/ 64/ 13     -13     -189 [ -210, -167]     -119 [ -140,  -97]      -99 [ -120,  -77]
+random direction #1     5726   26/ 63/ 12      +9     -167 [ -181, -152]      -97 [ -111,  -82]      -77 [  -91,  -62]
+random direction #2     5726   25/ 63/ 12      +5     -171 [ -186, -156]     -101 [ -116,  -86]      -81 [  -96,  -66]
+random direction #3     5726   25/ 63/ 12      +1     -175 [ -189, -161]     -105 [ -119,  -91]      -85 [  -99,  -71]
+by symbol (net bps @ passive 1.00%): NEAR-USD -58 (n=501), DOGE-USD -59 (n=451), LINK-USD -63 (n=430), AVAX-USD -68 (n=459), SOL-USD -78 (n=432), ETH-USD -80 (n=374), SUI-USD -85 (n=448), ADA-USD -91 (n=455), PENDLE-USD -92 (n=125), BTC-USD -93 (n=296), UNI-USD -95 (n=472), TAO-USD -97 (n=410), AAVE-USD -106 (n=463), XRP-USD -109 (n=410)
+
+== config C (tp 2.5/4/5%, sl 3/2/1.75%, 48 bars) ==
+activity: 0.59 trades per symbol per day; in a position 30% of bars; average hold 12.2 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades              8695   25/ 69/  7     +10     -167 [ -179, -155]      -97 [ -109,  -85]      -77 [  -89,  -65]
+tier 1 (tp 2.5/sl 3)       0   gross break-even target rate 55%
+tier 2 (tp 4/sl 2)         0   gross break-even target rate 33%
+tier 3 (tp 5/sl 1.75)   8695   25/ 69/  7     +10     -167 [ -179, -155]      -97 [ -109,  -85]      -77 [  -89,  -65]   gross break-even target rate 26%
+long                    4635   26/ 68/  6     +17     -159 [ -176, -145]      -89 [ -106,  -75]      -69 [  -86,  -55]
+short                   4060   23/ 70/  7      +2     -175 [ -194, -156]     -105 [ -124,  -86]      -85 [ -104,  -66]
+period 1 of 3           2558   25/ 69/  6      +9     -168 [ -186, -150]      -98 [ -116,  -80]      -78 [  -96,  -60]
+period 2 of 3           3291   26/ 69/  5     +17     -160 [ -182, -138]      -90 [ -112,  -68]      -70 [  -92,  -48]
+period 3 of 3           2846   23/ 69/  9      +3     -174 [ -197, -153]     -104 [ -127,  -83]      -84 [ -107,  -63]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95         8695   25/ 69/  7     +10     -167 [ -179, -155]      -97 [ -109,  -85]      -77 [  -89,  -65]
+-- controls on the same entry bars --
+reversed direction      8695   21/ 71/  8      -7     -184 [ -195, -174]     -114 [ -125, -104]      -94 [ -105,  -84]
+random direction #1     8695   23/ 70/  7      +1     -176 [ -183, -170]     -106 [ -113, -100]      -86 [  -93,  -80]
+random direction #2     8695   22/ 70/  7      -1     -178 [ -185, -171]     -108 [ -115, -101]      -88 [  -95,  -81]
+random direction #3     8695   22/ 71/  7      -5     -182 [ -188, -175]     -112 [ -118, -105]      -92 [  -98,  -85]
+by symbol (net bps @ passive 1.00%): NEAR-USD -84 (n=735), ETH-USD -85 (n=593), LINK-USD -87 (n=656), SOL-USD -90 (n=669), ADA-USD -92 (n=658), DOGE-USD -94 (n=704), PENDLE-USD -97 (n=229), SUI-USD -99 (n=668), AAVE-USD -101 (n=656), AVAX-USD -102 (n=685), UNI-USD -102 (n=708), BTC-USD -103 (n=508), XRP-USD -106 (n=641), TAO-USD -120 (n=585)
+######## interval 60 min | variant: --min-score 0.95 --regime
+14 symbols, 353606 bars; costs are round-trip, plus 0.10% extra on stop exits
+
+tier thresholds on |score|: (0.35, 0.55, 0.75); weights {'trend': 0.3, 'momentum': 0.3, 'osc': 0.2, 'bands': 0.2}; skip if ATR% < 0.35%
+
+variant: min |score| 0.95, regime filter (trade only in the direction of SMA50 vs SMA200) on; bar = 60 min
+
+== config A (tp 2/3.5/5%, sl 1/1.5/2%, 48 bars) ==
+activity: 0.34 trades per symbol per day; in a position 18% of bars; average hold 12.4 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades              5025   27/ 66/  7     +11     -166 [ -181, -152]      -96 [ -111,  -82]      -76 [  -91,  -62]
+tier 1 (tp 2/sl 1)         0   gross break-even target rate 33%
+tier 2 (tp 3.5/sl 1.5)     0   gross break-even target rate 30%
+tier 3 (tp 5/sl 2)      5025   27/ 66/  7     +11     -166 [ -181, -152]      -96 [ -111,  -82]      -76 [  -91,  -62]   gross break-even target rate 29%
+long                    2684   28/ 65/  7     +18     -159 [ -177, -140]      -89 [ -107,  -70]      -69 [  -87,  -50]
+short                   2341   26/ 67/  6      +3     -174 [ -198, -149]     -104 [ -128,  -79]      -84 [ -108,  -59]
+period 1 of 3           1477   28/ 66/  6     +16     -161 [ -183, -137]      -91 [ -113,  -67]      -71 [  -93,  -47]
+period 2 of 3           1862   28/ 66/  6     +14     -162 [ -186, -135]      -92 [ -116,  -65]      -72 [  -96,  -45]
+period 3 of 3           1686   25/ 66/  8      +2     -175 [ -204, -147]     -105 [ -134,  -77]      -85 [ -114,  -57]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95         5025   27/ 66/  7     +11     -166 [ -181, -152]      -96 [ -111,  -82]      -76 [  -91,  -62]
+-- controls on the same entry bars --
+reversed direction      5025   23/ 69/  8     -11     -188 [ -201, -172]     -118 [ -131, -102]      -98 [ -111,  -82]
+random direction #1     5025   26/ 67/  7      +4     -173 [ -183, -163]     -103 [ -113,  -93]      -83 [  -93,  -73]
+random direction #2     5025   25/ 68/  7      -2     -179 [ -189, -170]     -109 [ -119, -100]      -89 [  -99,  -80]
+random direction #3     5025   26/ 67/  8      +6     -171 [ -180, -162]     -101 [ -110,  -92]      -81 [  -90,  -72]
+by symbol (net bps @ passive 1.00%): ETH-USD -78 (n=342), SOL-USD -81 (n=394), BTC-USD -83 (n=300), NEAR-USD -84 (n=431), DOGE-USD -85 (n=421), PENDLE-USD -94 (n=56), SUI-USD -96 (n=362), ADA-USD -98 (n=412), LINK-USD -98 (n=393), XRP-USD -102 (n=392), UNI-USD -104 (n=403), AVAX-USD -111 (n=392), AAVE-USD -111 (n=381), TAO-USD -115 (n=346)
+
+== config B (tp 3/5/8%, sl 1.5/2.5/3.5%, 96 bars) ==
+activity: 0.24 trades per symbol per day; in a position 32% of bars; average hold 31.8 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades              3562   28/ 62/ 11     +24     -152 [ -186, -121]      -82 [ -116,  -51]      -62 [  -96,  -31]
+tier 1 (tp 3/sl 1.5)       0   gross break-even target rate 33%
+tier 2 (tp 5/sl 2.5)       0   gross break-even target rate 33%
+tier 3 (tp 8/sl 3.5)    3562   28/ 62/ 11     +24     -152 [ -186, -121]      -82 [ -116,  -51]      -62 [  -96,  -31]   gross break-even target rate 30%
+long                    1895   29/ 61/ 10     +33     -143 [ -175, -111]      -73 [ -105,  -41]      -53 [  -85,  -21]
+short                   1667   27/ 62/ 11     +13     -163 [ -214, -108]      -93 [ -144,  -38]      -73 [ -124,  -18]
+period 1 of 3           1038   27/ 63/ 10     +14     -162 [ -205, -115]      -92 [ -135,  -45]      -72 [ -115,  -25]
+period 2 of 3           1332   30/ 63/  7     +26     -150 [ -206,  -87]      -80 [ -136,  -17]      -60 [ -116,   +3]
+period 3 of 3           1192   27/ 59/ 15     +29     -147 [ -212,  -90]      -77 [ -142,  -20]      -57 [ -122,   -0]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95         3562   28/ 62/ 11     +24     -152 [ -186, -121]      -82 [ -116,  -51]      -62 [  -96,  -31]
+-- controls on the same entry bars --
+reversed direction      3562   23/ 65/ 12     -20     -196 [ -226, -165]     -126 [ -156,  -95]     -106 [ -136,  -75]
+random direction #1     3562   25/ 64/ 11      -3     -179 [ -199, -159]     -109 [ -129,  -89]      -89 [ -109,  -69]
+random direction #2     3562   24/ 65/ 11     -11     -187 [ -206, -170]     -117 [ -136, -100]      -97 [ -116,  -80]
+random direction #3     3562   25/ 64/ 11      -1     -177 [ -195, -159]     -107 [ -125,  -89]      -87 [ -105,  -69]
+by symbol (net bps @ passive 1.00%): DOGE-USD -51 (n=287), PENDLE-USD -62 (n=39), SUI-USD -62 (n=265), SOL-USD -65 (n=278), NEAR-USD -68 (n=305), BTC-USD -75 (n=200), LINK-USD -82 (n=279), ADA-USD -83 (n=285), ETH-USD -86 (n=239), AVAX-USD -92 (n=284), UNI-USD -95 (n=282), TAO-USD -98 (n=258), XRP-USD -102 (n=272), AAVE-USD -115 (n=289)
+
+== config C (tp 2.5/4/5%, sl 3/2/1.75%, 48 bars) ==
+activity: 0.35 trades per symbol per day; in a position 16% of bars; average hold 11.0 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades              5192   25/ 70/  5      +9     -168 [ -181, -156]      -98 [ -111,  -86]      -78 [  -91,  -66]
+tier 1 (tp 2.5/sl 3)       0   gross break-even target rate 55%
+tier 2 (tp 4/sl 2)         0   gross break-even target rate 33%
+tier 3 (tp 5/sl 1.75)   5192   25/ 70/  5      +9     -168 [ -181, -156]      -98 [ -111,  -86]      -78 [  -91,  -66]   gross break-even target rate 26%
+long                    2781   26/ 69/  6     +15     -162 [ -177, -145]      -92 [ -107,  -75]      -72 [  -87,  -55]
+short                   2411   24/ 71/  5      +2     -176 [ -196, -148]     -106 [ -126,  -78]      -86 [ -106,  -58]
+period 1 of 3           1521   26/ 69/  5     +14     -163 [ -186, -141]      -93 [ -116,  -71]      -73 [  -96,  -51]
+period 2 of 3           1920   26/ 69/  5     +16     -161 [ -182, -136]      -91 [ -112,  -66]      -71 [  -92,  -46]
+period 3 of 3           1751   23/ 71/  7      -3     -180 [ -205, -155]     -110 [ -135,  -85]      -90 [ -115,  -65]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95         5192   25/ 70/  5      +9     -168 [ -181, -156]      -98 [ -111,  -86]      -78 [  -91,  -66]
+-- controls on the same entry bars --
+reversed direction      5192   21/ 72/  7      -9     -186 [ -199, -174]     -116 [ -129, -104]      -96 [ -109,  -84]
+random direction #1     5192   23/ 71/  6      -1     -178 [ -188, -170]     -108 [ -118, -100]      -88 [  -98,  -80]
+random direction #2     5192   24/ 71/  6      +1     -176 [ -185, -166]     -106 [ -115,  -96]      -86 [  -95,  -76]
+random direction #3     5192   23/ 71/  6      +1     -176 [ -185, -168]     -106 [ -115,  -98]      -86 [  -95,  -78]
+by symbol (net bps @ passive 1.00%): ETH-USD -75 (n=350), BTC-USD -86 (n=306), SOL-USD -87 (n=412), DOGE-USD -91 (n=434), PENDLE-USD -93 (n=57), NEAR-USD -95 (n=445), LINK-USD -96 (n=405), ADA-USD -97 (n=423), SUI-USD -100 (n=381), XRP-USD -102 (n=398), UNI-USD -107 (n=427), AAVE-USD -109 (n=392), AVAX-USD -113 (n=404), TAO-USD -115 (n=358)
+######## interval 240 min | variant: base
+14 symbols, 87785 bars; costs are round-trip, plus 0.10% extra on stop exits
+
+tier thresholds on |score|: (0.35, 0.55, 0.75); weights {'trend': 0.3, 'momentum': 0.3, 'osc': 0.2, 'bands': 0.2}; skip if ATR% < 0.35%
+
+variant: min |score| 0, regime filter (trade only in the direction of SMA50 vs SMA200) off; bar = 240 min
+
+== config A (tp 2/3.5/5%, sl 1/1.5/2%, 48 bars) ==
+activity: 1.58 trades per symbol per day; in a position 66% of bars; average hold 2.5 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades             23180   31/ 69/  0      +3     -174 [ -180, -168]     -104 [ -110,  -98]      -84 [  -90,  -78]
+tier 1 (tp 2/sl 1)     10484   31/ 69/  0      -6     -183 [ -186, -178]     -113 [ -116, -108]      -93 [  -96,  -88]   gross break-even target rate 33%
+tier 2 (tp 3.5/sl 1.5)  6005   31/ 69/  0      +3     -174 [ -183, -165]     -104 [ -113,  -95]      -84 [  -93,  -75]   gross break-even target rate 30%
+tier 3 (tp 5/sl 2)      6691   31/ 69/  0     +16     -161 [ -176, -143]      -91 [ -106,  -73]      -71 [  -86,  -53]   gross break-even target rate 29%
+long                   11483   30/ 69/  0      +2     -175 [ -183, -166]     -105 [ -113,  -96]      -85 [  -93,  -76]
+short                  11697   31/ 68/  0      +4     -173 [ -183, -163]     -103 [ -113,  -93]      -83 [  -93,  -73]
+period 1 of 3           7121   31/ 68/  0      +4     -173 [ -182, -162]     -103 [ -112,  -92]      -83 [  -92,  -72]
+period 2 of 3           9295   31/ 69/  0      +3     -174 [ -185, -162]     -104 [ -115,  -92]      -84 [  -95,  -72]
+period 3 of 3           6764   30/ 69/  0      +0     -177 [ -189, -164]     -107 [ -119,  -94]      -87 [  -99,  -74]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45       5891   31/ 69/  0      -8     -185 [ -190, -180]     -115 [ -120, -110]      -95 [ -100,  -90]
+|score| 0.45-0.55       4593   32/ 68/  0      -3     -180 [ -186, -176]     -110 [ -116, -106]      -90 [  -96,  -86]
+|score| 0.55-0.65       3388   31/ 69/  0      +6     -170 [ -181, -160]     -100 [ -111,  -90]      -80 [  -91,  -70]
+|score| 0.65-0.75       2617   29/ 71/  0      -3     -180 [ -191, -168]     -110 [ -121,  -98]      -90 [ -101,  -78]
+|score| 0.75-0.85       2035   30/ 70/  0     +11     -166 [ -185, -147]      -96 [ -115,  -77]      -76 [  -95,  -57]
+|score| 0.85-0.95       1898   29/ 71/  0      +4     -173 [ -193, -151]     -103 [ -123,  -81]      -83 [ -103,  -61]
+|score| >= 0.95         2758   33/ 67/  0     +28     -148 [ -169, -122]      -78 [  -99,  -52]      -58 [  -79,  -32]
+-- controls on the same entry bars --
+reversed direction     23180   30/ 70/  0      -7     -184 [ -190, -178]     -114 [ -120, -108]      -94 [ -100,  -88]
+random direction #1    23180   30/ 70/  0      -2     -179 [ -182, -175]     -109 [ -112, -105]      -89 [  -92,  -85]
+random direction #2    23180   30/ 70/  0      -2     -179 [ -182, -176]     -109 [ -112, -106]      -89 [  -92,  -86]
+random direction #3    23180   30/ 69/  0      -1     -178 [ -181, -174]     -108 [ -111, -104]      -88 [  -91,  -84]
+by symbol (net bps @ passive 1.00%): DOGE-USD -91 (n=1740), ADA-USD -99 (n=1670), BTC-USD -100 (n=741), XRP-USD -101 (n=1371), PENDLE-USD -101 (n=1736), ETH-USD -102 (n=1145), NEAR-USD -106 (n=2133), SOL-USD -106 (n=1618), AVAX-USD -106 (n=1803), SUI-USD -107 (n=2111), AAVE-USD -108 (n=1825), UNI-USD -108 (n=1875), LINK-USD -110 (n=1617), TAO-USD -111 (n=1795)
+
+== config B (tp 3/5/8%, sl 1.5/2.5/3.5%, 96 bars) ==
+activity: 0.87 trades per symbol per day; in a position 71% of bars; average hold 4.9 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades             12766   33/ 67/  0      +7     -170 [ -184, -154]     -100 [ -114,  -84]      -80 [  -94,  -64]
+tier 1 (tp 3/sl 1.5)    5862   33/ 67/  0      -1     -178 [ -186, -170]     -108 [ -116, -100]      -88 [  -96,  -80]   gross break-even target rate 33%
+tier 2 (tp 5/sl 2.5)    3015   33/ 67/  0      -4     -180 [ -196, -164]     -110 [ -126,  -94]      -90 [ -106,  -74]   gross break-even target rate 33%
+tier 3 (tp 8/sl 3.5)    3889   33/ 67/  0     +28     -148 [ -182, -114]      -78 [ -112,  -44]      -58 [  -92,  -24]   gross break-even target rate 30%
+long                    6356   33/ 67/  0     +11     -165 [ -183, -147]      -95 [ -113,  -77]      -75 [  -93,  -57]
+short                   6410   33/ 67/  0      +3     -174 [ -196, -155]     -104 [ -126,  -85]      -84 [ -106,  -65]
+period 1 of 3           3895   33/ 67/  0      +5     -172 [ -192, -154]     -102 [ -122,  -84]      -82 [ -102,  -64]
+period 2 of 3           5363   33/ 67/  0      +9     -168 [ -188, -144]      -98 [ -118,  -74]      -78 [  -98,  -54]
+period 3 of 3           3508   33/ 67/  0      +8     -169 [ -199, -143]      -99 [ -129,  -73]      -79 [ -109,  -53]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45       3479   32/ 68/  0      -5     -182 [ -190, -174]     -112 [ -120, -104]      -92 [ -100,  -84]
+|score| 0.45-0.55       2383   34/ 66/  0      +5     -172 [ -183, -161]     -102 [ -113,  -91]      -82 [  -93,  -71]
+|score| 0.55-0.65       1664   34/ 66/  0      +3     -173 [ -192, -154]     -103 [ -122,  -84]      -83 [ -102,  -64]
+|score| 0.65-0.75       1351   32/ 68/  0     -12     -189 [ -213, -167]     -119 [ -143,  -97]      -99 [ -123,  -77]
+|score| 0.75-0.85       1090   32/ 67/  0     +22     -155 [ -195, -115]      -85 [ -125,  -45]      -65 [ -105,  -25]
+|score| 0.85-0.95       1064   29/ 71/  0     -20     -198 [ -241, -161]     -128 [ -171,  -91]     -108 [ -151,  -71]
+|score| >= 0.95         1735   36/ 64/  0     +62     -114 [ -161,  -63]      -44 [  -91,   +7]      -24 [  -71,  +27]
+-- controls on the same entry bars --
+reversed direction     12766   32/ 68/  0      -5     -182 [ -196, -168]     -112 [ -126,  -98]      -92 [ -106,  -78]
+random direction #1    12766   33/ 67/  0      +5     -172 [ -178, -164]     -102 [ -108,  -94]      -82 [  -88,  -74]
+random direction #2    12766   32/ 67/  0      +2     -175 [ -182, -168]     -105 [ -112,  -98]      -85 [  -92,  -78]
+random direction #3    12766   33/ 67/  0      +2     -174 [ -181, -167]     -104 [ -111,  -97]      -84 [  -91,  -77]
+by symbol (net bps @ passive 1.00%): DOGE-USD -82 (n=970), ADA-USD -85 (n=896), XRP-USD -88 (n=705), TAO-USD -94 (n=1060), SOL-USD -94 (n=826), NEAR-USD -101 (n=1215), SUI-USD -102 (n=1221), PENDLE-USD -104 (n=1047), UNI-USD -105 (n=1053), LINK-USD -107 (n=871), ETH-USD -107 (n=588), BTC-USD -107 (n=346), AAVE-USD -107 (n=990), AVAX-USD -111 (n=978)
+
+== config C (tp 2.5/4/5%, sl 3/2/1.75%, 48 bars) ==
+activity: 1.27 trades per symbol per day; in a position 74% of bars; average hold 3.5 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades             18578   39/ 61/  0      +2     -174 [ -182, -164]     -104 [ -112,  -94]      -84 [  -92,  -74]
+tier 1 (tp 2.5/sl 3)    6887   53/ 47/  0     -10     -185 [ -195, -174]     -115 [ -125, -104]      -95 [ -105,  -84]   gross break-even target rate 55%
+tier 2 (tp 4/sl 2)      4959   34/ 66/  0      +2     -174 [ -185, -162]     -104 [ -115,  -92]      -84 [  -95,  -72]   gross break-even target rate 33%
+tier 3 (tp 5/sl 1.75)   6732   28/ 72/  0     +15     -162 [ -175, -146]      -92 [ -105,  -76]      -72 [  -85,  -56]   gross break-even target rate 26%
+long                    9330   38/ 62/  0      +3     -173 [ -186, -161]     -103 [ -116,  -91]      -83 [  -96,  -71]
+short                   9248   39/ 61/  0      +1     -175 [ -189, -161]     -105 [ -119,  -91]      -85 [  -99,  -71]
+period 1 of 3           5750   39/ 61/  0      +2     -174 [ -186, -159]     -104 [ -116,  -89]      -84 [  -96,  -69]
+period 2 of 3           7473   39/ 61/  0      +4     -172 [ -187, -156]     -102 [ -117,  -86]      -82 [  -97,  -66]
+period 3 of 3           5355   38/ 62/  0      -1     -177 [ -195, -161]     -107 [ -125,  -91]      -87 [ -105,  -71]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45       3730   52/ 48/  0     -12     -187 [ -197, -174]     -117 [ -127, -104]      -97 [ -107,  -84]
+|score| 0.45-0.55       3157   53/ 47/  0      -8     -183 [ -195, -172]     -113 [ -125, -102]      -93 [ -105,  -82]
+|score| 0.55-0.65       2635   34/ 66/  0      +3     -173 [ -187, -159]     -103 [ -117,  -89]      -83 [  -97,  -69]
+|score| 0.65-0.75       2324   34/ 66/  0      +1     -176 [ -191, -160]     -106 [ -121,  -90]      -86 [ -101,  -70]
+|score| 0.75-0.85       1966   27/ 73/  0      +8     -169 [ -187, -151]      -99 [ -117,  -81]      -79 [  -97,  -61]
+|score| 0.85-0.95       1935   26/ 74/  0      +2     -175 [ -192, -156]     -105 [ -122,  -86]      -85 [ -102,  -66]
+|score| >= 0.95         2831   30/ 70/  0     +28     -149 [ -167, -128]      -79 [  -97,  -58]      -59 [  -77,  -38]
+-- controls on the same entry bars --
+reversed direction     18578   37/ 63/  0      -7     -183 [ -191, -174]     -113 [ -121, -104]      -93 [ -101,  -84]
+random direction #1    18578   38/ 62/  0      -2     -178 [ -183, -173]     -108 [ -113, -103]      -88 [  -93,  -83]
+random direction #2    18578   38/ 62/  0      -3     -180 [ -184, -175]     -110 [ -114, -105]      -90 [  -94,  -85]
+random direction #3    18578   39/ 61/  0      +1     -175 [ -180, -170]     -105 [ -110, -100]      -85 [  -90,  -80]
+by symbol (net bps @ passive 1.00%): DOGE-USD -91 (n=1412), XRP-USD -99 (n=1101), NEAR-USD -101 (n=1724), BTC-USD -101 (n=558), UNI-USD -101 (n=1479), TAO-USD -102 (n=1450), ADA-USD -102 (n=1371), AAVE-USD -104 (n=1431), LINK-USD -104 (n=1311), AVAX-USD -106 (n=1426), ETH-USD -106 (n=897), SUI-USD -110 (n=1703), PENDLE-USD -112 (n=1405), SOL-USD -114 (n=1310)
+######## interval 240 min | variant: --min-score 0.95
+14 symbols, 87785 bars; costs are round-trip, plus 0.10% extra on stop exits
+
+tier thresholds on |score|: (0.35, 0.55, 0.75); weights {'trend': 0.3, 'momentum': 0.3, 'osc': 0.2, 'bands': 0.2}; skip if ATR% < 0.35%
+
+variant: min |score| 0.95, regime filter (trade only in the direction of SMA50 vs SMA200) off; bar = 240 min
+
+== config A (tp 2/3.5/5%, sl 1/1.5/2%, 48 bars) ==
+activity: 0.24 trades per symbol per day; in a position 15% of bars; average hold 3.7 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades              3483   32/ 68/  0     +24     -153 [ -175, -131]      -83 [ -105,  -61]      -63 [  -85,  -41]
+tier 1 (tp 2/sl 1)         0   gross break-even target rate 33%
+tier 2 (tp 3.5/sl 1.5)     0   gross break-even target rate 30%
+tier 3 (tp 5/sl 2)      3483   32/ 68/  0     +24     -153 [ -175, -131]      -83 [ -105,  -61]      -63 [  -85,  -41]   gross break-even target rate 29%
+long                    1986   33/ 67/  0     +29     -147 [ -172, -121]      -77 [ -102,  -51]      -57 [  -82,  -31]
+short                   1497   31/ 69/  0     +16     -161 [ -196, -123]      -91 [ -126,  -53]      -71 [ -106,  -33]
+period 1 of 3            980   29/ 70/  0      +7     -170 [ -200, -138]     -100 [ -130,  -68]      -80 [ -110,  -48]
+period 2 of 3           1378   36/ 64/  0     +51     -125 [ -161,  -90]      -55 [  -91,  -20]      -35 [  -71,   +0]
+period 3 of 3           1128   29/ 71/  0      +5     -172 [ -216, -133]     -102 [ -146,  -63]      -82 [ -126,  -43]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95         3483   32/ 68/  0     +24     -153 [ -175, -131]      -83 [ -105,  -61]      -63 [  -85,  -41]
+-- controls on the same entry bars --
+reversed direction      3483   24/ 76/  0     -31     -209 [ -228, -190]     -139 [ -158, -120]     -119 [ -138, -100]
+random direction #1     3483   27/ 73/  0      -9     -186 [ -199, -174]     -116 [ -129, -104]      -96 [ -109,  -84]
+random direction #2     3483   28/ 72/  0      -5     -183 [ -194, -168]     -113 [ -124,  -98]      -93 [ -104,  -78]
+random direction #3     3483   28/ 72/  0      -3     -180 [ -193, -167]     -110 [ -123,  -97]      -90 [ -103,  -77]
+by symbol (net bps @ passive 1.00%): ETH-USD -60 (n=220), SOL-USD -63 (n=257), UNI-USD -75 (n=266), DOGE-USD -77 (n=298), ADA-USD -80 (n=268), NEAR-USD -80 (n=281), BTC-USD -82 (n=186), SUI-USD -84 (n=283), AVAX-USD -87 (n=242), XRP-USD -87 (n=263), AAVE-USD -93 (n=255), LINK-USD -97 (n=237), TAO-USD -100 (n=226), PENDLE-USD -102 (n=201)
+
+== config B (tp 3/5/8%, sl 1.5/2.5/3.5%, 96 bars) ==
+activity: 0.17 trades per symbol per day; in a position 26% of bars; average hold 9.4 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades              2480   34/ 65/  0     +46     -130 [ -174,  -85]      -60 [ -104,  -15]      -40 [  -84,   +5]
+tier 1 (tp 3/sl 1.5)       0   gross break-even target rate 33%
+tier 2 (tp 5/sl 2.5)       0   gross break-even target rate 33%
+tier 3 (tp 8/sl 3.5)    2480   34/ 65/  0     +46     -130 [ -174,  -85]      -60 [ -104,  -15]      -40 [  -84,   +5]   gross break-even target rate 30%
+long                    1375   35/ 65/  0     +49     -128 [ -173,  -74]      -58 [ -103,   -4]      -38 [  -83,  +16]
+short                   1105   34/ 66/  0     +43     -133 [ -221,  -36]      -63 [ -151,  +34]      -43 [ -131,  +54]
+period 1 of 3            711   32/ 68/  0     +20     -156 [ -220, -101]      -86 [ -150,  -31]      -66 [ -130,  -11]
+period 2 of 3            993   36/ 64/  0     +63     -113 [ -191,  -37]      -43 [ -121,  +33]      -23 [ -101,  +53]
+period 3 of 3            779   34/ 65/  1     +49     -128 [ -216,  -33]      -58 [ -146,  +37]      -38 [ -126,  +57]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95         2480   34/ 65/  0     +46     -130 [ -174,  -85]      -60 [ -104,  -15]      -40 [  -84,   +5]
+-- controls on the same entry bars --
+reversed direction      2480   27/ 73/  1     -38     -215 [ -251, -167]     -145 [ -181,  -97]     -125 [ -161,  -77]
+random direction #1     2480   31/ 68/  1     +11     -165 [ -188, -142]      -95 [ -118,  -72]      -75 [  -98,  -52]
+random direction #2     2480   31/ 69/  0      +4     -173 [ -200, -151]     -103 [ -130,  -81]      -83 [ -110,  -61]
+random direction #3     2480   30/ 69/  1      +1     -176 [ -202, -152]     -106 [ -132,  -82]      -86 [ -112,  -62]
+by symbol (net bps @ passive 1.00%): SOL-USD +12 (n=179), PENDLE-USD -33 (n=144), ADA-USD -41 (n=191), ETH-USD -43 (n=153), DOGE-USD -44 (n=212), AVAX-USD -48 (n=186), TAO-USD -57 (n=167), BTC-USD -58 (n=122), LINK-USD -67 (n=174), SUI-USD -80 (n=197), UNI-USD -86 (n=189), AAVE-USD -88 (n=181), NEAR-USD -89 (n=199), XRP-USD -106 (n=186)
+
+== config C (tp 2.5/4/5%, sl 3/2/1.75%, 48 bars) ==
+activity: 0.25 trades per symbol per day; in a position 14% of bars; average hold 3.4 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades              3585   29/ 71/  0     +22     -155 [ -174, -135]      -85 [ -104,  -65]      -65 [  -84,  -45]
+tier 1 (tp 2.5/sl 3)       0   gross break-even target rate 55%
+tier 2 (tp 4/sl 2)         0   gross break-even target rate 33%
+tier 3 (tp 5/sl 1.75)   3585   29/ 71/  0     +22     -155 [ -174, -135]      -85 [ -104,  -65]      -65 [  -84,  -45]   gross break-even target rate 26%
+long                    2047   30/ 70/  0     +29     -148 [ -168, -123]      -78 [  -98,  -53]      -58 [  -78,  -33]
+short                   1538   28/ 72/  0     +12     -165 [ -198, -131]      -95 [ -128,  -61]      -75 [ -108,  -41]
+period 1 of 3           1004   26/ 74/  0      +3     -175 [ -203, -145]     -105 [ -133,  -75]      -85 [ -113,  -55]
+period 2 of 3           1418   33/ 67/  0     +49     -127 [ -161,  -93]      -57 [  -91,  -23]      -37 [  -71,   -3]
+period 3 of 3           1166   27/ 73/  0      +5     -173 [ -212, -136]     -103 [ -142,  -66]      -83 [ -122,  -46]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95         3585   29/ 71/  0     +22     -155 [ -174, -135]      -85 [ -104,  -65]      -65 [  -84,  -45]
+-- controls on the same entry bars --
+reversed direction      3585   22/ 78/  0     -26     -204 [ -221, -186]     -134 [ -151, -116]     -114 [ -131,  -96]
+random direction #1     3585   25/ 75/  0      -4     -181 [ -194, -169]     -111 [ -124,  -99]      -91 [ -104,  -79]
+random direction #2     3585   25/ 75/  0      -8     -186 [ -197, -174]     -116 [ -127, -104]      -96 [ -107,  -84]
+random direction #3     3585   26/ 74/  0      +1     -177 [ -189, -164]     -107 [ -119,  -94]      -87 [  -99,  -74]
+by symbol (net bps @ passive 1.00%): ETH-USD -69 (n=227), DOGE-USD -72 (n=305), SOL-USD -75 (n=265), UNI-USD -75 (n=271), ADA-USD -80 (n=278), BTC-USD -81 (n=192), NEAR-USD -83 (n=292), LINK-USD -90 (n=242), AAVE-USD -91 (n=261), AVAX-USD -92 (n=249), SUI-USD -93 (n=293), XRP-USD -94 (n=272), TAO-USD -101 (n=231), PENDLE-USD -103 (n=207)
+######## interval 240 min | variant: --min-score 0.95 --regime
+14 symbols, 87785 bars; costs are round-trip, plus 0.10% extra on stop exits
+
+tier thresholds on |score|: (0.35, 0.55, 0.75); weights {'trend': 0.3, 'momentum': 0.3, 'osc': 0.2, 'bands': 0.2}; skip if ATR% < 0.35%
+
+variant: min |score| 0.95, regime filter (trade only in the direction of SMA50 vs SMA200) on; bar = 240 min
+
+== config A (tp 2/3.5/5%, sl 1/1.5/2%, 48 bars) ==
+activity: 0.14 trades per symbol per day; in a position 8% of bars; average hold 3.3 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades              2050   32/ 68/  0     +25     -152 [ -179, -122]      -82 [ -109,  -52]      -62 [  -89,  -32]
+tier 1 (tp 2/sl 1)         0   gross break-even target rate 33%
+tier 2 (tp 3.5/sl 1.5)     0   gross break-even target rate 30%
+tier 3 (tp 5/sl 2)      2050   32/ 68/  0     +25     -152 [ -179, -122]      -82 [ -109,  -52]      -62 [  -89,  -32]   gross break-even target rate 29%
+long                    1142   31/ 68/  0     +20     -157 [ -185, -131]      -87 [ -115,  -61]      -67 [  -95,  -41]
+short                    908   33/ 67/  0     +31     -145 [ -197,  -92]      -75 [ -127,  -22]      -55 [ -107,   -2]
+period 1 of 3            549   30/ 70/  0      +9     -168 [ -201, -125]      -98 [ -131,  -55]      -78 [ -111,  -35]
+period 2 of 3            858   36/ 63/  0     +56     -120 [ -165,  -76]      -50 [  -95,   -6]      -30 [  -75,  +14]
+period 3 of 3            643   28/ 72/  0      -4     -181 [ -229, -134]     -111 [ -159,  -64]      -91 [ -139,  -44]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95         2050   32/ 68/  0     +25     -152 [ -179, -122]      -82 [ -109,  -52]      -62 [  -89,  -32]
+-- controls on the same entry bars --
+reversed direction      2050   24/ 76/  0     -33     -211 [ -235, -181]     -141 [ -165, -111]     -121 [ -145,  -91]
+random direction #1     2050   29/ 71/  0      +5     -172 [ -187, -156]     -102 [ -117,  -86]      -82 [  -97,  -66]
+random direction #2     2050   28/ 72/  0      -6     -183 [ -202, -166]     -113 [ -132,  -96]      -93 [ -112,  -76]
+random direction #3     2050   28/ 72/  0      -6     -183 [ -199, -168]     -113 [ -129,  -98]      -93 [ -109,  -78]
+by symbol (net bps @ passive 1.00%): ADA-USD -50 (n=150), UNI-USD -54 (n=158), BTC-USD -57 (n=109), ETH-USD -59 (n=144), SOL-USD -73 (n=147), DOGE-USD -76 (n=197), AVAX-USD -77 (n=149), AAVE-USD -81 (n=149), NEAR-USD -94 (n=164), SUI-USD -97 (n=163), LINK-USD -101 (n=136), XRP-USD -103 (n=149), PENDLE-USD -109 (n=106), TAO-USD -128 (n=129)
+
+== config B (tp 3/5/8%, sl 1.5/2.5/3.5%, 96 bars) ==
+activity: 0.10 trades per symbol per day; in a position 13% of bars; average hold 8.0 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades              1456   35/ 64/  0     +59     -118 [ -181,  -57]      -48 [ -111,  +13]      -28 [  -91,  +33]
+tier 1 (tp 3/sl 1.5)       0   gross break-even target rate 33%
+tier 2 (tp 5/sl 2.5)       0   gross break-even target rate 33%
+tier 3 (tp 8/sl 3.5)    1456   35/ 64/  0     +59     -118 [ -181,  -57]      -48 [ -111,  +13]      -28 [  -91,  +33]   gross break-even target rate 30%
+long                     782   34/ 65/  0     +45     -132 [ -180,  -76]      -62 [ -110,   -6]      -42 [  -90,  +14]
+short                    674   37/ 63/  0     +75     -101 [ -210,   +6]      -31 [ -140,  +76]      -11 [ -120,  +96]
+period 1 of 3            392   32/ 68/  0     +23     -154 [ -226,  -70]      -84 [ -156,   -0]      -64 [ -136,  +20]
+period 2 of 3            621   38/ 62/  0     +88      -88 [ -186,   +8]      -18 [ -116,  +78]       +2 [  -96,  +98]
+period 3 of 3            443   35/ 65/  0     +50     -126 [ -243,  -21]      -56 [ -173,  +49]      -36 [ -153,  +69]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95         1456   35/ 64/  0     +59     -118 [ -181,  -57]      -48 [ -111,  +13]      -28 [  -91,  +33]
+-- controls on the same entry bars --
+reversed direction      1456   26/ 73/  1     -45     -223 [ -272, -164]     -153 [ -202,  -94]     -133 [ -182,  -74]
+random direction #1     1456   30/ 69/  0      +3     -174 [ -206, -141]     -104 [ -136,  -71]      -84 [ -116,  -51]
+random direction #2     1456   30/ 69/  0      -1     -178 [ -215, -146]     -108 [ -145,  -76]      -88 [ -125,  -56]
+random direction #3     1456   30/ 69/  0      +2     -174 [ -201, -144]     -104 [ -131,  -74]      -84 [ -111,  -54]
+by symbol (net bps @ passive 1.00%): ADA-USD +37 (n=105), SOL-USD -5 (n=102), PENDLE-USD -13 (n=70), BTC-USD -28 (n=69), TAO-USD -35 (n=90), AAVE-USD -43 (n=103), ETH-USD -46 (n=98), LINK-USD -46 (n=98), DOGE-USD -55 (n=146), AVAX-USD -56 (n=112), UNI-USD -70 (n=119), SUI-USD -73 (n=117), NEAR-USD -90 (n=119), XRP-USD -106 (n=108)
+
+== config C (tp 2.5/4/5%, sl 3/2/1.75%, 48 bars) ==
+activity: 0.14 trades per symbol per day; in a position 7% of bars; average hold 3.0 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades              2117   29/ 71/  0     +20     -157 [ -181, -133]      -87 [ -111,  -63]      -67 [  -91,  -43]
+tier 1 (tp 2.5/sl 3)       0   gross break-even target rate 55%
+tier 2 (tp 4/sl 2)         0   gross break-even target rate 33%
+tier 3 (tp 5/sl 1.75)   2117   29/ 71/  0     +20     -157 [ -181, -133]      -87 [ -111,  -63]      -67 [  -91,  -43]   gross break-even target rate 26%
+long                    1181   29/ 71/  0     +19     -158 [ -182, -130]      -88 [ -112,  -60]      -68 [  -92,  -40]
+short                    936   29/ 71/  0     +20     -157 [ -201, -108]      -87 [ -131,  -38]      -67 [ -111,  -18]
+period 1 of 3            564   26/ 74/  0      +3     -174 [ -209, -138]     -104 [ -139,  -68]      -84 [ -119,  -48]
+period 2 of 3            884   33/ 66/  0     +51     -126 [ -166,  -90]      -56 [  -96,  -20]      -36 [  -76,   -0]
+period 3 of 3            669   25/ 75/  0      -8     -185 [ -228, -145]     -115 [ -158,  -75]      -95 [ -138,  -55]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95         2117   29/ 71/  0     +20     -157 [ -181, -133]      -87 [ -111,  -63]      -67 [  -91,  -43]
+-- controls on the same entry bars --
+reversed direction      2117   22/ 78/  0     -28     -206 [ -227, -184]     -136 [ -157, -114]     -116 [ -137,  -94]
+random direction #1     2117   25/ 75/  0      -5     -183 [ -197, -167]     -113 [ -127,  -97]      -93 [ -107,  -77]
+random direction #2     2117   26/ 74/  0      +1     -176 [ -191, -161]     -106 [ -121,  -91]      -86 [ -101,  -71]
+random direction #3     2117   24/ 76/  0     -10     -188 [ -203, -172]     -118 [ -133, -102]      -98 [ -113,  -82]
+by symbol (net bps @ passive 1.00%): ADA-USD -46 (n=155), UNI-USD -55 (n=161), ETH-USD -63 (n=148), BTC-USD -66 (n=116), DOGE-USD -72 (n=203), AAVE-USD -82 (n=152), AVAX-USD -84 (n=153), SOL-USD -88 (n=153), LINK-USD -99 (n=140), NEAR-USD -106 (n=172), XRP-USD -108 (n=155), PENDLE-USD -114 (n=108), SUI-USD -115 (n=169), TAO-USD -135 (n=132)
+######## interval 1440 min | variant: base
+14 symbols, 14798 bars; costs are round-trip, plus 0.10% extra on stop exits
+
+tier thresholds on |score|: (0.35, 0.55, 0.75); weights {'trend': 0.3, 'momentum': 0.3, 'osc': 0.2, 'bands': 0.2}; skip if ATR% < 0.35%
+
+variant: min |score| 0, regime filter (trade only in the direction of SMA50 vs SMA200) off; bar = 1440 min
+
+== config A (tp 2/3.5/5%, sl 1/1.5/2%, 20 bars) ==
+activity: 0.54 trades per symbol per day; in a position 62% of bars; average hold 1.1 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades              8033   23/ 77/  0     -32     -209 [ -218, -200]     -139 [ -148, -130]     -119 [ -128, -110]
+tier 1 (tp 2/sl 1)      3315   22/ 78/  0     -35     -213 [ -219, -206]     -143 [ -149, -136]     -123 [ -129, -116]   gross break-even target rate 33%
+tier 2 (tp 3.5/sl 1.5)  2454   23/ 77/  0     -36     -213 [ -226, -200]     -143 [ -156, -130]     -123 [ -136, -110]   gross break-even target rate 30%
+tier 3 (tp 5/sl 2)      2264   25/ 75/  0     -22     -199 [ -222, -175]     -129 [ -152, -105]     -109 [ -132,  -85]   gross break-even target rate 29%
+long                    3523   21/ 79/  0     -45     -223 [ -235, -210]     -153 [ -165, -140]     -133 [ -145, -120]
+short                   4510   25/ 75/  0     -21     -198 [ -212, -183]     -128 [ -142, -113]     -108 [ -122,  -93]
+period 1 of 3           2490   22/ 78/  0     -35     -212 [ -228, -198]     -142 [ -158, -128]     -122 [ -138, -108]
+period 2 of 3           2917   22/ 78/  0     -42     -219 [ -235, -206]     -149 [ -165, -136]     -129 [ -145, -116]
+period 3 of 3           2651   26/ 74/  0     -17     -194 [ -213, -177]     -124 [ -143, -107]     -104 [ -123,  -87]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45       1724   21/ 79/  0     -36     -213 [ -221, -206]     -143 [ -151, -136]     -123 [ -131, -116]
+|score| 0.45-0.55       1591   22/ 78/  0     -34     -212 [ -222, -203]     -142 [ -152, -133]     -122 [ -132, -113]
+|score| 0.55-0.65       1318   23/ 77/  0     -34     -212 [ -227, -197]     -142 [ -157, -127]     -122 [ -137, -107]
+|score| 0.65-0.75       1136   23/ 77/  0     -37     -215 [ -229, -199]     -145 [ -159, -129]     -125 [ -139, -109]
+|score| 0.75-0.85        784   24/ 76/  0     -30     -208 [ -236, -175]     -138 [ -166, -105]     -118 [ -146,  -85]
+|score| 0.85-0.95        691   24/ 76/  0     -30     -207 [ -240, -174]     -137 [ -170, -104]     -117 [ -150,  -84]
+|score| >= 0.95          789   28/ 72/  0      -7     -184 [ -223, -152]     -114 [ -153,  -82]      -94 [ -133,  -62]
+-- controls on the same entry bars --
+reversed direction      8033   23/ 77/  0     -34     -211 [ -220, -202]     -141 [ -150, -132]     -121 [ -130, -112]
+random direction #1     8033   23/ 77/  0     -36     -214 [ -219, -207]     -144 [ -149, -137]     -124 [ -129, -117]
+random direction #2     8033   23/ 77/  0     -35     -212 [ -218, -206]     -142 [ -148, -136]     -122 [ -128, -116]
+random direction #3     8033   23/ 77/  0     -33     -210 [ -216, -203]     -140 [ -146, -133]     -120 [ -126, -113]
+by symbol (net bps @ passive 1.00%): BTC-USD -110 (n=408), ETH-USD -122 (n=543), SOL-USD -132 (n=593), XRP-USD -134 (n=533), LINK-USD -134 (n=565), DOGE-USD -135 (n=634), ADA-USD -137 (n=596), SUI-USD -141 (n=652), TAO-USD -142 (n=501), UNI-USD -142 (n=617), AVAX-USD -145 (n=604), AAVE-USD -147 (n=598), PENDLE-USD -157 (n=509), NEAR-USD -160 (n=680)
+
+== config B (tp 3/5/8%, sl 1.5/2.5/3.5%, 40 bars) ==
+activity: 0.43 trades per symbol per day; in a position 61% of bars; average hold 1.4 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades              6318   28/ 72/  0     -24     -201 [ -217, -184]     -131 [ -147, -114]     -111 [ -127,  -94]
+tier 1 (tp 3/sl 1.5)    2779   27/ 73/  0     -30     -207 [ -219, -195]     -137 [ -149, -125]     -117 [ -129, -105]   gross break-even target rate 33%
+tier 2 (tp 5/sl 2.5)    1808   31/ 69/  0     -21     -198 [ -223, -173]     -128 [ -153, -103]     -108 [ -133,  -83]   gross break-even target rate 33%
+tier 3 (tp 8/sl 3.5)    1731   29/ 71/  0     -18     -195 [ -243, -147]     -125 [ -173,  -77]     -105 [ -153,  -57]   gross break-even target rate 30%
+long                    2744   27/ 73/  0     -37     -214 [ -238, -187]     -144 [ -168, -117]     -124 [ -148,  -97]
+short                   3574   30/ 70/  0     -14     -191 [ -216, -160]     -121 [ -146,  -90]     -101 [ -126,  -70]
+period 1 of 3           1952   28/ 72/  0     -27     -204 [ -229, -177]     -134 [ -159, -107]     -114 [ -139,  -87]
+period 2 of 3           2375   28/ 72/  0     -31     -208 [ -235, -178]     -138 [ -165, -108]     -118 [ -145,  -88]
+period 3 of 3           1991   30/ 70/  0     -13     -190 [ -224, -156]     -120 [ -154,  -86]     -100 [ -134,  -66]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45       1492   27/ 73/  0     -29     -206 [ -220, -194]     -136 [ -150, -124]     -116 [ -130, -104]
+|score| 0.45-0.55       1287   26/ 74/  0     -31     -208 [ -223, -194]     -138 [ -153, -124]     -118 [ -133, -104]
+|score| 0.55-0.65        978   31/ 69/  0     -16     -193 [ -220, -162]     -123 [ -150,  -92]     -103 [ -130,  -72]
+|score| 0.65-0.75        830   30/ 70/  0     -26     -203 [ -228, -170]     -133 [ -158, -100]     -113 [ -138,  -80]
+|score| 0.75-0.85        587   30/ 70/  0      -9     -186 [ -241, -125]     -116 [ -171,  -55]      -96 [ -151,  -35]
+|score| 0.85-0.95        530   28/ 72/  0     -33     -210 [ -273, -145]     -140 [ -203,  -75]     -120 [ -183,  -55]
+|score| >= 0.95          614   29/ 71/  0     -13     -190 [ -255, -108]     -120 [ -185,  -38]     -100 [ -165,  -18]
+-- controls on the same entry bars --
+reversed direction      6318   28/ 72/  0     -30     -208 [ -224, -192]     -138 [ -154, -122]     -118 [ -134, -102]
+random direction #1     6318   28/ 72/  0     -28     -205 [ -216, -193]     -135 [ -146, -123]     -115 [ -126, -103]
+random direction #2     6318   29/ 71/  0     -26     -203 [ -213, -192]     -133 [ -143, -122]     -113 [ -123, -102]
+random direction #3     6318   28/ 72/  0     -30     -207 [ -217, -196]     -137 [ -147, -126]     -117 [ -127, -106]
+by symbol (net bps @ passive 1.00%): BTC-USD -107 (n=240), DOGE-USD -112 (n=509), ADA-USD -115 (n=459), SOL-USD -125 (n=464), UNI-USD -126 (n=503), ETH-USD -126 (n=387), LINK-USD -130 (n=455), SUI-USD -133 (n=520), AVAX-USD -134 (n=489), XRP-USD -136 (n=383), TAO-USD -137 (n=420), AAVE-USD -144 (n=490), PENDLE-USD -145 (n=424), NEAR-USD -152 (n=575)
+
+== config C (tp 2.5/4/5%, sl 3/2/1.75%, 20 bars) ==
+activity: 0.50 trades per symbol per day; in a position 63% of bars; average hold 1.3 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades              7429   33/ 67/  0     -34     -211 [ -224, -198]     -141 [ -154, -128]     -121 [ -134, -108]
+tier 1 (tp 2.5/sl 3)    2808   47/ 53/  0     -42     -218 [ -234, -200]     -148 [ -164, -130]     -128 [ -144, -110]   gross break-even target rate 55%
+tier 2 (tp 4/sl 2)      2332   28/ 72/  0     -30     -207 [ -224, -189]     -137 [ -154, -119]     -117 [ -134,  -99]   gross break-even target rate 33%
+tier 3 (tp 5/sl 1.75)   2289   22/ 78/  0     -27     -205 [ -228, -183]     -135 [ -158, -113]     -115 [ -138,  -93]   gross break-even target rate 26%
+long                    3350   29/ 71/  0     -53     -230 [ -245, -212]     -160 [ -175, -142]     -140 [ -155, -122]
+short                   4079   37/ 63/  0     -19     -195 [ -215, -174]     -125 [ -145, -104]     -105 [ -125,  -84]
+period 1 of 3           2290   33/ 67/  0     -33     -210 [ -231, -188]     -140 [ -161, -118]     -120 [ -141,  -98]
+period 2 of 3           2751   31/ 69/  0     -49     -225 [ -247, -204]     -155 [ -177, -134]     -135 [ -157, -114]
+period 3 of 3           2412   36/ 64/  0     -17     -194 [ -218, -166]     -124 [ -148,  -96]     -104 [ -128,  -76]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45       1415   48/ 52/  0     -36     -211 [ -232, -192]     -141 [ -162, -122]     -121 [ -142, -102]
+|score| 0.45-0.55       1393   46/ 54/  0     -49     -224 [ -245, -206]     -154 [ -175, -136]     -134 [ -155, -116]
+|score| 0.55-0.65       1231   29/ 71/  0     -28     -205 [ -226, -183]     -135 [ -156, -113]     -115 [ -136,  -93]
+|score| 0.65-0.75       1101   28/ 72/  0     -33     -210 [ -230, -188]     -140 [ -160, -118]     -120 [ -140,  -98]
+|score| 0.75-0.85        790   22/ 78/  0     -25     -202 [ -230, -174]     -132 [ -160, -104]     -112 [ -140,  -84]
+|score| 0.85-0.95        701   20/ 80/  0     -39     -217 [ -244, -190]     -147 [ -174, -120]     -127 [ -154, -100]
+|score| >= 0.95          798   23/ 77/  0     -19     -197 [ -230, -163]     -127 [ -160,  -93]     -107 [ -140,  -73]
+-- controls on the same entry bars --
+reversed direction      7429   33/ 67/  0     -37     -213 [ -227, -201]     -143 [ -157, -131]     -123 [ -137, -111]
+random direction #1     7429   33/ 67/  0     -38     -215 [ -223, -208]     -145 [ -153, -138]     -125 [ -133, -118]
+random direction #2     7429   32/ 68/  0     -41     -218 [ -226, -210]     -148 [ -156, -140]     -128 [ -136, -120]
+random direction #3     7429   33/ 67/  0     -36     -213 [ -220, -203]     -143 [ -150, -133]     -123 [ -130, -113]
+by symbol (net bps @ passive 1.00%): BTC-USD -96 (n=332), LINK-USD -119 (n=530), ETH-USD -123 (n=479), DOGE-USD -124 (n=574), SOL-USD -134 (n=548), XRP-USD -138 (n=478), ADA-USD -144 (n=551), UNI-USD -145 (n=581), PENDLE-USD -148 (n=486), TAO-USD -150 (n=480), AAVE-USD -153 (n=559), SUI-USD -155 (n=624), NEAR-USD -156 (n=642), AVAX-USD -161 (n=565)
+######## interval 1440 min | variant: --min-score 0.95
+14 symbols, 14798 bars; costs are round-trip, plus 0.10% extra on stop exits
+
+tier thresholds on |score|: (0.35, 0.55, 0.75); weights {'trend': 0.3, 'momentum': 0.3, 'osc': 0.2, 'bands': 0.2}; skip if ATR% < 0.35%
+
+variant: min |score| 0.95, regime filter (trade only in the direction of SMA50 vs SMA200) off; bar = 1440 min
+
+== config A (tp 2/3.5/5%, sl 1/1.5/2%, 20 bars) ==
+activity: 0.05 trades per symbol per day; in a position 6% of bars; average hold 1.2 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades               805   28/ 72/  0      -6     -183 [ -219, -145]     -113 [ -149,  -75]      -93 [ -129,  -55]
+tier 1 (tp 2/sl 1)         0   gross break-even target rate 33%
+tier 2 (tp 3.5/sl 1.5)     0   gross break-even target rate 30%
+tier 3 (tp 5/sl 2)       805   28/ 72/  0      -6     -183 [ -219, -145]     -113 [ -149,  -75]      -93 [ -129,  -55]   gross break-even target rate 29%
+long                     547   22/ 78/  0     -44     -222 [ -253, -187]     -152 [ -183, -117]     -132 [ -163,  -97]
+short                    258   39/ 61/  0     +74     -102 [ -198,   -2]      -32 [ -128,  +68]      -12 [ -108,  +88]
+period 1 of 3            280   28/ 72/  0      -8     -185 [ -235, -124]     -115 [ -165,  -54]      -95 [ -145,  -34]
+period 2 of 3            268   21/ 79/  0     -54     -232 [ -278, -188]     -162 [ -208, -118]     -142 [ -188,  -98]
+period 3 of 3            262   36/ 64/  0     +51     -125 [ -203,  -37]      -55 [ -133,  +33]      -35 [ -113,  +53]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95          805   28/ 72/  0      -6     -183 [ -219, -145]     -113 [ -149,  -75]      -93 [ -129,  -55]
+-- controls on the same entry bars --
+reversed direction       805   21/ 79/  0     -50     -228 [ -260, -192]     -158 [ -190, -122]     -138 [ -170, -102]
+random direction #1      805   20/ 80/  0     -57     -234 [ -257, -211]     -164 [ -187, -141]     -144 [ -167, -121]
+random direction #2      805   22/ 78/  0     -48     -226 [ -247, -200]     -156 [ -177, -130]     -136 [ -157, -110]
+random direction #3      805   23/ 77/  0     -37     -214 [ -235, -191]     -144 [ -165, -121]     -124 [ -145, -101]
+by symbol (net bps @ passive 1.00%): BTC-USD +7 (n=56), XRP-USD -69 (n=56), LINK-USD -81 (n=62), ETH-USD -84 (n=66), SOL-USD -87 (n=67), DOGE-USD -96 (n=63), SUI-USD -100 (n=54), ADA-USD -111 (n=57), UNI-USD -127 (n=66), AVAX-USD -154 (n=59), TAO-USD -158 (n=42), AAVE-USD -158 (n=56), NEAR-USD -195 (n=68), PENDLE-USD -224 (n=33)
+
+== config B (tp 3/5/8%, sl 1.5/2.5/3.5%, 40 bars) ==
+activity: 0.05 trades per symbol per day; in a position 8% of bars; average hold 1.8 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades               667   30/ 70/  0      -2     -179 [ -240, -113]     -109 [ -170,  -43]      -89 [ -150,  -23]
+tier 1 (tp 3/sl 1.5)       0   gross break-even target rate 33%
+tier 2 (tp 5/sl 2.5)       0   gross break-even target rate 33%
+tier 3 (tp 8/sl 3.5)     667   30/ 70/  0      -2     -179 [ -240, -113]     -109 [ -170,  -43]      -89 [ -150,  -23]   gross break-even target rate 30%
+long                     445   27/ 73/  0     -35     -212 [ -276, -137]     -142 [ -206,  -67]     -122 [ -186,  -47]
+short                    222   36/ 64/  0     +64     -112 [ -264,  +42]      -42 [ -194, +112]      -22 [ -174, +132]
+period 1 of 3            204   31/ 69/  0      +5     -172 [ -276,  -57]     -102 [ -206,  +13]      -82 [ -186,  +33]
+period 2 of 3            273   27/ 73/  0     -42     -220 [ -318, -115]     -150 [ -248,  -45]     -130 [ -228,  -25]
+period 3 of 3            194   36/ 64/  0     +59     -117 [ -276,  +29]      -47 [ -206,  +99]      -27 [ -186, +119]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95          667   30/ 70/  0      -2     -179 [ -240, -113]     -109 [ -170,  -43]      -89 [ -150,  -23]
+-- controls on the same entry bars --
+reversed direction       667   25/ 75/  0     -67     -245 [ -303, -186]     -175 [ -233, -116]     -155 [ -213,  -96]
+random direction #1      667   28/ 72/  0     -26     -203 [ -255, -151]     -133 [ -185,  -81]     -113 [ -165,  -61]
+random direction #2      667   26/ 74/  0     -55     -233 [ -276, -188]     -163 [ -206, -118]     -143 [ -186,  -98]
+random direction #3      667   24/ 76/  0     -74     -252 [ -295, -201]     -182 [ -225, -131]     -162 [ -205, -111]
+by symbol (net bps @ passive 1.00%): BTC-USD +46 (n=39), DOGE-USD +4 (n=55), ETH-USD -30 (n=54), SOL-USD -88 (n=53), SUI-USD -90 (n=47), LINK-USD -96 (n=51), ADA-USD -110 (n=53), UNI-USD -110 (n=53), TAO-USD -124 (n=38), XRP-USD -125 (n=45), NEAR-USD -175 (n=53), AVAX-USD -189 (n=47), PENDLE-USD -211 (n=28), AAVE-USD -255 (n=51)
+
+== config C (tp 2.5/4/5%, sl 3/2/1.75%, 20 bars) ==
+activity: 0.06 trades per symbol per day; in a position 6% of bars; average hold 1.1 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades               817   24/ 76/  0     -16     -194 [ -225, -157]     -124 [ -155,  -87]     -104 [ -135,  -67]
+tier 1 (tp 2.5/sl 3)       0   gross break-even target rate 55%
+tier 2 (tp 4/sl 2)         0   gross break-even target rate 33%
+tier 3 (tp 5/sl 1.75)    817   24/ 76/  0     -16     -194 [ -225, -157]     -124 [ -155,  -87]     -104 [ -135,  -67]   gross break-even target rate 26%
+long                     555   18/ 82/  0     -53     -232 [ -257, -201]     -162 [ -187, -131]     -142 [ -167, -111]
+short                    262   35/ 65/  0     +62     -114 [ -192,  -25]      -44 [ -122,  +45]      -24 [ -102,  +65]
+period 1 of 3            281   23/ 77/  0     -19     -197 [ -246, -140]     -127 [ -176,  -70]     -107 [ -156,  -50]
+period 2 of 3            272   17/ 83/  0     -61     -239 [ -277, -202]     -169 [ -207, -132]     -149 [ -187, -112]
+period 3 of 3            269   31/ 69/  0     +36     -141 [ -216,  -68]      -71 [ -146,   +2]      -51 [ -126,  +22]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95          817   24/ 76/  0     -16     -194 [ -225, -157]     -124 [ -155,  -87]     -104 [ -135,  -67]
+-- controls on the same entry bars --
+reversed direction       817   19/ 81/  0     -46     -224 [ -252, -194]     -154 [ -182, -124]     -134 [ -162, -104]
+random direction #1      817   18/ 82/  0     -50     -228 [ -249, -205]     -158 [ -179, -135]     -138 [ -159, -115]
+random direction #2      817   19/ 81/  0     -44     -222 [ -241, -199]     -152 [ -171, -129]     -132 [ -151, -109]
+random direction #3      817   20/ 80/  0     -40     -217 [ -235, -192]     -147 [ -165, -122]     -127 [ -145, -102]
+by symbol (net bps @ passive 1.00%): BTC-USD -21 (n=57), XRP-USD -81 (n=57), ETH-USD -89 (n=70), LINK-USD -92 (n=64), DOGE-USD -103 (n=64), ADA-USD -108 (n=58), SUI-USD -123 (n=55), UNI-USD -129 (n=66), AAVE-USD -150 (n=56), SOL-USD -154 (n=68), AVAX-USD -157 (n=59), TAO-USD -171 (n=42), NEAR-USD -194 (n=68), PENDLE-USD -202 (n=33)
+######## interval 1440 min | variant: --min-score 0.95 --regime
+14 symbols, 14798 bars; costs are round-trip, plus 0.10% extra on stop exits
+
+tier thresholds on |score|: (0.35, 0.55, 0.75); weights {'trend': 0.3, 'momentum': 0.3, 'osc': 0.2, 'bands': 0.2}; skip if ATR% < 0.35%
+
+variant: min |score| 0.95, regime filter (trade only in the direction of SMA50 vs SMA200) on; bar = 1440 min
+
+== config A (tp 2/3.5/5%, sl 1/1.5/2%, 20 bars) ==
+activity: 0.03 trades per symbol per day; in a position 3% of bars; average hold 1.2 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades               371   32/ 68/  0     +21     -156 [ -212,  -90]      -86 [ -142,  -20]      -66 [ -122,   -0]
+tier 1 (tp 2/sl 1)         0   gross break-even target rate 33%
+tier 2 (tp 3.5/sl 1.5)     0   gross break-even target rate 30%
+tier 3 (tp 5/sl 2)       371   32/ 68/  0     +21     -156 [ -212,  -90]      -86 [ -142,  -20]      -66 [ -122,   -0]   gross break-even target rate 29%
+long                     184   21/ 79/  0     -55     -233 [ -278, -184]     -163 [ -208, -114]     -143 [ -188,  -94]
+short                    187   42/ 58/  0     +96      -80 [ -176,  +27]      -10 [ -106,  +97]      +10 [  -86, +117]
+period 1 of 3            133   26/ 74/  0     -16     -193 [ -262, -119]     -123 [ -192,  -49]     -103 [ -172,  -29]
+period 2 of 3             82   20/ 80/  0     -63     -241 [ -306, -163]     -171 [ -236,  -93]     -151 [ -216,  -73]
+period 3 of 3            156   42/ 58/  0     +96      -80 [ -199,  +24]      -10 [ -129,  +94]      +10 [ -109, +114]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95          371   32/ 68/  0     +21     -156 [ -212,  -90]      -86 [ -142,  -20]      -66 [ -122,   -0]
+-- controls on the same entry bars --
+reversed direction       371   20/ 80/  0     -58     -236 [ -280, -184]     -166 [ -210, -114]     -146 [ -190,  -94]
+random direction #1      371   30/ 70/  0      +8     -169 [ -216, -127]      -99 [ -146,  -57]      -79 [ -126,  -37]
+random direction #2      371   26/ 74/  0     -19     -196 [ -233, -154]     -126 [ -163,  -84]     -106 [ -143,  -64]
+random direction #3      371   31/ 69/  0     +17     -160 [ -201, -115]      -90 [ -131,  -45]      -70 [ -111,  -25]
+by symbol (net bps @ passive 1.00%): BTC-USD +21 (n=30), ETH-USD +11 (n=31), SOL-USD -37 (n=26), ADA-USD -47 (n=27), SUI-USD -54 (n=25), AVAX-USD -81 (n=31), UNI-USD -97 (n=30), XRP-USD -99 (n=37), LINK-USD -114 (n=29), AAVE-USD -114 (n=29), DOGE-USD -141 (n=21), NEAR-USD -173 (n=26), PENDLE-USD -192 (n=18), TAO-USD -245 (n=11)
+
+== config B (tp 3/5/8%, sl 1.5/2.5/3.5%, 40 bars) ==
+activity: 0.02 trades per symbol per day; in a position 4% of bars; average hold 1.9 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades               303   33/ 67/  0     +33     -143 [ -244,  -35]      -73 [ -174,  +35]      -53 [ -154,  +55]
+tier 1 (tp 3/sl 1.5)       0   gross break-even target rate 33%
+tier 2 (tp 5/sl 2.5)       0   gross break-even target rate 33%
+tier 3 (tp 8/sl 3.5)     303   33/ 67/  0     +33     -143 [ -244,  -35]      -73 [ -174,  +35]      -53 [ -154,  +55]   gross break-even target rate 30%
+long                     147   27/ 73/  0     -37     -214 [ -311, -110]     -144 [ -241,  -40]     -124 [ -221,  -20]
+short                    156   39/ 61/  0    +100      -76 [ -248, +133]       -6 [ -178, +203]      +14 [ -158, +223]
+period 1 of 3            123   32/ 68/  0     +15     -162 [ -300,  -17]      -92 [ -230,  +53]      -72 [ -210,  +73]
+period 2 of 3             74   20/ 80/  0    -117     -295 [ -403, -180]     -225 [ -333, -110]     -205 [ -313,  -90]
+period 3 of 3            106   44/ 56/  0    +160      -16 [ -248, +237]      +54 [ -178, +307]      +74 [ -158, +327]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95          303   33/ 67/  0     +33     -143 [ -244,  -35]      -73 [ -174,  +35]      -53 [ -154,  +55]
+-- controls on the same entry bars --
+reversed direction       303   24/ 76/  0     -73     -251 [ -338, -159]     -181 [ -268,  -89]     -161 [ -248,  -69]
+random direction #1      303   33/ 67/  0     +26     -151 [ -232,  -68]      -81 [ -162,   +2]      -61 [ -142,  +22]
+random direction #2      303   26/ 74/  0     -54     -231 [ -299, -162]     -161 [ -229,  -92]     -141 [ -209,  -72]
+random direction #3      303   34/ 66/  0     +41     -136 [ -215,  -59]      -66 [ -145,  +11]      -46 [ -125,  +31]
+by symbol (net bps @ passive 1.00%): UNI-USD +62 (n=20), BTC-USD +37 (n=21), SOL-USD +37 (n=21), ETH-USD -14 (n=26), SUI-USD -38 (n=22), DOGE-USD -54 (n=20), ADA-USD -58 (n=26), LINK-USD -107 (n=23), XRP-USD -108 (n=33), AVAX-USD -122 (n=24), PENDLE-USD -129 (n=14), NEAR-USD -170 (n=16), AAVE-USD -192 (n=26), TAO-USD -249 (n=11)
+
+== config C (tp 2.5/4/5%, sl 3/2/1.75%, 20 bars) ==
+activity: 0.03 trades per symbol per day; in a position 3% of bars; average hold 1.2 bars
+                           n  tgt/stp/tmo%   gross  net bps @ taker 1.7%      net bps @ passive 1.0%    net bps @ maker 0.8%    
+all trades               377   29/ 71/  0     +18     -159 [ -210, -105]      -89 [ -140,  -35]      -69 [ -120,  -15]
+tier 1 (tp 2.5/sl 3)       0   gross break-even target rate 55%
+tier 2 (tp 4/sl 2)         0   gross break-even target rate 33%
+tier 3 (tp 5/sl 1.75)    377   29/ 71/  0     +18     -159 [ -210, -105]      -89 [ -140,  -35]      -69 [ -120,  -15]   gross break-even target rate 26%
+long                     186   19/ 81/  0     -44     -222 [ -265, -180]     -152 [ -195, -110]     -132 [ -175,  -90]
+short                    191   38/ 62/  0     +79      -97 [ -187,   +8]      -27 [ -117,  +78]       -7 [  -97,  +98]
+period 1 of 3            133   25/ 75/  0      -8     -185 [ -250, -117]     -115 [ -180,  -47]      -95 [ -160,  -27]
+period 2 of 3             85   18/ 82/  0     -56     -234 [ -294, -159]     -164 [ -224,  -89]     -144 [ -204,  -69]
+period 3 of 3            159   38/ 62/  0     +80      -97 [ -203,   +4]      -27 [ -133,  +74]       -7 [ -113,  +94]
+-- by |score| at entry (is a stricter filter better?) --
+|score| 0.35-0.45          0
+|score| 0.45-0.55          0
+|score| 0.55-0.65          0
+|score| 0.65-0.75          0
+|score| 0.75-0.85          0
+|score| 0.85-0.95          0
+|score| >= 0.95          377   29/ 71/  0     +18     -159 [ -210, -105]      -89 [ -140,  -35]      -69 [ -120,  -15]
+-- controls on the same entry bars --
+reversed direction       377   18/ 82/  0     -55     -233 [ -274, -187]     -163 [ -204, -117]     -143 [ -184,  -97]
+random direction #1      377   26/ 74/  0      +0     -177 [ -220, -137]     -107 [ -150,  -67]      -87 [ -130,  -47]
+random direction #2      377   25/ 75/  0      -3     -181 [ -217, -141]     -111 [ -147,  -71]      -91 [ -127,  -51]
+random direction #3      377   27/ 73/  0      +6     -171 [ -209, -132]     -101 [ -139,  -62]      -81 [ -119,  -42]
+by symbol (net bps @ passive 1.00%): BTC-USD +24 (n=31), ETH-USD +6 (n=33), SUI-USD -38 (n=25), ADA-USD -40 (n=28), AVAX-USD -86 (n=31), LINK-USD -96 (n=29), AAVE-USD -96 (n=29), XRP-USD -100 (n=37), UNI-USD -102 (n=30), SOL-USD -133 (n=27), DOGE-USD -160 (n=22), PENDLE-USD -171 (n=18), NEAR-USD -180 (n=26), TAO-USD -223 (n=11)
