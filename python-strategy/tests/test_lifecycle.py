@@ -140,3 +140,12 @@ def test_build_specs_dedupes_and_report_runs(tmp_path):
                       sp=TradeSpec(specs[0].uid, SYM, 1, 10 * NS, 0.01, 1000 * NS))
     text = format_report(outs, owners, [("fees t1", FEES)], [(1.0, 0.0)], stats)
     assert "all-taker" in text and "all-passive" in text and "validation" in text and "per arm" in text
+
+
+def test_gap_summary(tmp_path):
+    from execution_sim.gaps import format_summary, scan
+    rep = recording(tmp_path, [(300, {"_event": "disconnect", "reason": "boom"}), (310, {"_event": "connect", "depth": 25}),
+                               (320, {"_event": "checksum_mismatch", "symbol": SYM})])
+    s = scan([tmp_path])
+    assert s["events"]["disconnect"] == 1 and s["mismatch"][SYM] == 1 and s["downtimes"] == [10.0]
+    assert "boom" in format_summary(s)
