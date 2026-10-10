@@ -362,6 +362,8 @@ def main(argv=None) -> None:
     p.add_argument("--csv-dir", default=None)
     p.add_argument("--stop-slip", type=float, default=0.001)
     p.add_argument("--symbols", default="", help="comma-separated subset")
+    p.add_argument("--start", default=None, help="only bars at/after this UTC date (YYYY-MM-DD)")
+    p.add_argument("--end", default=None, help="only bars before this UTC date (YYYY-MM-DD)")
     p.add_argument("--min-score", type=float, default=0.0, help="only enter when |score| is at least this (tiers start at 0.35)")
     p.add_argument("--macd-cross", action="store_true", help="only enter on a fresh MACD / signal-line crossover (this bar or the previous two) in the trade direction")
     p.add_argument("--regime", action="store_true", help="only trade in the direction of SMA50 vs SMA200 (golden / death cross regime)")
@@ -370,6 +372,17 @@ def main(argv=None) -> None:
     if args.symbols:
         keep = set(args.symbols.split(","))
         data = {k: v for k, v in data.items() if k in keep}
+    if args.start or args.end:
+        from datetime import datetime, timezone
+
+        lo = int(datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc).timestamp()) if args.start else 0
+        hi = int(datetime.fromisoformat(args.end).replace(tzinfo=timezone.utc).timestamp()) if args.end else 1 << 60
+        cut = {}
+        for k, (ts, h, l, c, v) in data.items():
+            m = (ts >= lo) & (ts < hi)
+            if m.sum() > 300:
+                cut[k] = (ts[m], h[m], l[m], c[m], v[m])
+        data = cut
     text = run(data, args.interval * 60, args.stop_slip, min_score=args.min_score, regime=args.regime, macd_cross=args.macd_cross)
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
