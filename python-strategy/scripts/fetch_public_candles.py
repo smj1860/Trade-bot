@@ -20,7 +20,7 @@ from pathlib import Path
 import requests
 
 BASE = "https://data-api.binance.vision/api/v3/klines"
-STEP_MS = {"1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
+STEP_MS = {"1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "12h": 43_200_000, "1d": 86_400_000}
 
 
 def fetch(symbol: str, interval: str, start_ms: int, end_ms: int, session: requests.Session) -> list[list]:
