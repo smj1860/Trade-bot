@@ -165,10 +165,14 @@ class ExecutionConfig:
     # [execution].post_only_only is true; this flag keeps Python from even
     # trying (use_limit_orders=False or fallback_to_market=True need it).
     allow_market_orders: bool = False
-    # Profit target: once an entry order fills, rest a post-only limit exit
-    # at this fraction above the entry price (below it for a short). 0.015 =
-    # 1.5%. 0 disables. The exit is maker-only like every other order.
+    # Profit target, NET of fees: once an entry order fills, rest a post-only
+    # limit exit priced so the round trip nets this fraction after the maker
+    # fee on both legs (see policy.take_profit_price). 0.015 = 1.5% net, which
+    # at a 0.40% maker fee is an exit about 2.3% from entry. 0 disables.
     take_profit_pct: float = 0.015
+    # Maker fee per leg used to gross up the target. Kraken Tier 1 is 0.40%;
+    # update this if the 30-day volume tier changes.
+    maker_fee_pct: float = 0.004
     # Price decimals per symbol, e.g. {"BTC-USD": 1}, used to round the
     # take-profit price onto the exchange's tick grid. A symbol missing here
     # falls back to the precision of the entry price itself.

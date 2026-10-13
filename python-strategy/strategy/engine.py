@@ -462,8 +462,9 @@ class Engine:
             )
 
     async def _place_take_profit(self, symbol: str, side: Side, filled: Decimal, entry_price: Decimal, order_stub) -> None:
-        """Rests a post-only limit exit `execution.take_profit_pct` away from
-        the entry price for the quantity just filled. Only for fills that
+        """Rests a post-only limit exit for the quantity just filled, priced so
+        the round trip nets `execution.take_profit_pct` after maker fees on both
+        legs (see policy.take_profit_price). Only for fills that
         open or add to a position (the resulting position has the same sign
         as the order), never for one that merely reduces an opposite
         position. Sits on the book until it fills, is canceled, or the
@@ -479,7 +480,8 @@ class Engine:
         decimals = self.config.execution.price_decimals.get(symbol)
         if decimals is None:
             decimals = max(0, -entry_price.as_tuple().exponent)
-        target = take_profit_price(side, entry_price, pct, decimals)
+        fee = Decimal(str(self.config.execution.maker_fee_pct))
+        target = take_profit_price(side, entry_price, pct, decimals, fee)
         exit_side: Side = "SELL" if side == "BUY" else "BUY"
         client_order_id = f"{self.strategy.strategy_id}-{symbol}-tp-{time.time_ns()}"
         self._resting_order_events[client_order_id] = asyncio.Event()
@@ -503,7 +505,8 @@ class Engine:
             quantity=str(qty),
             entry_price=str(entry_price),
             target_price=str(target),
-            take_profit_pct=str(pct),
+            net_target_pct=str(pct),
+            maker_fee_pct=str(fee),
         )
         try:
             response = await order_stub.SubmitOrder(order)

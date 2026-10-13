@@ -169,9 +169,13 @@ fallback_to_market = false
 # Market orders are never sent unless this is true (and Rust's
 # [execution].post_only_only is false). Keep false: post-only limits only.
 allow_market_orders = false
-# Profit target: after an entry fills, rest a post-only limit exit 1.5%
-# away (above a long's entry, below a short's). 0 disables.
+# Profit target, NET of fees: after an entry fills, rest a post-only limit
+# exit priced to net 1.5% after the maker fee on both legs (about 2.3% from
+# entry at a 0.40% fee). 0 disables.
 take_profit_pct = 0.015
+# Maker fee per leg used to gross the target up (Kraken Tier 1 = 0.40%).
+# Update when the 30-day volume tier changes.
+maker_fee_pct = 0.004
 # Price decimals per symbol, to round the target onto the tick grid.
 # Verify against Kraken AssetPairs (config/config.example.toml has the
 # tick_size per symbol; decimals = digits after the point in tick_size).

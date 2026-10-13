@@ -195,16 +195,22 @@ def post_only_price(side: Side, mid_price: Decimal, spread: Decimal) -> Decimal:
     return mid_price - half_spread if side == "BUY" else mid_price + half_spread
 
 
-def take_profit_price(entry_side: Side, entry_price: Decimal, pct: Decimal, decimals: int) -> Decimal:
-    """The resting exit price for a position just opened at `entry_price`:
-    `pct` in profit (1.5% = Decimal("0.015")), rounded to `decimals` places
-    in the direction that can only make the target slightly *larger* than
-    asked, never smaller (a long sells at or above entry*(1+pct), a short
-    buys at or below entry*(1-pct)). Exchange tick sizes are not known to
+def take_profit_price(entry_side: Side, entry_price: Decimal, net_pct: Decimal, decimals: int,
+                      maker_fee: Decimal = Decimal(0)) -> Decimal:
+    """The resting exit price that nets `net_pct` (1.5% = Decimal("0.015"))
+    *after* the maker fee on both legs, as a fraction of what the entry cost
+    (a long) or paid out (a short). With a maker fee `f` per leg:
+
+        long : exit = entry * (1+f) * (1+net) / (1-f)
+        short: exit = entry * (1-f) * (1-net) / (1+f)
+
+    At f = 0.4% and net = 1.5% that is about +2.3% from entry. Rounded to
+    `decimals` places in the direction that can only make the target slightly
+    farther from entry, never nearer. Exchange tick sizes are not known to
     this layer, so the caller passes the symbol's price precision."""
     from decimal import ROUND_CEILING, ROUND_FLOOR
 
     quantum = Decimal(1).scaleb(-decimals)
     if entry_side == "BUY":
-        return (entry_price * (1 + pct)).quantize(quantum, rounding=ROUND_CEILING)
-    return (entry_price * (1 - pct)).quantize(quantum, rounding=ROUND_FLOOR)
+        return (entry_price * (1 + maker_fee) * (1 + net_pct) / (1 - maker_fee)).quantize(quantum, rounding=ROUND_CEILING)
+    return (entry_price * (1 - maker_fee) * (1 - net_pct) / (1 + maker_fee)).quantize(quantum, rounding=ROUND_FLOOR)

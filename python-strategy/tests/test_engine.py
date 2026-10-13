@@ -230,26 +230,27 @@ def test_market_orders_are_blocked_by_default():
     assert all(r.post_only for r in stub.submitted)
 
 
-def test_fill_places_a_post_only_take_profit_1_5_pct_away():
-    engine = make_engine(take_profit_pct=0.015, price_decimals={"BTC-USD": 1})
+def test_fill_places_a_post_only_take_profit_netting_1_5_pct_after_fees():
+    engine = make_engine(take_profit_pct=0.015, maker_fee_pct=0.004, price_decimals={"BTC-USD": 1})
     stub = FakeOrderStub(engine, lambda req: filled_update(req, "0.01") if req.side == trading_pb2.ORDER_SIDE_BUY else None)
     asyncio.run(engine._manage_resting_order(buy_intent("0.01", "30000"), stub))
     tp = [r for r in stub.submitted if r.side == trading_pb2.ORDER_SIDE_SELL]
     assert len(tp) == 1
     assert tp[0].type == trading_pb2.ORDER_TYPE_LIMIT and tp[0].post_only
-    assert Decimal(tp[0].limit_price.value) == Decimal("30450.0")  # 30000 * 1.015
+    # 30000 * 1.004 * 1.015 / 0.996 = 30694.5.. -> rounded away to 30694.6: about +2.3% from entry
+    assert Decimal(tp[0].limit_price.value) == Decimal("30694.6")
     assert Decimal(tp[0].quantity.value) == Decimal("0.01")
     assert tp[0].client_order_id in engine._take_profit_orders
 
 
 def test_short_entry_takes_profit_below():
-    engine = make_engine(take_profit_pct=0.015, price_decimals={"BTC-USD": 1})
+    engine = make_engine(take_profit_pct=0.015, maker_fee_pct=0.004, price_decimals={"BTC-USD": 1})
     intent = OrderIntent(symbol="BTC-USD", side="SELL", quantity=Decimal("0.01"), signal=-0.5,
                          order_type="LIMIT", limit_price=Decimal("30000"))
     stub = FakeOrderStub(engine, lambda req: filled_update(req, "0.01") if req.side == trading_pb2.ORDER_SIDE_SELL else None)
     asyncio.run(engine._manage_resting_order(intent, stub))
     tp = [r for r in stub.submitted if r.side == trading_pb2.ORDER_SIDE_BUY]
-    assert len(tp) == 1 and Decimal(tp[0].limit_price.value) == Decimal("29550.0")
+    assert len(tp) == 1 and Decimal(tp[0].limit_price.value) == Decimal("29314.5")  # 30000*0.996*0.985/1.004 = 29314.5..: about 2.3% below entry
 
 
 def test_no_take_profit_when_disabled_or_when_the_fill_only_closes_a_position():
@@ -265,7 +266,16 @@ def test_no_take_profit_when_disabled_or_when_the_fill_only_closes_a_position():
     assert len(stub.submitted) == 1
 
 
-def test_take_profit_price_rounds_outward():
+def test_take_profit_price_nets_the_target_after_fees_and_rounds_outward():
     from strategy.policy import take_profit_price
-    assert take_profit_price("BUY", Decimal("0.3333"), Decimal("0.015"), 4) == Decimal("0.3383")  # 0.33829.. -> up
-    assert take_profit_price("SELL", Decimal("0.3333"), Decimal("0.015"), 4) == Decimal("0.3283")  # 0.32830.. -> down
+    f, net = Decimal("0.004"), Decimal("0.015")
+    long_exit = take_profit_price("BUY", Decimal("100"), net, 4, f)
+    short_exit = take_profit_price("SELL", Decimal("100"), net, 4, f)
+    # round trip after fees on both legs really nets >= 1.5%
+    long_net = (long_exit * (1 - f) - 100 * (1 + f)) / (100 * (1 + f))
+    short_net = (100 * (1 - f) - short_exit * (1 + f)) / (100 * (1 - f))
+    assert long_net >= net and short_net >= net
+    assert long_net - net < Decimal("0.0001") and short_net - net < Decimal("0.0001")
+    assert long_exit > Decimal("102.3") and short_exit < Decimal("97.8")
+    # zero fee reduces to the plain percentage
+    assert take_profit_price("BUY", Decimal("100"), net, 2) == Decimal("101.50")
