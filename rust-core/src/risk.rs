@@ -32,6 +32,12 @@ use crate::orderbook::SharedBooks;
 use crate::persistence::{FillRecord, Store};
 use crate::proto::pb::{OrderRequest, OrderSide, OrderType};
 
+/// Strategy ids of the protective flatten orders the core itself generates
+/// (stop_loss.rs and heartbeat.rs). The only orders allowed to be MARKET
+/// while `execution.post_only_only` is on, and only if
+/// `execution.allow_emergency_market_exit` is true.
+pub const EMERGENCY_STRATEGY_IDS: [&str; 2] = ["stop-loss", "dead-man-switch"];
+
 /// Baseline window used for both the spread guard's rolling average and
 /// the volatility breaker's baseline distribution — matches
 /// `orderbook.rs::HISTORY_MAX_AGE`, the longest either guardrail could
@@ -406,7 +412,36 @@ impl RiskEngine {
         None
     }
 
+    /// `execution.post_only_only`: every order must be a LIMIT order with the
+    /// post-only flag, so it can only ever be a maker. Emergency flatten
+    /// orders (see `EMERGENCY_STRATEGY_IDS`) are exempt unless
+    /// `execution.allow_emergency_market_exit` is false.
+    fn check_post_only_policy(&self, order: &OrderRequest) -> Option<String> {
+        let exec = &self.config.execution;
+        if !exec.post_only_only {
+            return None;
+        }
+        if exec.allow_emergency_market_exit && EMERGENCY_STRATEGY_IDS.contains(&order.strategy_id.as_str()) {
+            return None;
+        }
+        let is_limit = matches!(OrderType::try_from(order.r#type), Ok(OrderType::Limit));
+        if !is_limit {
+            return Some(format!(
+                "execution.post_only_only: {} order rejected, only post-only LIMIT orders are allowed",
+                if matches!(OrderType::try_from(order.r#type), Ok(OrderType::Market)) { "MARKET" } else { "non-LIMIT" }
+            ));
+        }
+        if !order.post_only {
+            return Some("execution.post_only_only: LIMIT order rejected, post_only must be set".to_string());
+        }
+        None
+    }
+
     pub async fn evaluate(&self, order: &OrderRequest) -> RiskVerdict {
+        if let Some(reason) = self.check_post_only_policy(order) {
+            return RiskVerdict::Rejected(reason);
+        }
+
         if let Some(reason) = self.check_kill_switch().await {
             return RiskVerdict::Rejected(reason);
         }
@@ -912,6 +947,8 @@ mod tests {
             },
             execution: crate::config::ExecutionConfig {
                 dry_run: true,
+                post_only_only: false, // existing tests exercise MARKET orders; the policy has its own tests below
+                allow_emergency_market_exit: true,
                 rate_limit: crate::config::RateLimitConfig::default(),
             },
             persistence: crate::config::PersistenceConfig { database_path: ":memory:".to_string() },
@@ -947,6 +984,53 @@ mod tests {
             strategy_id: "test-strategy".into(),
             post_only: false,
         }
+    }
+
+    fn post_only_config(allow_emergency: bool) -> Config {
+        let mut c = test_config();
+        c.execution.post_only_only = true;
+        c.execution.allow_emergency_market_exit = allow_emergency;
+        c
+    }
+
+    #[tokio::test]
+    async fn post_only_policy_rejects_market_orders() {
+        let engine = RiskEngine::new(Arc::new(post_only_config(true)), new_shared_books());
+        match engine.evaluate(&buy_order("BTC-USD", "0.01", None)).await {
+            RiskVerdict::Rejected(r) => assert!(r.contains("post_only_only"), "{r}"),
+            _ => panic!("market order must be rejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_only_policy_rejects_limit_orders_without_the_flag() {
+        let engine = RiskEngine::new(Arc::new(post_only_config(true)), new_shared_books());
+        match engine.evaluate(&buy_order("BTC-USD", "0.01", Some("29999"))).await {
+            RiskVerdict::Rejected(r) => assert!(r.contains("post_only must be set"), "{r}"),
+            _ => panic!("non-post-only limit must be rejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_only_policy_allows_post_only_limit_orders() {
+        let engine = RiskEngine::new(Arc::new(post_only_config(true)), new_shared_books());
+        let mut o = buy_order("BTC-USD", "0.01", Some("29999"));
+        o.post_only = true;
+        assert!(!matches!(engine.evaluate(&o).await, RiskVerdict::Rejected(ref r) if r.contains("post_only_only")));
+    }
+
+    #[tokio::test]
+    async fn emergency_flatten_is_exempt_only_when_allowed() {
+        let mut o = sell_order("BTC-USD", "0.01", None);
+        o.strategy_id = "stop-loss".into();
+        let allowed = RiskEngine::new(Arc::new(post_only_config(true)), new_shared_books());
+        assert!(!matches!(allowed.evaluate(&o).await, RiskVerdict::Rejected(ref r) if r.contains("post_only_only")));
+        let strict = RiskEngine::new(Arc::new(post_only_config(false)), new_shared_books());
+        assert!(matches!(strict.evaluate(&o).await, RiskVerdict::Rejected(ref r) if r.contains("post_only_only")));
+        // a strategy cannot borrow the exemption by naming itself differently
+        let mut other = sell_order("BTC-USD", "0.01", None);
+        other.strategy_id = "my-strategy".into();
+        assert!(matches!(allowed.evaluate(&other).await, RiskVerdict::Rejected(ref r) if r.contains("post_only_only")));
     }
 
     #[tokio::test]

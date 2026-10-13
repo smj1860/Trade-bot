@@ -261,14 +261,38 @@ impl Default for RateLimitConfig {
 pub struct ExecutionConfig {
     #[serde(default = "default_dry_run")]
     pub dry_run: bool,
+    /// Only post-only LIMIT orders may be sent: the risk engine rejects any
+    /// MARKET order and any LIMIT order that is not post-only. Defaults to
+    /// true (the safe direction: never pay a taker fee by accident).
+    #[serde(default = "default_post_only_only")]
+    pub post_only_only: bool,
+    /// The one exception to `post_only_only`: the stop-loss and dead-man's
+    /// switch flatten orders (strategy ids in `risk::EMERGENCY_STRATEGY_IDS`)
+    /// may be MARKET orders, because a protective exit that can fail to
+    /// execute is not protective. Set false to forbid even those.
+    #[serde(default = "default_allow_emergency_market_exit")]
+    pub allow_emergency_market_exit: bool,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
 }
 
 impl Default for ExecutionConfig {
     fn default() -> Self {
-        Self { dry_run: true, rate_limit: RateLimitConfig::default() }
+        Self {
+            dry_run: true,
+            post_only_only: default_post_only_only(),
+            allow_emergency_market_exit: default_allow_emergency_market_exit(),
+            rate_limit: RateLimitConfig::default(),
+        }
     }
+}
+
+fn default_post_only_only() -> bool {
+    true
+}
+
+fn default_allow_emergency_market_exit() -> bool {
+    true
 }
 
 fn default_database_path() -> String {

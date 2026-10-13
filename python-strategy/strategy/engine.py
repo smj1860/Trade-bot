@@ -21,7 +21,7 @@ from strategy.config import Config
 from strategy.imbalance_momentum import ImbalanceMomentumStrategy
 from strategy.logging_utils import JsonlEventLogger
 from strategy.pb import trading_pb2, trading_pb2_grpc
-from strategy.policy import OrderIntent, Side
+from strategy.policy import OrderIntent, Side, take_profit_price
 from strategy.portfolio import PortfolioManager
 
 # Registry of available strategies, keyed by strategy_config.toml's
@@ -75,6 +75,10 @@ class Engine:
         # (via its done-callback) instead of being silently dropped, and
         # so run() could in principle wait for them to drain on shutdown.
         self._background_tasks: set[asyncio.Task] = set()
+        # client_order_id -> symbol for resting take-profit exits. Registered
+        # as "managed" (in _resting_order_events) so the update loop keeps
+        # attributing their partial fills; removed once terminal.
+        self._take_profit_orders: dict[str, str] = {}
 
     async def run(self) -> None:
         async with grpc.aio.insecure_channel(self.config.connection.rust_core_addr) as channel:
@@ -255,6 +259,15 @@ class Engine:
         resulting status name (e.g. "ACCEPTED", "REJECTED"), or None on a
         transport failure, so a caller that cares (currently none do) can
         react without re-parsing a log line."""
+        if not self.config.execution.allow_market_orders:
+            self.log.log(
+                "market_order_blocked",
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                note="execution.allow_market_orders=false: post-only limit orders only, nothing sent",
+            )
+            return None
         client_order_id = f"{self.strategy.strategy_id}-{symbol}-{time.time_ns()}"
         order = trading_pb2.OrderRequest(
             client_order_id=client_order_id,
@@ -387,6 +400,12 @@ class Engine:
                 filled = _decimal_or_none(update.filled_quantity.value)
                 if filled:
                     remaining -= filled
+                    fill_price = (
+                        _decimal_or_none(update.avg_fill_price.value)
+                        if update.HasField("avg_fill_price")
+                        else None
+                    ) or limit_price
+                    await self._place_take_profit(intent.symbol, intent.side, filled, fill_price, order_stub)
             self._cleanup_resting_order(client_order_id)
 
             if remaining <= 0:
@@ -442,6 +461,64 @@ class Engine:
                 "was never filled",
             )
 
+    async def _place_take_profit(self, symbol: str, side: Side, filled: Decimal, entry_price: Decimal, order_stub) -> None:
+        """Rests a post-only limit exit `execution.take_profit_pct` away from
+        the entry price for the quantity just filled. Only for fills that
+        open or add to a position (the resulting position has the same sign
+        as the order), never for one that merely reduces an opposite
+        position. Sits on the book until it fills, is canceled, or the
+        dead-man's switch cancels it."""
+        pct = Decimal(str(self.config.execution.take_profit_pct))
+        if pct <= 0 or filled <= 0 or entry_price is None:
+            return
+        position = self.portfolio.position(symbol)
+        opened = position > 0 if side == "BUY" else position < 0
+        if not opened:
+            return
+        qty = min(filled, abs(position))
+        decimals = self.config.execution.price_decimals.get(symbol)
+        if decimals is None:
+            decimals = max(0, -entry_price.as_tuple().exponent)
+        target = take_profit_price(side, entry_price, pct, decimals)
+        exit_side: Side = "SELL" if side == "BUY" else "BUY"
+        client_order_id = f"{self.strategy.strategy_id}-{symbol}-tp-{time.time_ns()}"
+        self._resting_order_events[client_order_id] = asyncio.Event()
+        self._pending_orders[client_order_id] = (symbol, exit_side)
+        self._take_profit_orders[client_order_id] = symbol
+        order = trading_pb2.OrderRequest(
+            client_order_id=client_order_id,
+            symbol=symbol,
+            exchange=self.config.strategy.exchange,
+            side=_side_to_pb(exit_side),
+            type=trading_pb2.ORDER_TYPE_LIMIT,
+            quantity=trading_pb2.Decimal(value=str(qty)),
+            limit_price=trading_pb2.Decimal(value=str(target)),
+            strategy_id=self.strategy.strategy_id,
+            post_only=True,
+        )
+        self.log.log(
+            "take_profit_submitted",
+            symbol=symbol,
+            side=exit_side,
+            quantity=str(qty),
+            entry_price=str(entry_price),
+            target_price=str(target),
+            take_profit_pct=str(pct),
+        )
+        try:
+            response = await order_stub.SubmitOrder(order)
+        except grpc.aio.AioRpcError as e:
+            self.log.log("take_profit_submit_error", symbol=symbol, detail=str(e))
+            self._cleanup_take_profit(client_order_id)
+            return
+        if response.status == trading_pb2.ORDER_STATUS_REJECTED:
+            self.log.log("take_profit_rejected", symbol=symbol, reason=response.reject_reason, target_price=str(target))
+            self._cleanup_take_profit(client_order_id)
+
+    def _cleanup_take_profit(self, client_order_id: str) -> None:
+        self._take_profit_orders.pop(client_order_id, None)
+        self._cleanup_resting_order(client_order_id)
+
     def _cleanup_resting_order(self, client_order_id: str) -> None:
         self._resting_order_events.pop(client_order_id, None)
         self._resting_order_last_update.pop(client_order_id, None)
@@ -483,6 +560,11 @@ class Engine:
                 filled_qty = _decimal_or_none(update.filled_quantity.value if update.HasField("filled_quantity") else None)
                 self.portfolio.on_order_update(update.client_order_id, symbol, side, status_name, filled_qty)
 
+                if update.client_order_id in self._take_profit_orders:
+                    if status_name in ("FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"):
+                        self.log.log("take_profit_done", symbol=symbol, status=status_name, order=update.client_order_id)
+                        self._cleanup_take_profit(update.client_order_id)
+                    continue
                 if is_managed:
                     self._resting_order_last_update[update.client_order_id] = update
                     self._resting_order_events[update.client_order_id].set()

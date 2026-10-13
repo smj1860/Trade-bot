@@ -371,6 +371,15 @@ vol_circuit_breaker_freeze_secs = 300 # how long a trip freezes the symbol to re
 # -----------------------------------------------------------------------------
 [execution]
 dry_run = true
+# Only post-only LIMIT orders may be sent. The risk engine rejects every
+# MARKET order and every LIMIT order without post_only, so nothing can pay
+# a taker fee by accident. Default true.
+post_only_only = true
+# The one exception: the stop-loss and dead-man's-switch flatten orders (a
+# protective exit that can fail to execute is not protective). Set false to
+# forbid even those; a breached position is then only exited if the strategy
+# manages to post a maker order.
+allow_emergency_market_exit = true
 
 # Approximate token-bucket model of Kraken's private-REST call counter
 # (see rust-core/src/kraken_rest.rs::RateLimiter) — throttles this

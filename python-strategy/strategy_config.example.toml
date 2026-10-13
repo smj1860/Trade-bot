@@ -165,4 +165,28 @@ limit_reprice_attempts = 2
 # MARKET order for whatever quantity never filled (paying the taker fee
 # on just the leftover, rather than never completing the intended trade
 # at all). false abandons the remaining quantity instead.
-fallback_to_market = true
+fallback_to_market = false
+# Market orders are never sent unless this is true (and Rust's
+# [execution].post_only_only is false). Keep false: post-only limits only.
+allow_market_orders = false
+# Profit target: after an entry fills, rest a post-only limit exit 1.5%
+# away (above a long's entry, below a short's). 0 disables.
+take_profit_pct = 0.015
+# Price decimals per symbol, to round the target onto the tick grid.
+# Verify against Kraken AssetPairs (config/config.example.toml has the
+# tick_size per symbol; decimals = digits after the point in tick_size).
+[execution.price_decimals]
+BTC-USD = 1
+ETH-USD = 2
+XRP-USD = 5
+DOGE-USD = 7
+ADA-USD = 6
+SOL-USD = 2
+AVAX-USD = 3
+NEAR-USD = 4
+SUI-USD = 4
+UNI-USD = 4
+AAVE-USD = 2
+PENDLE-USD = 3
+LINK-USD = 5
+TAO-USD = 4

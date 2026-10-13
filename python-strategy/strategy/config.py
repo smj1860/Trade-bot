@@ -160,7 +160,19 @@ class ExecutionConfig:
     # maker and, failing that, does nothing rather than pay taker fees
     # anyway, which defeats the point of this phase for a
     # fee-sensitivity-conscious deployment.
-    fallback_to_market: bool = True
+    fallback_to_market: bool = False
+    # Market orders are off. The Rust risk engine also rejects them while
+    # [execution].post_only_only is true; this flag keeps Python from even
+    # trying (use_limit_orders=False or fallback_to_market=True need it).
+    allow_market_orders: bool = False
+    # Profit target: once an entry order fills, rest a post-only limit exit
+    # at this fraction above the entry price (below it for a short). 0.015 =
+    # 1.5%. 0 disables. The exit is maker-only like every other order.
+    take_profit_pct: float = 0.015
+    # Price decimals per symbol, e.g. {"BTC-USD": 1}, used to round the
+    # take-profit price onto the exchange's tick grid. A symbol missing here
+    # falls back to the precision of the entry price itself.
+    price_decimals: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

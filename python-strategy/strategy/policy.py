@@ -193,3 +193,18 @@ def post_only_price(side: Side, mid_price: Decimal, spread: Decimal) -> Decimal:
     know each symbol's tick size."""
     half_spread = spread / 2
     return mid_price - half_spread if side == "BUY" else mid_price + half_spread
+
+
+def take_profit_price(entry_side: Side, entry_price: Decimal, pct: Decimal, decimals: int) -> Decimal:
+    """The resting exit price for a position just opened at `entry_price`:
+    `pct` in profit (1.5% = Decimal("0.015")), rounded to `decimals` places
+    in the direction that can only make the target slightly *larger* than
+    asked, never smaller (a long sells at or above entry*(1+pct), a short
+    buys at or below entry*(1-pct)). Exchange tick sizes are not known to
+    this layer, so the caller passes the symbol's price precision."""
+    from decimal import ROUND_CEILING, ROUND_FLOOR
+
+    quantum = Decimal(1).scaleb(-decimals)
+    if entry_side == "BUY":
+        return (entry_price * (1 + pct)).quantize(quantum, rounding=ROUND_CEILING)
+    return (entry_price * (1 - pct)).quantize(quantum, rounding=ROUND_FLOOR)
