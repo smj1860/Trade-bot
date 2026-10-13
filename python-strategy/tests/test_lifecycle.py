@@ -109,9 +109,47 @@ def test_passive_entry_fills_at_touch(tmp_path):
     assert o.entry_fills[0].maker and o.entry_fills[0].price == 100.0
 
 
-def test_gap_excludes_the_trade(tmp_path):
-    outs, stats = run(tmp_path, [(300, {"_event": "disconnect", "reason": "x"})], ["all-taker"])
+def test_gap_excludes_the_trade_in_strict_mode(tmp_path):
+    rep = recording(tmp_path, [(300, {"_event": "disconnect", "reason": "x"})])
+    outs, stats = run_lifecycles([spec()], rep, CFG, [(1.0, 0.0)], [SCEN["all-taker"]], 1000.0, max_gap_s=0)
     assert outs == [] and stats.aborted == 1
+
+
+def reconnect(t0, t1, snap=SNAP):
+    """A disconnect at t0 and a reconnect with a fresh snapshot at t1 (seconds)."""
+    return [(t0, {"_event": "disconnect", "reason": "x"}), (t1 - 0.5, {"_event": "connect", "depth": 25}), (t1, snap)]
+
+
+def test_short_gap_is_bridged(tmp_path):
+    outs, stats = run(tmp_path, reconnect(300, 303), ["all-taker"])
+    assert stats.aborted == 0 and stats.gaps_bridged == 1
+    assert outs[0].reason == "timeout"
+
+
+def test_long_gap_still_aborts(tmp_path):
+    outs, stats = run(tmp_path, reconnect(300, 400), ["all-taker"])
+    assert outs == [] and stats.aborted == 1
+
+
+def test_stop_inferred_after_gap(tmp_path):
+    # price is far below the stop (99.1) when the book comes back
+    low = book_msg([(95.0, 5.0)], [(95.2, 5.0)], "snapshot")
+    outs, stats = run(tmp_path, reconnect(300, 303, low), ["all-taker"])
+    o = outs[0]
+    assert o.reason == "stop" and stats.gap_triggers == 1
+
+
+def test_resting_target_filled_by_price_through_it_during_gap(tmp_path):
+    # exit-passive rests a sell at 101.1; the book returns with bids at 102
+    high = book_msg([(102.0, 5.0)], [(102.2, 5.0)], "snapshot")
+    outs, stats = run(tmp_path, reconnect(300, 303, high), ["exit-passive"])
+    o = outs[0]
+    assert o.reason == "target" and o.exit_fills[0].maker and stats.gap_fills == 1
+
+
+def test_resting_target_survives_gap_when_price_has_not_reached_it(tmp_path):
+    outs, stats = run(tmp_path, reconnect(300, 303), ["exit-passive"])
+    assert stats.gap_fills == 0 and outs[0].reason == "timeout"
 
 
 def test_trade_without_recording_at_entry_is_skipped(tmp_path):

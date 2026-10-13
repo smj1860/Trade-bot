@@ -134,6 +134,8 @@ def format_report(outcomes: list[Outcome], owners: dict[int, list[dict]], fees_l
     lines = [
         f"trades: {stats.specs} distinct; {stats.started} had recording at entry, {stats.no_data_at_entry} did not; "
         f"{stats.lifecycles} lifecycles run, {stats.aborted} aborted by recording gaps, {stats.unfinished} unfinished when data ended",
+        f"gaps bridged: {stats.gaps_bridged} lifecycle crossings; {stats.gap_fills} resting orders judged filled and "
+        f"{stats.gap_triggers} stop/target triggers inferred from prices across a gap",
     ]
     base = get("all-taker", 0)
     for vi, (qf, cc) in enumerate(variants):
@@ -227,6 +229,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--fees", default=DEFAULT_FEES, help="maker:taker per leg, comma separated")
     p.add_argument("--entry-s", type=float, default=600.0)
     p.add_argument("--exit-s", type=float, default=600.0)
+    p.add_argument("--max-gap-s", type=float, default=30.0,
+                   help="bridge recording gaps up to this long (re-seed from the next snapshot and infer what happened); "
+                        "longer gaps abort the trade. 0 = abort on any gap (the old strict behaviour)")
     args = p.parse_args(argv)
 
     paths = list(args.data)
@@ -266,7 +271,7 @@ def main(argv: list[str] | None = None) -> None:
             for cfg_i in cfg.values() if cfg_i["native"] in symbols}
     rep = MultiReplayer(files, symbols)
     t0 = time.time()
-    outcomes, stats = run_lifecycles(specs, rep, cfgs, variants, SCENARIOS, args.notional, args.entry_s, args.exit_s)
+    outcomes, stats = run_lifecycles(specs, rep, cfgs, variants, SCENARIOS, args.notional, args.entry_s, args.exit_s, args.max_gap_s)
     print(f"{len(files)} file(s), {len(symbols)} symbol(s), {len(rows)} trade rows; replayed in {time.time() - t0:.0f}s", file=sys.stderr)
     print(format_report(outcomes, owners, fees_list, variants, stats, arms or None))
 

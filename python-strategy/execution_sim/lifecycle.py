@@ -38,6 +38,7 @@ BIG = 1 << 62
 ENTRY_S = 600
 EXIT_S = 600
 MAX_START_LAG_S = 30
+MAX_GAP_S = 30.0  # recording gaps up to this long are bridged; longer ones abort the trade
 
 
 class _Hold:
@@ -126,6 +127,8 @@ class Lifecycle:
         self.done = False
         self.aborted = False
         self.wake_ns = 0
+        self.gap_filled = False
+        self.gap_triggered = False
         self.reg: tuple | None = None  # (side, price) of the resting order as registered by the driver
 
     # -- helpers ------------------------------------------------------------------
@@ -181,6 +184,35 @@ class Lifecycle:
     def abort(self) -> None:
         self.aborted = True
         self.done = True
+
+    def resume(self, now: int, lo: float, hi: float) -> None:
+        """Called when the book is back after a short recording gap. ``lo``/``hi`` are the
+        lowest and highest trade prices seen during it (inf / -inf if none). What happened in
+        the gap is inferred from where the market is now, only when the evidence is
+        unambiguous. The stop is checked before the target and before any resting-order fill,
+        so the unknowns go against us."""
+        if self.done:
+            return
+        book, cur = self.book, self.cur
+        bb, ba = book.best(BID), book.best(ASK)
+        plo, phi = min(lo, bb[0]), max(hi, ba[0])  # price range we know the market visited
+        if self.phase == "hold" and not self.triggered and not cur.done:
+            if (plo <= self.stop) if self.long else (phi >= self.stop):
+                self._trigger("stop", now)
+                self.gap_triggered = True
+            elif not self.scen.maker_target and ((phi >= self.target) if self.long else (plo <= self.target)):
+                self._trigger("target", now)
+                self.gap_triggered = True
+        o = cur.order
+        if o is not None and not cur.done and not self.triggered:
+            # filled only if a trade went through our price, or the opposite touch is now at/through it
+            crossed = (lo < o.price or ba[0] <= o.price) if cur.side == "buy" else (hi > o.price or bb[0] >= o.price)
+            if crossed:
+                cur._fill_maker(now, o.remaining)
+                self.gap_filled = True
+            else:
+                o.queue_ahead = max(0.0, min(o.queue_ahead, book.qty_at(cur.own, o.price)))
+        self.wake_ns = 0
 
     # -- time ---------------------------------------------------------------------
     def step(self, now: int) -> None:
@@ -257,12 +289,15 @@ class RunStats:
     lifecycles: int = 0
     aborted: int = 0
     unfinished: int = 0
+    gaps_bridged: int = 0  # lifecycle-gap crossings survived
+    gap_fills: int = 0  # resting orders judged filled by the market moving through them during a gap
+    gap_triggers: int = 0  # stop/target triggers inferred from prices seen across a gap
     notes: list[str] = field(default_factory=list)
 
 
 def run_lifecycles(specs: list[TradeSpec], rep: MultiReplayer, cfgs: dict[str, SimConfig],
                    variants: list[tuple[float, float]], scenarios=SCENARIOS, notional: float = 1000.0,
-                   entry_s: float = ENTRY_S, exit_s: float = EXIT_S) -> tuple[list[Outcome], RunStats]:
+                   entry_s: float = ENTRY_S, exit_s: float = EXIT_S, max_gap_s: float = MAX_GAP_S) -> tuple[list[Outcome], RunStats]:
     """One pass over the recordings. ``variants`` are (queue_factor, cancel_credit)
     pairs; scenarios with no passive leg are run once (variant 0) since the
     assumptions cannot affect them. ``cfgs`` maps symbol -> SimConfig (tick etc.)."""
@@ -282,6 +317,8 @@ def run_lifecycles(specs: list[TradeSpec], rep: MultiReplayer, cfgs: dict[str, S
     t_lo = min(sp.t0_ns for sp in specs)
     t_hi = max(sp.t0_ns + sp.hold_ns for sp in specs) + int((exit_s + 60) * NS)
     lag = MAX_START_LAG_S * NS
+    max_gap = int(max_gap_s * NS)
+    gap: dict[str, list] = {}  # symbol -> [start_ns, lowest trade price, highest trade price] while the book is down
 
     def sync(sym: str, lc: Lifecycle) -> None:
         new = lc.order_key()
@@ -316,13 +353,41 @@ def run_lifecycles(specs: list[TradeSpec], rep: MultiReplayer, cfgs: dict[str, S
     for sym, ev in rep.events(start_ns=t_lo - NS, end_ns=t_hi):
         lcs = live[sym]
         if isinstance(ev, GapEvent):
-            for lc in lcs:
-                lc.abort()
-                drop(sym, lc)
-            live[sym] = []
-            sym_wake[sym] = BIG
+            if max_gap <= 0 or not lcs:
+                for lc in lcs:
+                    lc.abort()
+                    drop(sym, lc)
+                live[sym] = []
+                sym_wake[sym] = BIG
+                gap.pop(sym, None)
+            elif sym not in gap:
+                gap[sym] = [ev.t_ns, float("inf"), float("-inf")]
+                sym_wake[sym] = BIG  # nothing to step until the book is back
             continue
         now = ev.t_ns
+        g = gap.get(sym)
+        if g is not None:
+            if isinstance(ev, TradeEvent):
+                g[1], g[2] = min(g[1], ev.price), max(g[2], ev.price)
+                continue
+            if not ev.snapshot:
+                continue
+            del gap[sym]
+            if now - g[0] > max_gap:
+                for lc in lcs:
+                    lc.abort()
+                    drop(sym, lc)
+                live[sym] = lcs = []
+                sym_wake[sym] = BIG
+            else:
+                for lc in lcs:
+                    lc.resume(now, g[1], g[2])
+                    stats.gaps_bridged += 1
+                    stats.gap_fills += lc.gap_filled
+                    stats.gap_triggers += lc.gap_triggered
+                    lc.gap_filled = lc.gap_triggered = False
+                    sync(sym, lc)
+                sym_wake[sym] = 0
         book = rep.books[sym]
         if isinstance(ev, TradeEvent):
             for lc in lcs:
