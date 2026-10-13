@@ -170,6 +170,22 @@ class ExecutionConfig:
     # fee on both legs (see policy.take_profit_price). 0.015 = 1.5% net, which
     # at a 0.40% maker fee is an exit about 2.3% from entry. 0 disables.
     take_profit_pct: float = 0.015
+    # Scale-out tiers used when the trend agrees with the trade at entry:
+    # [net target, fraction of the position]. The fractions that are not
+    # assigned (here 25%) are the runner: no resting order, exits on a trend
+    # break or a stop. Without a trend, the whole position uses take_profit_pct.
+    take_profit_tiers: list = field(default_factory=lambda: [[0.015, 0.30], [0.025, 0.20], [0.04, 0.25]])
+    # Stop loss, NET of fees (0.02 = lose 2% after fees; at 0.40% per leg that
+    # is only about a 1.2% price move). While the trend is intact (price on the
+    # right side of the long EMA) a dip through this level is held, not sold.
+    stop_loss_net_pct: float = 0.02
+    hold_stop_while_trend_intact: bool = True
+    # Backstop: close regardless of trend once the net loss reaches this.
+    hard_stop_net_pct: float = 0.05
+    # Reprice attempts when exiting a position by stop/trend exit.
+    exit_reprice_attempts: int = 10
+    # Quantity precision (decimals) when splitting a position into tiers.
+    qty_decimals: int = 8
     # Maker fee per leg used to gross up the target. Kraken Tier 1 is 0.40%;
     # update this if the 30-day volume tier changes.
     maker_fee_pct: float = 0.004

@@ -450,8 +450,11 @@ auto_flatten_positions = false # submit a market order to zero out every open
 # -----------------------------------------------------------------------------
 [stop_loss]
 enabled = true
-max_loss_pct = "0.03"      # flatten a position once it's down 3% against its
-                            # own average entry price
+max_loss_pct = "0.06"      # DISASTER backstop: market-flatten once a position is
+                            # down 6% against its own average entry price. The
+                            # strategy's own stops (a net-2% stop held through
+                            # dips while the trend is intact, and a net-5% hard
+                            # stop, both post-only) act long before this.
 check_interval_secs = 10   # how often the monitor re-checks every open position
 
 # -----------------------------------------------------------------------------

@@ -279,3 +279,68 @@ def test_take_profit_price_nets_the_target_after_fees_and_rounds_outward():
     assert long_exit > Decimal("102.3") and short_exit < Decimal("97.8")
     # zero fee reduces to the plain percentage
     assert take_profit_price("BUY", Decimal("100"), net, 2) == Decimal("101.50")
+
+
+def uptrend_engine(**o):
+    engine = make_engine(take_profit_pct=0.015, maker_fee_pct=0.004, price_decimals={"BTC-USD": 1}, **o)
+    engine._latest_ema_long_ratio["BTC-USD"] = 0.01  # price above the long EMA
+    return engine
+
+
+def test_uptrend_entry_rests_three_scaled_tiers_and_keeps_a_runner():
+    engine = uptrend_engine()
+    stub = FakeOrderStub(engine, lambda req: filled_update(req, "0.01") if req.side == trading_pb2.ORDER_SIDE_BUY else None)
+    asyncio.run(engine._manage_resting_order(buy_intent("0.01", "30000"), stub))
+    tps = [r for r in stub.submitted if r.side == trading_pb2.ORDER_SIDE_SELL]
+    assert [Decimal(r.quantity.value) for r in tps] == [Decimal("0.003"), Decimal("0.002"), Decimal("0.0025")]
+    prices = [Decimal(r.limit_price.value) for r in tps]
+    assert prices == sorted(prices) and prices[0] == Decimal("30694.6")
+    assert all(r.post_only and r.type == trading_pb2.ORDER_TYPE_LIMIT for r in tps)
+    assert engine._pos["BTC-USD"]["entry"] == Decimal("30000")
+
+
+def run_exit_check(engine, mid):
+    stub = FakeOrderStub(engine, lambda req: filled_update(req, str(req.quantity.value)))
+
+    async def go():
+        engine._maybe_start_exit("BTC-USD", Decimal(mid), stub)
+        if engine._background_tasks:
+            await asyncio.gather(*list(engine._background_tasks))
+
+    asyncio.run(go())
+    return stub
+
+
+def long_position(engine):
+    engine.portfolio.on_order_update("seed", "BTC-USD", "BUY", "FILLED", Decimal("0.01"))
+    engine._pos["BTC-USD"] = {"side": "BUY", "entry": Decimal("30000"), "tiers_filled": 0, "exiting": False}
+    engine._latest_book["BTC-USD"] = (Decimal("29000"), Decimal("29001"))
+
+
+def test_stop_is_held_through_a_dip_while_the_trend_is_intact():
+    engine = uptrend_engine()
+    long_position(engine)
+    stub = run_exit_check(engine, "29600")  # below the ~29636 net-2% stop
+    assert stub.submitted == []
+    assert engine._pos["BTC-USD"]["exiting"] is False
+
+
+def test_stop_sells_post_only_when_the_trend_breaks():
+    engine = uptrend_engine()
+    long_position(engine)
+    engine._latest_ema_long_ratio["BTC-USD"] = -0.002
+    stub = run_exit_check(engine, "29600")
+    sells = [r for r in stub.submitted if r.side == trading_pb2.ORDER_SIDE_SELL]
+    assert len(sells) == 1 and sells[0].type == trading_pb2.ORDER_TYPE_LIMIT and sells[0].post_only
+    assert Decimal(sells[0].quantity.value) == Decimal("0.01")
+    assert [r for r in stub.submitted if r.type == trading_pb2.ORDER_TYPE_MARKET] == []
+
+
+def test_hard_stop_exits_even_in_an_uptrend_and_cancels_resting_targets():
+    engine = uptrend_engine()
+    long_position(engine)
+    engine._take_profit_orders["tp-1"] = "BTC-USD"
+    engine._resting_order_events["tp-1"] = asyncio.Event()
+    stub = run_exit_check(engine, "28700")  # below the net-5% hard stop
+    assert "tp-1" in stub.canceled and "tp-1" not in engine._take_profit_orders
+    assert any(r.side == trading_pb2.ORDER_SIDE_SELL for r in stub.submitted)

@@ -21,7 +21,8 @@ from strategy.config import Config
 from strategy.imbalance_momentum import ImbalanceMomentumStrategy
 from strategy.logging_utils import JsonlEventLogger
 from strategy.pb import trading_pb2, trading_pb2_grpc
-from strategy.policy import OrderIntent, Side, take_profit_price
+from strategy.exits import exit_reason, tier_plan, trend_up_for
+from strategy.policy import OrderIntent, Side
 from strategy.portfolio import PortfolioManager
 
 # Registry of available strategies, keyed by strategy_config.toml's
@@ -79,6 +80,11 @@ class Engine:
         # as "managed" (in _resting_order_events) so the update loop keeps
         # attributing their partial fills; removed once terminal.
         self._take_profit_orders: dict[str, str] = {}
+        # symbol -> open-position bookkeeping used by the exit rules (average
+        # entry price, direction, how many profit tiers have filled, whether
+        # an exit is already in progress). In-memory like the portfolio.
+        self._pos: dict[str, dict] = {}
+        self._latest_ema_long_ratio: dict[str, float] = {}
 
     async def run(self) -> None:
         async with grpc.aio.insecure_channel(self.config.connection.rust_core_addr) as channel:
@@ -194,6 +200,9 @@ class Engine:
         if decision is None:
             return
 
+        self._latest_ema_long_ratio[symbol] = decision.features.ema_long_ratio
+        self._maybe_start_exit(symbol, decision.features.mid_price, order_stub)
+
         self.log.log(
             "signal",
             symbol=symbol,
@@ -308,7 +317,7 @@ class Engine:
         self.portfolio.on_order_update(client_order_id, symbol, side, status_name, filled_qty)
         return status_name
 
-    async def _manage_resting_order(self, intent: OrderIntent, order_stub) -> None:
+    async def _manage_resting_order(self, intent: OrderIntent, order_stub, max_attempts: Optional[int] = None) -> None:
         """The maker/limit order state machine institutional audit Phase
         1.3 calls for: place a post-only limit order -> wait up to
         `execution.limit_order_timeout_secs` for it to fill -> if it
@@ -327,7 +336,8 @@ class Engine:
         """
         remaining = intent.quantity
         limit_price = intent.limit_price
-        max_attempts = self.config.execution.limit_reprice_attempts
+        if max_attempts is None:
+            max_attempts = self.config.execution.limit_reprice_attempts
         timeout = self.config.execution.limit_order_timeout_secs
 
         for attempt in range(max_attempts + 1):
@@ -462,14 +472,14 @@ class Engine:
             )
 
     async def _place_take_profit(self, symbol: str, side: Side, filled: Decimal, entry_price: Decimal, order_stub) -> None:
-        """Rests a post-only limit exit for the quantity just filled, priced so
-        the round trip nets `execution.take_profit_pct` after maker fees on both
-        legs (see policy.take_profit_price). Only for fills that
-        open or add to a position (the resulting position has the same sign
-        as the order), never for one that merely reduces an opposite
-        position. Sits on the book until it fills, is canceled, or the
-        dead-man's switch cancels it."""
-        pct = Decimal(str(self.config.execution.take_profit_pct))
+        """Called after an entry fill: records the position's average entry and
+        rests the post-only profit exits (see strategy/exits.py): scaled tiers
+        when the trend agrees with the trade, otherwise the whole quantity at
+        `execution.take_profit_pct`. All targets are net of maker fees. Only for
+        fills that open or add to a position, never one that merely reduces an
+        opposite position."""
+        ex = self.config.execution
+        pct = Decimal(str(ex.take_profit_pct))
         if pct <= 0 or filled <= 0 or entry_price is None:
             return
         position = self.portfolio.position(symbol)
@@ -477,12 +487,24 @@ class Engine:
         if not opened:
             return
         qty = min(filled, abs(position))
-        decimals = self.config.execution.price_decimals.get(symbol)
+        prior = abs(position) - qty
+        st = self._pos.get(symbol)
+        if st is None or st["side"] != side or prior <= 0:
+            self._pos[symbol] = {"side": side, "entry": entry_price, "tiers_filled": 0, "exiting": False}
+        else:
+            st["entry"] = (st["entry"] * prior + entry_price * qty) / (prior + qty)
+        decimals = ex.price_decimals.get(symbol)
         if decimals is None:
             decimals = max(0, -entry_price.as_tuple().exponent)
-        fee = Decimal(str(self.config.execution.maker_fee_pct))
-        target = take_profit_price(side, entry_price, pct, decimals, fee)
+        fee = Decimal(str(ex.maker_fee_pct))
+        uptrend = trend_up_for(side, self._latest_ema_long_ratio.get(symbol, 0.0))
+        plan = tier_plan(side, entry_price, qty, uptrend, ex.take_profit_tiers, pct, fee, fee, decimals, ex.qty_decimals)
         exit_side: Side = "SELL" if side == "BUY" else "BUY"
+        for target, tier_qty, tier in plan:
+            await self._submit_target(symbol, exit_side, target, tier_qty, tier, entry_price, order_stub)
+
+    async def _submit_target(self, symbol: str, exit_side: Side, target: Decimal, qty: Decimal, tier: int,
+                             entry_price: Decimal, order_stub) -> None:
         client_order_id = f"{self.strategy.strategy_id}-{symbol}-tp-{time.time_ns()}"
         self._resting_order_events[client_order_id] = asyncio.Event()
         self._pending_orders[client_order_id] = (symbol, exit_side)
@@ -503,10 +525,10 @@ class Engine:
             symbol=symbol,
             side=exit_side,
             quantity=str(qty),
+            tier=tier,
             entry_price=str(entry_price),
             target_price=str(target),
-            net_target_pct=str(pct),
-            maker_fee_pct=str(fee),
+            maker_fee_pct=str(self.config.execution.maker_fee_pct),
         )
         try:
             response = await order_stub.SubmitOrder(order)
@@ -517,6 +539,61 @@ class Engine:
         if response.status == trading_pb2.ORDER_STATUS_REJECTED:
             self.log.log("take_profit_rejected", symbol=symbol, reason=response.reject_reason, target_price=str(target))
             self._cleanup_take_profit(client_order_id)
+
+    def _maybe_start_exit(self, symbol: str, mid: Decimal, order_stub) -> None:
+        """Checks the stop / trend-exit rules against the open position on every book update
+        (cheap: pure arithmetic) and, when one fires, closes the rest of the position in a
+        background task."""
+        st = self._pos.get(symbol)
+        position = self.portfolio.position(symbol)
+        if st is None:
+            return
+        if position == 0:
+            self._pos.pop(symbol, None)
+            return
+        if st["exiting"]:
+            return
+        ex = self.config.execution
+        fee = Decimal(str(ex.maker_fee_pct))
+        reason = exit_reason(
+            st["side"], st["entry"], mid, self._latest_ema_long_ratio.get(symbol, 0.0), st["tiers_filled"],
+            Decimal(str(ex.stop_loss_net_pct)), Decimal(str(ex.hard_stop_net_pct)),
+            ex.hold_stop_while_trend_intact, fee, fee,
+        )
+        if reason is None:
+            return
+        st["exiting"] = True
+        task = asyncio.create_task(self._exit_position(symbol, reason, order_stub))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _exit_position(self, symbol: str, reason: str, order_stub) -> None:
+        """Cancels the resting profit exits, then closes whatever is left with a post-only
+        limit that joins the best bid/ask and reprices up to `execution.exit_reprice_attempts`
+        times. Never a market order. If it still has not filled, the exiting flag is cleared
+        so the rule can fire again on the next update."""
+        st = self._pos.get(symbol)
+        try:
+            for oid in [o for o, sym in self._take_profit_orders.items() if sym == symbol]:
+                try:
+                    await order_stub.CancelOrder(trading_pb2.CancelOrderRequest(client_order_id=oid))
+                except grpc.aio.AioRpcError as e:
+                    self.log.log("take_profit_cancel_error", symbol=symbol, detail=str(e))
+                self._cleanup_take_profit(oid)
+            position = self.portfolio.position(symbol)
+            if position == 0 or st is None:
+                return
+            side: Side = "SELL" if position > 0 else "BUY"
+            latest = self._latest_book.get(symbol)
+            price = (latest[1] if side == "SELL" else latest[0]) if latest is not None else None
+            self.log.log("position_exit", symbol=symbol, reason=reason, side=side, quantity=str(abs(position)),
+                         avg_entry=str(st["entry"]))
+            intent = OrderIntent(symbol=symbol, side=side, quantity=abs(position), signal=0.0,
+                                 order_type="LIMIT", limit_price=price)
+            await self._manage_resting_order(intent, order_stub, max_attempts=self.config.execution.exit_reprice_attempts)
+        finally:
+            if st is not None:
+                st["exiting"] = False
 
     def _cleanup_take_profit(self, client_order_id: str) -> None:
         self._take_profit_orders.pop(client_order_id, None)
@@ -565,6 +642,8 @@ class Engine:
 
                 if update.client_order_id in self._take_profit_orders:
                     if status_name in ("FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"):
+                        if status_name == "FILLED" and symbol in self._pos:
+                            self._pos[symbol]["tiers_filled"] += 1
                         self.log.log("take_profit_done", symbol=symbol, status=status_name, order=update.client_order_id)
                         self._cleanup_take_profit(update.client_order_id)
                     continue

@@ -173,6 +173,20 @@ allow_market_orders = false
 # exit priced to net 1.5% after the maker fee on both legs (about 2.3% from
 # entry at a 0.40% fee). 0 disables.
 take_profit_pct = 0.015
+# Scale-out when the trend already agrees with the trade at entry:
+# [net target, fraction of the position]. The unassigned fraction (25% here)
+# is the runner: it has no resting order and leaves on a trend break or a
+# stop. With no trend, the whole position rests at take_profit_pct.
+take_profit_tiers = [[0.015, 0.30], [0.025, 0.20], [0.04, 0.25]]
+# Stop loss, NET of fees. At 0.40% per leg, a net 2% stop is only about a
+# 1.2% price move. While the price is still on the right side of the long
+# EMA (trend intact) a dip through it is held, not sold.
+stop_loss_net_pct = 0.02
+hold_stop_while_trend_intact = true
+# Backstop, regardless of trend: exit once the net loss reaches this.
+hard_stop_net_pct = 0.05
+exit_reprice_attempts = 10   # post-only exit retries (never a market order)
+qty_decimals = 8             # tier quantities round down to this precision
 # Maker fee per leg used to gross the target up (Kraken Tier 1 = 0.40%).
 # Update when the 30-day volume tier changes.
 maker_fee_pct = 0.004
